@@ -41,8 +41,9 @@
           # $IDF_TOOLS_PATH/tools/<tool-name>/<version>
           # という通常インストール構造を期待する。
           #
-          # nixpkgs-esp-dev の各 tool derivation をその形に symlink して、
-          # VSCode 拡張や idf_tools.py export が落ちないようにする。
+          # ただし IDF_TOOLS_PATH 自体を /nix/store にすると、
+          # ESP-IDF や VSCode 拡張が書き込みを試みて壊れる可能性がある。
+          # ここでは Nix store 側には「読み取り専用の tools 雛形」だけを作る。
           idfToolsPath = pkgs.runCommand "esp-idf-tools-path" {
             nativeBuildInputs = [ pkgs.python3 ];
 
@@ -95,10 +96,27 @@ PY
 
             shellHook = ''
               export IDF_TARGET=esp32s3
-              export IDF_CCACHE_ENABLE=1
 
-              # idf_tools.py export 対策。
-              export IDF_TOOLS_PATH=${idfToolsPath}
+              # まずは事故切り分けのため ccache を無効化。
+              # 問題が消えたら 1 に戻してよい。
+              export IDF_CCACHE_ENABLE=0
+
+              # ESP-IDF が書き込む可能性のある場所は /nix/store にしない。
+              export IDF_TOOLS_PATH="''${XDG_CACHE_HOME:-$HOME/.cache}/avi-99l/esp-idf-tools"
+              mkdir -p "$IDF_TOOLS_PATH"
+
+              # tools は Nix store 側の読み取り専用生成物を参照する。
+              # IDF_TOOLS_PATH 自体は writable にしておくのが重要。
+              if [ ! -e "$IDF_TOOLS_PATH/tools" ]; then
+                ln -s ${idfToolsPath}/tools "$IDF_TOOLS_PATH/tools"
+              fi
+
+              # dist は ESP-IDF 側が触る可能性があるので writable にする。
+              mkdir -p "$IDF_TOOLS_PATH/dist"
+
+              # ccache を再有効化した場合でも、書き込み先を明示しておく。
+              export CCACHE_DIR="''${XDG_CACHE_HOME:-$HOME/.cache}/avi-99l/ccache"
+              mkdir -p "$CCACHE_DIR"
 
               # custom installation 扱いでも ESP-IDF 側がバージョン判定できるようにする。
               export ESP_IDF_VERSION="$(cat "$IDF_PATH/version.txt" | sed 's/^v//' | cut -d. -f1,2)"
@@ -106,6 +124,7 @@ PY
               echo "ESP32-S3 ESP-IDF shell"
               echo "IDF_PATH=$IDF_PATH"
               echo "IDF_TOOLS_PATH=$IDF_TOOLS_PATH"
+              echo "CCACHE_DIR=$CCACHE_DIR"
               echo "Use: idf.py set-target esp32s3 / idf.py build / idf.py flash / idf.py monitor"
             '';
           };
