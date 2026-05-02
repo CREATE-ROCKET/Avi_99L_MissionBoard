@@ -3,6 +3,7 @@ edition = "2024"
 name = "mission_board"
 rust-version = "1.88"
 version = "0.1.0"
+default-run = "mission_board"
 
 [[bin]]
 name = "mission_board"
@@ -25,6 +26,8 @@ esp-backtrace = { version = "0.19.0", features = [
     "esp32s3",
     "panic-handler",
     "println",
+    "custom-pre-backtrace",
+    "custom-halt"
 ] }
 esp-println = { version = "0.17.0", features = ["log-04", "esp32s3"] }
 
