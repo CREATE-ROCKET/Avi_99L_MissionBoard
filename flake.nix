@@ -1,5 +1,5 @@
 {
-  description = "ESP32-S3 ESP-IDF project";
+  description = "Avi 99L Mission Board ESP32-S3 ESP-IDF / esp-hal development environment";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
@@ -24,112 +24,137 @@
     {
       devShells = forAllSystems (system:
         let
-          lib = nixpkgs.lib;
-
           pkgs = import nixpkgs {
             inherit system;
-            overlays = [ nixpkgs-esp-dev.overlays.default ];
+
+            overlays = [
+              nixpkgs-esp-dev.overlays.default
+            ];
 
             config.permittedInsecurePackages = [
               "python3.13-ecdsa-0.19.1"
             ];
           };
 
-          espIdf = pkgs.esp-idf-full;
+          lib = pkgs.lib;
 
-          # ESP-IDF の idf_tools.py export は
-          # $IDF_TOOLS_PATH/tools/<tool-name>/<version>
-          # という通常インストール構造を期待する。
-          #
-          # ただし IDF_TOOLS_PATH 自体を /nix/store にすると、
-          # ESP-IDF や VSCode 拡張が書き込みを試みて壊れる可能性がある。
-          # ここでは Nix store 側には「読み取り専用の tools 雛形」だけを作る。
-          idfToolsPath = pkgs.runCommand "esp-idf-tools-path" {
-            nativeBuildInputs = [ pkgs.python3 ];
+          espIdfS3 = pkgs.esp-idf-s3-full or pkgs.esp-idf-full;
 
-            toolMap =
-              builtins.toJSON
-                (lib.mapAttrs (_: drv: "${drv}") espIdf.tools);
-          } ''
-            mkdir -p "$out/tools" "$out/dist"
+          espIdfDeps = with pkgs; [
+            espIdfS3
 
-            python3 - <<'PY'
-import json
-import os
+            git
+            cmake
+            ninja
+            ccache
+            dfu-util
+          ] ++ lib.optionals pkgs.stdenv.isLinux [
+            usbutils
+          ];
 
-tool_map = json.loads(os.environ["toolMap"])
+          espHalDeps = with pkgs; [
+            rustup
+            espup
+            esp-generate
+            espflash
+            esptool
+            probe-rs-tools
+            cargo-make
 
-with open("${espIdf}/tools/tools.json", "r", encoding="utf-8") as f:
-    tool_specs = json.load(f)["tools"]
-
-versions = {
-    tool["name"]: tool["versions"][0]["name"]
-    for tool in tool_specs
-}
-
-for name, store_path in tool_map.items():
-    version = versions.get(name)
-    if version is None:
-        raise SystemExit(f"{name} is not listed in ESP-IDF tools.json")
-
-    tool_dir = os.path.join(os.environ["out"], "tools", name)
-    os.makedirs(tool_dir, exist_ok=True)
-    os.symlink(store_path, os.path.join(tool_dir, version))
-PY
-          '';
+            git
+            pkg-config
+            openssl
+          ] ++ lib.optionals pkgs.stdenv.isLinux [
+            usbutils
+          ];
         in
         rec {
           default = pkgs.mkShell {
             name = "avi-99l-esp32s3-idf";
 
-            buildInputs = with pkgs; [
-              espIdf
-
-              git
-              cmake
-              ninja
-              ccache
-              dfu-util
-            ] ++ lib.optionals pkgs.stdenv.isLinux [
-              usbutils
-            ];
+            packages = espIdfDeps;
 
             shellHook = ''
               export IDF_TARGET=esp32s3
 
-              # まずは事故切り分けのため ccache を無効化。
-              # 問題が消えたら 1 に戻してよい。
+              # まず安全側。必要になったら 1 にする。
               export IDF_CCACHE_ENABLE=0
 
-              # ESP-IDF が書き込む可能性のある場所は /nix/store にしない。
-              export IDF_TOOLS_PATH="''${XDG_CACHE_HOME:-$HOME/.cache}/avi-99l/esp-idf-tools"
-              mkdir -p "$IDF_TOOLS_PATH"
-
-              # tools は Nix store 側の読み取り専用生成物を参照する。
-              # IDF_TOOLS_PATH 自体は writable にしておくのが重要。
-              if [ ! -e "$IDF_TOOLS_PATH/tools" ]; then
-                ln -s ${idfToolsPath}/tools "$IDF_TOOLS_PATH/tools"
-              fi
-
-              # dist は ESP-IDF 側が触る可能性があるので writable にする。
-              mkdir -p "$IDF_TOOLS_PATH/dist"
-
-              # ccache を再有効化した場合でも、書き込み先を明示しておく。
+              # ccache を有効化した場合の保存先。
               export CCACHE_DIR="''${XDG_CACHE_HOME:-$HOME/.cache}/avi-99l/ccache"
               mkdir -p "$CCACHE_DIR"
-
-              # custom installation 扱いでも ESP-IDF 側がバージョン判定できるようにする。
-              export ESP_IDF_VERSION="$(cat "$IDF_PATH/version.txt" | sed 's/^v//' | cut -d. -f1,2)"
 
               echo "ESP32-S3 ESP-IDF shell"
               echo "IDF_PATH=$IDF_PATH"
               echo "IDF_TOOLS_PATH=$IDF_TOOLS_PATH"
+              echo "IDF_PYTHON_ENV_PATH=$IDF_PYTHON_ENV_PATH"
               echo "CCACHE_DIR=$CCACHE_DIR"
               echo "Use: idf.py set-target esp32s3 / idf.py build / idf.py flash / idf.py monitor"
             '';
           };
 
           esp32s3 = default;
+
+          "esp-hal" = pkgs.mkShell {
+            name = "avi-99l-esp32s3-esp-hal";
+
+            packages = espHalDeps;
+
+            shellHook = ''
+              export IDF_TARGET=esp32s3
+              export CARGO_BUILD_TARGET=xtensa-esp32s3-none-elf
+
+              export IDF_PYTHON_CHECK_CONSTRAINTS=no
+              export IDF_PYTHON_CHECK_DONE=1
+
+              export RUSTUP_HOME="''${RUSTUP_HOME:-$HOME/.rustup}"
+              export CARGO_HOME="''${CARGO_HOME:-$HOME/.cargo}"
+
+              mkdir -p "$RUSTUP_HOME" "$CARGO_HOME"
+
+              # ESP32-S3 は Xtensa なので、通常の stable Rust だけでは足りない。
+              # espup が Espressif Rust toolchain と Xtensa 周辺ツールを入れる。
+              if ! rustup toolchain list 2>/dev/null | grep -Eq '^esp([[:space:]]|$)'; then
+                echo "Espressif Rust toolchain is not installed."
+                echo "Running: espup install -t esp32s3"
+                espup install -t esp32s3
+              fi
+
+              if [ -f "$HOME/export-esp.sh" ]; then
+                source "$HOME/export-esp.sh"
+              else
+                echo "ERROR: $HOME/export-esp.sh was not found."
+                echo "Run manually: espup install -t esp32s3"
+              fi
+
+              # espup の export 後に再指定する。
+              export IDF_TARGET=esp32s3
+              export CARGO_BUILD_TARGET=xtensa-esp32s3-none-elf
+
+              # rust-analyzer 用。失敗しても shell 自体は壊さない。
+              if command -v rustc >/dev/null 2>&1; then
+                rust_sysroot="$(rustc --print sysroot 2>/dev/null || true)"
+                if [ -n "$rust_sysroot" ] && [ -d "$rust_sysroot/lib/rustlib/src/rust/library" ]; then
+                  export RUST_SRC_PATH="$rust_sysroot/lib/rustlib/src/rust/library"
+                fi
+              fi
+
+              echo "ESP32-S3 esp-hal shell"
+              echo "IDF_TARGET=$IDF_TARGET"
+              echo "CARGO_BUILD_TARGET=$CARGO_BUILD_TARGET"
+              echo "RUSTUP_HOME=$RUSTUP_HOME"
+              echo "CARGO_HOME=$CARGO_HOME"
+              echo "probe-rs=$(command -v probe-rs || true)"
+              echo "Use:"
+              echo "  esp-generate"
+              echo "  cargo build"
+              echo "  cargo run"
+              echo "  espflash flash --monitor <ELF>"
+              echo "  probe-rs list"
+              echo "  probe-rs info --protocol jtag --chip esp32s3"
+              echo "  probe-rs run --protocol jtag --chip esp32s3 <ELF>"
+            '';
+          };
         });
     };
 }
