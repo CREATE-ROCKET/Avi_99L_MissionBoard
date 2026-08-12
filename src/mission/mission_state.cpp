@@ -1,0 +1,232 @@
+#include "mission/mission_state.hpp"
+
+#include <limits>
+
+namespace mission {
+namespace {
+
+constexpr uint64_t kOneSecondUs = 1'000'000;
+constexpr uint64_t kControlGateUs = 8 * kOneSecondUs;
+constexpr uint64_t kPressureDeploymentGateUs = 10 * kOneSecondUs;
+constexpr uint64_t kDeploymentDeadlineUs = 17 * kOneSecondUs;
+constexpr uint64_t kPowerCutoffUs = 25 * kOneSecondUs;
+
+uint32_t nextEpoch(uint32_t current) {
+  ++current;
+  return current == 0 ? 1 : current;
+}
+
+} // 無名名前空間
+
+bool ControlAvailability::ready() const {
+  return fin_control_available && fin_zero_hold_valid && attitude_valid &&
+         airspeed_above_60 && lps_available && ssc_available &&
+         gyro_bias_valid && ssc_zero_valid;
+}
+
+bool SequenceConfiguration::ready() const {
+  return fin_zero_configured && parachute_open_configured &&
+         parachute_close_configured && resources_preallocated;
+}
+
+TransitionResult MissionStateMachine::startSequence(
+    uint64_t, const SequenceConfiguration &configuration) {
+  if (snapshot_.state != protocol::MissionState::command_receive)
+    return TransitionResult::invalid_state;
+  if (!configuration.ready())
+    return TransitionResult::not_configured;
+  snapshot_.flight_epoch = nextEpoch(snapshot_.flight_epoch);
+  snapshot_.state = protocol::MissionState::liftoff_detection;
+  snapshot_.fin_control_disabled = false;
+  snapshot_.control_reentry_inhibited = false;
+  snapshot_.reset_invalidated = false;
+  snapshot_.deployment_started = false;
+  snapshot_.deployment_power_cutoff_latched = false;
+  snapshot_.parachute = ParaDirective::hold;
+  control_gate_evaluated_ = false;
+  fin_control_available_ = configuration.fin_zero_configured;
+  elapsed_offset_us_ = 0;
+  invalidateLiftoff();
+  updateDirectives(0);
+  return TransitionResult::completed;
+}
+
+TransitionResult MissionStateMachine::cancelSequence() {
+  if (snapshot_.state != protocol::MissionState::liftoff_detection)
+    return TransitionResult::invalid_state;
+  snapshot_.state = protocol::MissionState::command_receive;
+  snapshot_.fin_control_disabled = false;
+  snapshot_.control_reentry_inhibited = false;
+  snapshot_.deployment_started = false;
+  control_gate_evaluated_ = false;
+  fin_control_available_ = false;
+  elapsed_offset_us_ = 0;
+  invalidateLiftoff();
+  updateDirectives(0);
+  return TransitionResult::completed;
+}
+
+TransitionResult MissionStateMachine::disableFinControl() {
+  if (snapshot_.state != protocol::MissionState::liftoff_detection &&
+      snapshot_.state != protocol::MissionState::engine_burn &&
+      snapshot_.state != protocol::MissionState::control)
+    return TransitionResult::invalid_state;
+  snapshot_.fin_control_disabled = true;
+  snapshot_.control_reentry_inhibited = true;
+  if (snapshot_.state == protocol::MissionState::control)
+    snapshot_.state = protocol::MissionState::engine_burn;
+  updateDirectives(0);
+  return TransitionResult::completed;
+}
+
+TransitionResult MissionStateMachine::liftoffDetectionEmergencyStop() {
+  if (snapshot_.state != protocol::MissionState::engine_burn)
+    return TransitionResult::invalid_state;
+  snapshot_.flight_epoch = nextEpoch(snapshot_.flight_epoch);
+  snapshot_.state = protocol::MissionState::liftoff_detection;
+  snapshot_.control_reentry_inhibited = snapshot_.fin_control_disabled;
+  snapshot_.deployment_started = false;
+  control_gate_evaluated_ = false;
+  elapsed_offset_us_ = 0;
+  invalidateLiftoff();
+  updateDirectives(0);
+  return TransitionResult::completed;
+}
+
+TransitionResult MissionStateMachine::restoreAfterReset(
+    uint64_t now_us, const ResetCheckpoint &checkpoint) {
+  if (!checkpoint.valid || !checkpoint.elapsed_valid ||
+      checkpoint.state == protocol::MissionState::command_receive ||
+      checkpoint.state == protocol::MissionState::liftoff_detection)
+    return TransitionResult::not_configured;
+
+  snapshot_ = {};
+  snapshot_.state = checkpoint.deployment_started ||
+                            checkpoint.state == protocol::MissionState::descent
+                        ? protocol::MissionState::descent
+                        : protocol::MissionState::engine_burn;
+  snapshot_.flight_epoch = checkpoint.flight_epoch == 0
+                               ? 1
+                               : checkpoint.flight_epoch;
+  snapshot_.liftoff_time_valid = true;
+  snapshot_.liftoff_time_us =
+      now_us;
+  snapshot_.control_reentry_inhibited = true;
+  snapshot_.reset_invalidated = true;
+  snapshot_.deployment_started = checkpoint.deployment_started;
+  snapshot_.deployment_power_cutoff_latched = checkpoint.power_cutoff_latched;
+  snapshot_.fin = FinDirective::brake;
+  snapshot_.parachute = checkpoint.power_cutoff_latched
+                            ? ParaDirective::powered_off
+                            : (checkpoint.deployment_started
+                                   ? ParaDirective::open
+                                   : ParaDirective::hold);
+  control_gate_evaluated_ = true;
+  fin_control_available_ = false;
+  elapsed_offset_us_ = checkpoint.elapsed_us;
+  updateDirectives(now_us);
+  return TransitionResult::completed;
+}
+
+void MissionStateMachine::tick(const MissionTickInput &input,
+                               const SafetyRequest &safety) {
+  const bool current_safety =
+      safety.flight_epoch != 0 &&
+      safety.flight_epoch == snapshot_.flight_epoch;
+  if (current_safety && snapshot_.liftoff_time_valid &&
+      safety.absolute_power_cutoff)
+    snapshot_.deployment_power_cutoff_latched = true;
+
+  if (snapshot_.state == protocol::MissionState::liftoff_detection &&
+      input.liftoff_detected) {
+    snapshot_.liftoff_time_valid = true;
+    snapshot_.liftoff_time_us = input.monotonic_us >= kOneSecondUs
+                                    ? input.monotonic_us - kOneSecondUs
+                                    : 0;
+    snapshot_.state = protocol::MissionState::engine_burn;
+    control_gate_evaluated_ = false;
+    elapsed_offset_us_ = 0;
+  }
+
+  uint64_t elapsed_us{};
+  if (snapshot_.liftoff_time_valid &&
+      input.monotonic_us >= snapshot_.liftoff_time_us)
+    elapsed_us = elapsed_offset_us_ +
+                 input.monotonic_us - snapshot_.liftoff_time_us;
+  fin_control_available_ = input.control.fin_control_available;
+
+  const bool flight_state =
+      snapshot_.state == protocol::MissionState::engine_burn ||
+      snapshot_.state == protocol::MissionState::control;
+  if (flight_state &&
+      ((current_safety && safety.deploy) ||
+       (input.deployment_pressure_condition &&
+        snapshot_.liftoff_time_valid &&
+        elapsed_us >= kPressureDeploymentGateUs) ||
+       (snapshot_.liftoff_time_valid && elapsed_us >= kDeploymentDeadlineUs)))
+    enterDescent();
+
+  if (snapshot_.state == protocol::MissionState::engine_burn &&
+      snapshot_.liftoff_time_valid && elapsed_us >= kControlGateUs &&
+      !control_gate_evaluated_) {
+    control_gate_evaluated_ = true;
+    if (!snapshot_.fin_control_disabled &&
+        !snapshot_.control_reentry_inhibited && input.control.ready())
+      snapshot_.state = protocol::MissionState::control;
+    else
+      snapshot_.control_reentry_inhibited = true;
+  }
+
+  if (snapshot_.state == protocol::MissionState::control &&
+      !input.control.ready()) {
+    snapshot_.state = protocol::MissionState::engine_burn;
+    snapshot_.control_reentry_inhibited = true;
+  }
+
+  if (snapshot_.liftoff_time_valid && elapsed_us >= kPowerCutoffUs)
+    snapshot_.deployment_power_cutoff_latched = true;
+  updateDirectives(input.monotonic_us);
+}
+
+void MissionStateMachine::enterDescent() {
+  snapshot_.state = protocol::MissionState::descent;
+  snapshot_.deployment_started = true;
+  snapshot_.parachute = ParaDirective::open;
+}
+
+void MissionStateMachine::updateDirectives(uint64_t now_us) {
+  if (snapshot_.deployment_power_cutoff_latched)
+    snapshot_.parachute = ParaDirective::powered_off;
+  else if (snapshot_.deployment_started)
+    snapshot_.parachute = ParaDirective::open;
+
+  if (snapshot_.reset_invalidated || snapshot_.fin_control_disabled) {
+    snapshot_.fin = FinDirective::brake;
+    return;
+  }
+  if (snapshot_.state == protocol::MissionState::control) {
+    snapshot_.fin = FinDirective::roll_control;
+    return;
+  }
+  if (snapshot_.state == protocol::MissionState::liftoff_detection ||
+      snapshot_.state == protocol::MissionState::engine_burn ||
+      snapshot_.state == protocol::MissionState::descent) {
+    if (snapshot_.liftoff_time_valid &&
+        now_us >= snapshot_.liftoff_time_us + kPowerCutoffUs)
+      snapshot_.fin = FinDirective::brake;
+    else if (fin_control_available_)
+      snapshot_.fin = FinDirective::zero_hold;
+    else
+      snapshot_.fin = FinDirective::brake;
+    return;
+  }
+  snapshot_.fin = FinDirective::brake;
+}
+
+void MissionStateMachine::invalidateLiftoff() {
+  snapshot_.liftoff_time_valid = false;
+  snapshot_.liftoff_time_us = 0;
+  elapsed_offset_us_ = 0;
+}
+
+} // 名前空間 mission
