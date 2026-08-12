@@ -1,4 +1,4 @@
-u#include "bringup/sts_bringup.hpp"
+#include "bringup/sts_bringup.hpp"
 
 #include <array>
 #include <cmath>
