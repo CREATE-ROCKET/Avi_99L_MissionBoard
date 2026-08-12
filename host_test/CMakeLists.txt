@@ -5,8 +5,16 @@ enable_testing()
 
 add_executable(mission_host_tests
   mission_host_tests.cpp
+  ../src/actuators/safety_core.cpp
+  ../src/control/control_pipeline.cpp
+  ../src/mission/command_executor.cpp
+  ../src/mission/mission_state.cpp
+  ../src/mission/recovery.cpp
   ../src/protocol/can_protocol.cpp
   ../src/protocol/quantization.cpp
+  ../src/sensors/attitude_estimator.cpp
+  ../src/sensors/flight_detectors.cpp
+  ../src/sensors/sensor_health.cpp
 )
 target_include_directories(mission_host_tests PRIVATE ../src)
 target_compile_features(mission_host_tests PRIVATE cxx_std_17)
