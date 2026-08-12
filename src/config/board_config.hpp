@@ -7,6 +7,7 @@
 #include "driver/i2c_types.h"
 #include "driver/spi_master.h"
 #include "driver/uart.h"
+#include "config/control_config.hpp"
 
 namespace board {
 
@@ -78,24 +79,6 @@ constexpr uint32_t kCalibrationDurationMs = 3'000;
 // TODO(SIMULATION): ICM連続欠落許容sample数をSpicaで決定する
 constexpr uint32_t kImuInterpolatableMissingSamples = 1;
 
-enum class MotorPolarity : uint8_t {
-  unconfigured,
-  positive_in1,
-  positive_in2,
-};
-
-struct MotorProfile {
-  uint8_t id;
-  MotorPolarity polarity;
-  bool parameters_valid;
-  float resistance_ohm;
-  float torque_constant_nm_per_a;
-  float speed_constant_rpm_per_v;
-  float drivetrain_efficiency;
-  float max_motor_current_a;
-  float max_output_torque_nm;
-};
-
 // TODO(HW_TEST): FlightMotorA実測値
 constexpr MotorProfile kFlightMotorA{1, MotorPolarity::unconfigured, false,
                                      0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
@@ -103,21 +86,8 @@ constexpr MotorProfile kFlightMotorA{1, MotorPolarity::unconfigured, false,
 constexpr MotorProfile kSpareMotorB{2, MotorPolarity::unconfigured, false,
                                     0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
 
-struct FinSoftwareLimits {
-  bool configured;
-  float minimum_rad;
-  float maximum_rad;
-};
-
 // TODO(HW_TEST): 動翼・stopper組付後に決定
 constexpr FinSoftwareLimits kFinSoftwareLimits{false, 0.0F, 0.0F};
-
-struct AlphaBetaConfig {
-  bool configured;
-  float alpha;
-  float beta;
-  uint32_t reset_gap_us;
-};
 
 // TODO(SIMULATION): alpha/betaをSpica + 実encoder logで確定
 constexpr AlphaBetaConfig kThetaDotFilter{false, 0.0F, 0.0F, 0};
