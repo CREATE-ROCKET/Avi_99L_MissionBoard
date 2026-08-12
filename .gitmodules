@@ -1,0 +1,4 @@
+[submodule "lib/Avi_ESP_Libs"]
+	path = lib/Avi_ESP_Libs
+	url = https://github.com/CREATE-ROCKET/Avi_ESP_Libs
+	branch = refactor

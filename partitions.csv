@@ -1,0 +1,5 @@
+# Name,Type,SubType,Offset,Size,Flags
+nvs,data,nvs,0x9000,64K,
+phy_init,data,phy,0x19000,4K,
+factory,app,factory,0x20000,4M,
+flightlog,data,0x40,0x420000,2M,
