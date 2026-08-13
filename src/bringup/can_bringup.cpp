@@ -6,6 +6,7 @@
 #include "CANCREATE.h"
 #include "avi_esp_libs/timeout.h"
 #include "config/board_config.hpp"
+#include "esp_idf_version.h"
 #include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -110,6 +111,13 @@ esp_err_t CanBringup::test() {
   if (!guard.acquired())
     return ESP_ERR_INVALID_STATE;
 
+#if ESP_IDF_VERSION_MAJOR == 6 && ESP_IDF_VERSION_MINOR == 0
+  // ESP-IDF #18803: TWAI node削除後にdeferred event callbackが走り得る。
+  // CANCREATE::test()は内部でnodeを再生成するため、修正版IDFへ更新するまで実行しない。
+  std::printf("CAN test: ESP-IDF 6.0.x TWAI lifecycle既知問題のため未対応\n");
+  return ESP_ERR_NOT_SUPPORTED;
+#endif
+
   std::printf(
       "CAN test semantics: standard ID 0x7FFをnormal/single-shotで送信し、"
       "ACK成功ならsuccess。ACKが無ければno-ack/self-loopbackを行い、"
@@ -175,6 +183,12 @@ esp_err_t CanBringup::loadTest(uint32_t frequency_hz,
     return ESP_ERR_INVALID_STATE;
   if (frequency_hz == 0 || frequency_hz > 1'000 || duration_seconds == 0)
     return ESP_ERR_INVALID_ARG;
+
+#if ESP_IDF_VERSION_MAJOR == 6 && ESP_IDF_VERSION_MINOR == 0
+  // TX完了直後のnode削除も同じTWAI lifecycle問題を踏むためfail-closedにする。
+  std::printf("CAN load: ESP-IDF 6.0.x TWAI lifecycle既知問題のため未対応\n");
+  return ESP_ERR_NOT_SUPPORTED;
+#endif
 
   CANCREATE can;
   esp_err_t result = can.begin(config());
