@@ -23,7 +23,7 @@ ESP32-S3-WROOM-1-N16R8を搭載した99L Mission Board firmwareです。Vault 00
 - actuatorを動かす試験は自動実行しません。USB consoleから対応commandを明示的に入力した場合だけ実行します。
 - motor PWMは`motor-arm`後だけ許可されます。arm状態はRAMだけに保持され、resetで必ず解除されます。試験中でも`motor-disarm`を受理し、通常は即時、出力lock競合時も5 ms以内に安全停止を再試行します。
 - motorには動翼・stopperが無いため飛行用±15度limitは使いません。bring-up専用上限はduty 15%、速度100 rad/s、command時間45秒です。速度上限は実測前の暫定値で、`combined-motor-imu-test`の実行時間は41秒です。
-- STS3215は`sts-*` command実行中だけpara電源をONにし、終了時にtorqueを無効化して電源をOFFにします。最初の移動は`sts-small-move`で絶対値3度以下に限定します。
+- bring-upのSTS UART1はshell初期化時、Para電源OFFのまま一度だけopenし、shell lifetime中は保持します。`sts-*` command時だけPara電源をONにして100 ms待機し、起動中のtimeoutだけを1.5秒のdeadline内で再PINGしてからSTS3215を初期化します。終了時はtorqueを無効化してPara電源をOFFにしますが、UARTはcloseしません。最初の移動は`sts-small-move`で絶対値3度以下に限定します。
 - `aux5v-on`はGPIO40をHIGHにし、`aux5v-off`またはresetまで+5 Vを保持します。必要な試験中だけ明示的にONにし、終了後は必ずOFFへ戻します。
 - `pio device monitor`とbinary captureを同時に開かないでください。同じUSB deviceを同時利用できません。
 - motor capture中に`Ctrl-C`を入力するとhost toolはportを閉じる前に`motor-disarm`を送ります。ただしUSB通信不能時には届かないため、物理resetまたはmotor電源遮断を直ちに行える状態を必ず確保してください。
@@ -115,14 +115,14 @@ pio device monitor --port "$MISSION_PORT" --baud 115200 --eol LF
 | `imu-selftest` | FIFO無効状態でICM42688 self-testを実行 |
 | `imu-stream <seconds>` | ICM42688 FIFOを1 kHzでbinary stream出力 |
 | `imu-static <seconds>` | stationary raw dataをbinary stream出力 |
-| `can-test` | CANCREATEのACK/self-loopback診断、status、Config復元を確認 |
-| `can-load-test <hz> <seconds>` | test ID `0x7FE`、sequence付きframeで負荷、bus-off/recoveryを確認 |
-| `sts-probe` | para電源ON、bus/servo begin、設定read後に安全cleanup |
+| `can-test` | CANCREATEのACK/self-loopback診断。ESP-IDF 6.0.xでは既知TWAI lifecycle問題を避けて実行拒否 |
+| `can-load-test <hz> <seconds>` | test ID `0x7FE`の負荷試験。ESP-IDF 6.0.xでは同じ理由で実行拒否 |
+| `sts-probe` | persistent UARTで明示PING、servo begin、設定read後に安全cleanup |
 | `sts-read` | STS3215 telemetryを約50 Hzで取得 |
 | `sts-free` | torqueを無効化し、終了時にpara電源OFF |
 | `sts-hold` | 現在位置保持を明示実行 |
 | `sts-small-move <deg>` | 低速・低torqueで相対移動。`abs(deg) <= 3` |
-| `i2c-probe` | `0x28`、`0x5C`、`0x5D`を含むno-device有限timeout試験 |
+| `i2c-probe` | `0x28`、`0x5C`、`0x5D`の有限timeoutとLPS transport latencyを確認。物理値は評価しない |
 | `sd-test` | SDMMC 4-bitで1 MiB write/flush/fsync/readback/CRC/unmount |
 | `flash-test` | label検証済み`flightlog`の試験範囲をwrite/read/再起動検証/erase |
 | `adc-stream <seconds>` | logic/motor電圧をcalibrated ADCで100 Hz取得 |
@@ -181,7 +181,10 @@ CANはstandard 11-bit、125 kbit/s、DLC 8以下、multi-byteはlittle-endianで
 
 - ICM42688とAS5047Dは各独立SPI busで1 kHz acquisition候補
 - LPS25HB/SSCは外部pull-upのI2C0 300 kHz。SSC未接続は正常な起動条件で、Controlだけをinhibitします。
+- 現在のLPS25HB個体はpressure/temperatureの妥当性を保証できません。bring-upではtransport/config/read/cleanupとread latencyだけを評価し、物理値、実効ODR、freshness、離床・頂点判定を合格扱いしません。
+- 2026-08-13のaddress probeでは100 ms以上安定後も未使用`0x5D`へ1/3,200のintermittent false ACKがありました。logic analyzerでwire ACK/NACKを確認するまでI2C address検出も未解決です。
 - STS3215はUART1唯一owner。Open位置未復元時は動作せずpower cutoffします。
+- bring-upのSTS tx/response timeout 100 msと起動deadline 1.5秒は`TODO(HW_TEST)`暫定値です。2026-08-13の実機ではPara電源ON後の最初の6回がtimeoutし、7回目のPING、STS3215初期化、50回のtelemetry read、cleanupが成功しました。個体差・電源条件を測定後に安全に短縮します。
 - MotorProfile polarity/個体値、fin software limitは`TODO(HW_TEST)`のまま未設定です。
 - Roll gain table、freshness/debounce、quadratic estimator、torque scaleは`TODO(SIMULATION)`を保持します。
 
@@ -191,5 +194,7 @@ CANはstandard 11-bit、125 kbit/s、DLC 8以下、multi-byteはlittle-endianで
 - Roll gain tableとmotor/fin configuration未確定のためproduction runtimeはflight-disabledです。
 - ICM history/replay、AS5047D unwrap、quadratic fin rateまではruntimeへ接続済みですが、Roll/ZeroHold/TorqueMapperからmotor出力への経路はprofile確定まで無効で、常にcoastします。
 - ParachuteTaskはSTS唯一ownerですが、Open位置永続loader未接続のためflight Openを安全拒否します。
+- AS5047DはDIAG/AGC/magnitudeが全て0の応答を返しており、bring-upは`ESP_ERR_INVALID_RESPONSE`としてmotor試験をfail-closedにします。配線・電源・SPI信号の切り分けが完了するまでmotorをarmしません。
+- ESP-IDF 6.0.xにはTWAI node削除後のdeferred callback問題があるため、nodeを作成・破棄するbring-up CAN診断は`ESP_ERR_NOT_SUPPORTED`で拒否します。常駐ownerを使うproduction CANとはlifecycleが異なります。
 - Deep SleepはRTC marker/wake causeを検証した専用task subsetで10秒周期wakeします。Internal Flash/SD log reader未接続のためlog dump要求は`SourceUnavailable`です。2秒command windowは`TODO(HW_TEST)`です。
 - 実機flash、CAN/LoRa round-trip、actuator試験はREADMEのbuild/test完了とは別に記録します。未実施を成功扱いしません。

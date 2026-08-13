@@ -109,20 +109,22 @@ PASS条件は1 kHzで60秒、`angle_raw`が0..16383、degree/radian変換が整�
 
 `i2c-probe`を実行します。I2C_NUM_0、SDA GPIO47、SCL GPIO48、300 kHz、internal pull-upなし、lock noWait、有限operation timeoutを使います。
 
-現在の未接続試験では+5 VをOFFのままにします。接続後に+5 Vが必要な試験では`aux5v-on`を明示実行し、終了後は`aux5v-off`で必ずOFFへ戻します。`aux5v-on`は自動cleanupされず、OFF commandまたはresetまでGPIO40をHIGHに保持します。
+現在の基板ではSSCは未接続、LPS25HBは接続済みです。`aux5v-on`を明示実行し、100 ms以上待ってから`i2c-probe`を実行します。終了後は`aux5v-off`で必ずOFFへ戻します。`aux5v-on`は自動cleanupされず、OFF commandまたはresetまでGPIO40をHIGHに保持します。
 
 - SSC `0x28`
 - LPS `0x5C`
 - LPS `0x5D`
 
-現在は差圧系が未接続なので、deviceが見つからない結果は正常です。約100回のno-device accessが有限時間で戻り、bus hangとresource leakが無いことをPASS条件とします。LPS25HB/SSCDRRN005PD2A5のsensor値検証は`SKIP`とします。
+SSC `0x28`が見つからない結果は正常です。各未接続addressへの100回のaccessが有限時間で戻り、bus hangとresource leakが無いことをPASS条件とします。LPS25HBはODRを25 Hzへ設定して25回readし、I2C transactionの成功数、error数、最大latency、cleanupだけを評価します。45 ms間隔のpollは実効25 Hzを証明しません。
+
+現在のLPS25HB個体はpressure/temperatureの妥当性を保証できないため、物理値を表示・合否判定・parameter決定へ使いません。実効ODR、sample更新、averaging delay、freshness、離床・頂点判定も本試験では`NOT EVALUATED`です。
 
 ### 3.5 CAN
 
-CAN配線とpeerのtest ID許可を確認してから実施します。
+CAN配線とpeerのtest ID許可を確認してから実施します。ただし現在のESP-IDF 6.0.xでは、TWAI node削除後にdeferred callbackが解放済みevent groupへ触れ得る既知問題があるため、`can-test`と`can-load-test`は`ESP_ERR_NOT_SUPPORTED`で安全拒否します。
 
-1. `can-test`を実行する。`CANCREATE::test`は標準ID `0x7FF`をnormal/single-shotで送り、ACKが無い場合はno-ack/self-loopbackでcontrollerとpeer不在を切り分け、最後に元Configを復元する。このcommandは`recover`を呼ばない。
-2. peer接続時に`can-load-test 100 60`を実行する。bring-up専用標準ID `0x7FE`、payload内sequence counterを使う。bus-offまたはrecoveringを検出した場合の`recover`はこの負荷試験で確認する。
+1. upstream修正を含むESP-IDFへ更新後、`can-test`を実行する。`CANCREATE::test`は標準ID `0x7FF`をnormal/single-shotで送り、ACKが無い場合はno-ack/self-loopbackでcontrollerとpeer不在を切り分け、最後に元Configを復元する。このcommandは`recover`を呼ばない。
+2. 同じ修正後、peer接続時に`can-load-test 100 60`を実行する。bring-up専用標準ID `0x7FE`、payload内sequence counterを使う。bus-offまたはrecoveringを検出した場合の`recover`はこの負荷試験で確認する。
 3. requested、driver queue投入成功、write error、RX error、bus error、dropped RX、bus-off回数、recovery成否、平均/最大write latencyを記録する。
 
 `write == ESP_OK`はdriver queueへの投入成功であり、物理ACK完了数ではありません。100 Hzで問題が出た場合はlibrary、Mission Board、配線、peerを切り分け、peer処理能力またはbus loadが原因と確認できた場合だけ10 Hzを比較します。
@@ -165,7 +167,9 @@ GPIO1 logicとGPIO2 motorを100 Hzで取得します。ESP-IDF calibration API�
 4. `sts-hold`
 5. faultが無い場合だけ`sts-small-move 3`または`sts-small-move -3`
 
-各commandはpara電源ON、STSCREATE begin、STS3215 begin、必要なoperation、disableTorque、bus end、para電源OFFの順でcleanupします。`begin`またはreadだけで動いた場合は即中止し、library bugとして扱います。
+STSCREATE UART1はbring-up shell初期化時、Para電源OFFのまま一度だけbeginし、shell lifetime中はopenしたまま保持します。各commandはPara電源ON、100 ms安定待ち、起動中のtimeoutまたは不完全応答だけを1.5秒のdeadline内で再PING、STS3215 begin、必要なoperation、disableTorque、STS3215 end、Para電源OFFの順で処理します。STSCREATEはcommand終了時にendしません。`PING`、`STS begin`、cleanupはそれぞれresult、latency、device errorを個別に記録します。
+
+tx/response timeoutは切り分け用に100 ms / 100 msとしますが、起動deadlineとともに`TODO(HW_TEST)`の暫定値です。2026-08-13の実機では最初の6回がtimeoutし、同じ電源cycleの7回目でPINGに成功しました。続くSTS3215 begin、`sts-read`の50 sample、cleanupが成功し、2 command目でも`GPIO 42 is not usable`は再発していません。PINGが1.5秒間すべてtimeoutする場合は物理UART/RS-485を、PING成功後のSTS beginだけ失敗する場合はconfiguration readを次段階で調査します。
 
 response latency、timeout数、`lastDeviceError`、overload、overcurrent、overtemperature、encoder/voltage fault、position、speed、current、voltage、temperatureを記録します。最初の移動は絶対値3度以下、低speed、低torqueです。
 

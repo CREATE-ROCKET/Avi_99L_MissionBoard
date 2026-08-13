@@ -2,15 +2,14 @@
 
 ## 1. 現在の識別情報
 
-- 記録日時: 2026-08-11T01:50:00+09:00
+- 最新検証日時: 2026-08-13
 - 作業開始時Mission Board HEAD: `31cadbc`
-- 現在のMission Board HEAD: `48d3ee3f7161b9bb44fcc3840108baed1af618f9`
+- 現在のMission Board HEAD: `5ff403309fb2eb1611d0f8e663993552f3d76941` + working tree変更
 - branch: `main`
-- HEAD変化: 作業中に外部の`git pull`で`31cadbc`から`48d3ee3`へ進んだ。今回の作業によるcommitではない
 - Avi_ESP_Libs branch: `refactor`
-- Avi_ESP_Libs取得元HEAD: `0701132deb1d662732059a505001d0e238bc0d13`
-- submodule状態: 上記SHAを基点とし、CAN診断ID対応の未commit変更あり
-- serial port: `/dev/ttyACM0`。このpathは今回の観測結果であり、設定へ固定しない
+- Avi_ESP_Libs HEAD: `9bd7a365057b3f532f25166a2620b45c20df0783`
+- submodule状態: clean。今回変更していない
+- serial port: `/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_44:1B:F6:D1:DC:A8-if00`。`ttyACM`番号は固定しない
 - MCU確認: PlatformIO付属esptoolでESP32-S3 revision 0.2を確認
 - commit: 実施していない
 
@@ -20,24 +19,28 @@
 |---|---|---|
 | 作業前状態・docs確認 | PASS | 未commit変更を保持し、branch/HEADとrepository内docsを確認 |
 | 変更前empty firmware build | FAIL | 旧環境名のstale sdkconfigとESP-IDF 6.0.1の組合せで`kconfgen`が`AttributeError` |
-| Avi_ESP_Libs submodule取得 | PASS | `lib/Avi_ESP_Libs`、`refactor`、SHA `0701132...` |
-| Avi_ESP_Libs ESP-IDF smoke build | PASS | CAN修正後を含めlibrary側build成功 |
-| project-local board foundation build | PASS | ESP32-S3、16 MiB Flash、8 MiB PSRAM用envで`pio run`成功 |
-| upload/boot | PASS | `/dev/ttyACM0`へuploadしboot完了 |
+| Avi_ESP_Libs submodule | PASS | `refactor`、SHA `9bd7a365...`、clean。今回変更なし |
+| production/bring-up build | PASS | ESP-IDF 6.0.1で両environmentの`pio run`成功 |
+| upload/boot | PASS | serial `44:1B:F6:D1:DC:A8`を再識別し、最新bring-upをflash/boot |
 | safe output初期化 | PASS | boot先頭のGPIO38/39/40/44 LOW設定が`ESP_OK`、意図しないactuator動作なし |
 | Flash/PSRAM runtime確認 | PASS | Flash 16 MiB、PSRAM 8 MiB initialized、QIO 80 MHzを確認 |
 | custom partition boot確認 | PASS | NVS 64 KiB、PHY 4 KiB、factory 4 MiB、flightlog 2 MiBのtableを確認 |
 | host capture parser self-test | PASS | CRC、分割frame、破損frame、sequence gap、encoder/IMU/ADC decode、CSV出力を確認 |
-| SPICREATE/AS5047D/ICM42688 | PENDING | 実機API試験とdata captureは未実施 |
-| CANCREATE | PENDING | 実機ACK/load/bus-off/recovery試験は未実施 |
-| I2CCREATE no-device | PENDING | 100回の有限timeout/hang/resource確認は未実施 |
-| LPS25HB/SSCDRRN005PD2A5 sensor値 | SKIP | 差圧系が未接続。接続後に再試験 |
-| STSCREATE/STS3215 | PENDING | 意図しない動作、telemetry、free/hold/small moveは未実施 |
-| microSD/flightlog Flash/ADC | PENDING | 実機read/write/calibration試験は未実施 |
-| calibration | PENDING | gyro/gravityとrepeatabilityの取得は未実施 |
-| motor/combined identification | PENDING | 安全上、前段driver検証完了後に実施 |
+| ICM42688 | PASS (静置/通信) | self-test 10/10、1 kHz 5分で300,000 sample、欠落・FIFO fault・CRC error 0 |
+| AS5047D | FAIL | DIAG/AGC/magnitudeを含むstatusが全0。`ESP_ERR_INVALID_RESPONSE`としてmotor試験を拒否 |
+| CANCREATE bring-up診断 | BLOCKED | ESP-IDF 6.0.xのTWAI lifecycle既知問題を実機panicで確認し、診断commandを安全拒否 |
+| I2CCREATE address probe | FAIL (intermittent) | 100 ms以上安定後も未使用LPS high addressで1/3,200 false ACK。原因未確定 |
+| LPS25HB transport timing | MEASURED | config/read/end、400/400 read成功、最大transaction latency 710 us。値・実効ODRは未評価 |
+| LPS25HB pressure/temperature | NOT EVALUATED | 現在個体の物理値妥当性を保証できないため、値決め・判定へ不使用 |
+| SSCDRRN005PD2A5 sensor値 | SKIP | 未接続。Unavailable条件だけ確認 |
+| STSCREATE/STS3215 | PASS (read-only) | persistent UARTでprobe/read、50 sample、torque OFF、Para電源OFFを確認。hold/small moveは未実施 |
+| microSD | PASS (bring-up I/O) | 1 MiB write/read/CRC/unmountを6/6成功。production logger throughputは未評価 |
+| flightlog Flash | PASS (bring-up sector) | 既知test sectorのwrite/read/CRC/reboot/eraseを確認。production appendは未評価 |
+| ADC | PARTIAL | motor source 10.17 V相当、logic senseは0 V。bench基準との校正と閾値決定は未実施 |
+| calibration | PARTIAL | 3秒×10回、IMU 10/10成功、SSC 0/10。stationary acceptance値は未決定 |
+| motor/combined identification | BLOCKED | AS5047D異常をfail-closed検出したためarm/駆動を実施せず |
 
-`PENDING`はPASSでもFAILでもありません。差圧sensor値以外を未接続扱いで`SKIP`にはしていません。
+`PARTIAL`、`BLOCKED`、`MEASURED`、`NOT EVALUATED`はPASSではありません。LPS25HBのtransaction timing取得は、address probe、pressure/temperature、実効ODR、freshness、離床・頂点判定のPASSを意味しません。
 
 ## 3. 実施記録
 
@@ -143,10 +146,11 @@
 
 ## 5. 取得data
 
-- firmware runtime確認: serial consoleで観察。保存raw fileなし
+- ICM 60秒/5分、ADC 10秒、calibration 10回のraw/CSV/summary: `data/bringup/hwtest_20260813/`（Git管理外）
+- STS、I2C、SD、Flash、AS5047D、CAN guard: serial consoleで観察。raw fileなし
 - host parser self-test: temporary directoryだけを使用し、終了時に削除
-- sensor/motor実測data: 未取得
-- 今後の保存先: `data/bringup/`。raw/CSV/summaryはGit管理外とし、このfileにsummaryだけを記録する
+- motor実測data: AS5047D異常のため安全側に未取得
+- raw/CSV/summaryはGit管理外とし、このfileにsummaryだけを記録する
 
 ## 6. 実測から分かった値
 
@@ -157,9 +161,20 @@
 | physical Flash | 16 MiB | runtime確認 |
 | PSRAM | 8 MiB、initialized | runtime確認 |
 | Flash mode/frequency | QIO、80 MHz | boot/build設定確認 |
-| serial port | `/dev/ttyACM0` | 今回の接続時だけの観測値 |
+| Mission USB serial | `44:1B:F6:D1:DC:A8` | udev VID/PIDとserial |
+| ICM FIFO read latency | 5分試験最大231 us（全試験最大259 us） | 300,000 sample |
+| ICM 60秒gyro平均 X/Y/Z | 0.00038 / 0.11117 / 0.07467 dps | 静置capture。正式bias値ではない |
+| ICM 60秒gyro標準偏差 X/Y/Z | 0.04838 / 0.04474 / 0.04490 dps | 標本標準偏差 |
+| STS cold-start応答 | 約826 ms、100/100 ms設定で7回目 | 同一電源cycleの再PING |
+| STS ready後PING / begin | 最大448 us / 約3.2 ms | read-only反復 |
+| STS telemetry read | 最大907 us（別試行938 us） | 50 sample、error 0 |
+| LPS I2C read latency | 最大710 us | 400 transaction。物理値・sample cadenceは未評価 |
+| motor電源ADC | 平均10.174 V相当 | 10秒、1,000 sample。bench基準未比較 |
+| logic電源ADC | 0 V相当 | 接続条件との矛盾があり未解決 |
+| microSD throughput | write 0.550 MiB/s、read 1.760 MiB/s | 1 MiB bring-up file |
+| Flash test block | 最大9,221 us | 4 KiB test sector |
 
-encoder jitter、IMU bias/noise/drift、motor polarity/dead-zone/time response、ADC電圧、CAN/STS latency、SD速度はまだ実測していません。
+LPS25HBのpressure/temperature読値は現在個体の妥当性を保証できないため、この表とparameter判断から除外しました。
 
 ## 7. 残っているTODO(SIMULATION)
 
@@ -169,25 +184,107 @@ encoder jitter、IMU bias/noise/drift、motor polarity/dead-zone/time response�
 ## 8. 残っているTODO(HW_TEST)
 
 - 400 Hz AirData取得時のI2C operation timeout
-- STS3215 tx/response timeout、para電源安定待ち、bring-up torque/speed/acceleration
+- LPS25HBの物理値は正常性を確認した個体と基準圧力/温度で別途検証する。今回のtransport latencyから値を決めない
+- STS3215 tx/response timeout、起動deadline、bring-up torque/speed/acceleration
 - bring-up motor速度停止上限
 - battery present threshold/debounce
 - 初期calibration時間
 - FlightMotorA/SpareMotorB実測profile
 - 動翼・stopper組付後のfin software limit
 - Flash logging rateとRealtimeへの影響
-- LPS25HB/SSCDRRN005PD2A5接続後のsensor値
-- encoder、IMU、CAN、STS、storage、ADC、motorの各実機長時間試験
+- SSCDRRN005PD2A5接続後の400 Hz通信、zero、sensor値
+- encoder、CAN、STS motion、production storage、ADC校正、motorの各実機長時間試験
 
 ## 9. Mission実装へ進むblocker
 
-- SPICREATE、AS5047D、ICM42688、CANCREATE、I2CCREATE、STSCREATE/STS3215、storage、ADC、motorの要求された実機試験が未完了
-- AS5047D 60秒1 kHz、ICM 60秒/5分、CAN 100 Hz 60秒、no-device I2C連続試験のdataが未取得
-- actuator試験前のnon-actuator PASS条件を満たしていない
-- CAN library修正が未commitで、検証済みsubmodule SHAとして固定できていない
+- AS5047Dがall-zero statusを返し、角度feedbackの有効性を確認できない。motor試験はfail-closedで停止中
+- CAN bring-upはESP-IDF 6.0.x TWAI lifecycle問題により禁止中。upstream修正版IDFとComBoard復旧後に再試験が必要
+- LPS25HBの物理値は未検証で、pressure trend、離床・頂点判定の根拠にできない
+- SSC未接続のため400 Hz AirData、zero、airspeed、Control gateを完了できない
+- logic電源ADCが0の原因、battery threshold/debounce、production loggingのRealtime影響が未解決
+- STS motion/open/stall/retryは安全監視・fixtureなしで実施していない
 - motor polarity/profile、filter係数、欠落sample許容値、fin limitが未確定
 
-## 10. 追記template
+## 10. 追加実測記録
+
+### BR-005: STS3215 persistent UARTと起動待ち
+
+- date/time: 2026-08-13
+- Mission Board git HEAD: `5ff403309fb2eb1611d0f8e663993552f3d76941` + working tree変更
+- Avi_ESP_Libs submodule HEAD: `9bd7a365`
+- test name: `status`、`sts-probe`、`sts-read`、2 command間のUART再利用
+- firmware build: env `avi_99l_missionboard_bringup`
+- serial port: `/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_44:1B:F6:D1:DC:A8-if00`
+- duration: 各commandでPara電源ONから最大1.5秒の起動待ち
+- sample count: 100/100 ms設定のread 50 sample、5/10 ms設定のcold start 10 cycleとread 50 sample、追加のpower cycle反復
+- error count: ready後のtelemetry error/timeout/fault/device error 0
+- max latency: ready後PING 448 us、STS begin約3.2 ms、telemetry response 907 us（別試行938 us）
+- observed behavior: Para電源ON後100 msでは応答せず、100/100 ms設定では電源を維持した7回目、約826 msで応答。5/10 ms設定でも1秒OFFを挟む10/10 cold cycleが24回目で成功し、read 50/50が成功した。timeout値そのものではなくservo起動時間が初期timeoutの原因。2 command目でもUART1を再beginせず、GPIO42再利用errorなし。worker stackをESP-IDFのbyte単位で16 KiBへ修正後、`sts-read`後の最小空きは8,196 byte
+- result: PASS (read-only)
+- cause: timeoutごとにPara電源をOFFにすると、servoの約0.8秒の起動期間を毎回先頭からやり直していた。加えて従来のworker stack指定は4,096 byteしかなく、telemetry bufferを持つ`sts-read`で不足していた
+- library fix: なし
+- remaining TODO: final設定は100/100 ms、1.5秒deadlineを維持する。温度、電源電圧、別個体を含むworst caseで短縮可否を判断する。`sts-hold`/`sts-small-move`、Open、stall/retryは安全確認後に別途実施する
+- data files: serial consoleで確認。raw fileなし
+
+### BR-006: ICM42688静置取得と初期calibration再現性
+
+- date/time: 2026-08-13
+- Mission Board git HEAD: `5ff403309fb2eb1611d0f8e663993552f3d76941` + working tree変更
+- test name: `imu-selftest` 10回、`imu-stream 60`、`imu-static 300`、`calibration-repeat 10`
+- sample count: IMU 60,000＋300,000、calibration 3,000 sample×10回
+- error count: CRC/decode/sequence gap/FIFO lost/full/fault/timestamp nonmonotonic 0。calibration IMU error 0、SSC valid 0/10
+- max latency: 5分試験231 us、全試験259 us
+- observed behavior: self-test 10/10、60秒stream 60,000/60,000、5分static 300,000/300,000、calibration IMU 10/10。5分試験はfirmware/host双方で欠落・FIFO fault・timestamp非単調0。5分gyro平均X/Y/Z=-0.00383/0.10522/0.05128 dps、標準偏差=0.04416/0.04505/0.04401 dps。5分推定変化X/Y/Z=-0.00323/-0.00138/+0.00144 dps。正式bias値ではなく、calibration間のbias変動とstationary判定基準は未確定
+- result: PASS (静置通信/FIFO)、PARTIAL (calibration parameter)
+- remaining TODO: vibration/motor動作中のFIFO margin、既知姿勢でのbody axis、stationary acceptance、calibration時間を決定する。SSC zeroは未接続のため未評価
+- data files: `data/bringup/hwtest_20260813/bringup_20260813T161215_659232_*`、`bringup_20260813T164409_968103_*`、`bringup_20260813T161750_390495_*`
+
+### BR-007: I2C/LPS transport、SSC未接続、ADC
+
+- date/time: 2026-08-13
+- test name: AUX5V 100 ms以上安定後の`i2c-probe` 10 power cycle＋6同一power run、LPS transport read、`adc-stream 10`
+- sample count: 未接続address probe 3,200、LPS read 400、ADC 1,000
+- error count: 未使用LPS high address false ACK 1、LPS read error 0、ADC CRC/decode/sequence gap 0
+- max latency: LPS I2C read 710 us、ADC処理419 us
+- observed behavior: 通電直後に加え、100 ms以上安定後も未使用`0x5D`の100回中72回目に1度だけfalse ACKを観測し、続く1,000 probeでは再発しなかった。LPS low側のconfig/read/endは成功。motor sourceは平均10.174 V相当、logic senseは0 V相当
+- result: FAIL (intermittent address probe)、MEASURED (LPS transaction timing only)、SKIP (SSC)、NOT EVALUATED (LPS physical values)、PARTIAL (ADC)
+- limitation: 現在のLPS25HB個体はpressure/temperatureの妥当性を保証できない。物理値、実効ODR、sample更新、freshness、離床・頂点判定の判断には使用しない
+- remaining TODO: logic analyzerでfalse ACK時のSDA/SCLと実ACKを確認し、IC/board/driverを切り分ける。SSC接続後の400 Hz timing/zero、正常性を確認したLPS個体と基準器による物理値試験、logic sense 0の原因、bench DMM/supplyによるADC校正と閾値決定
+- data files: `data/bringup/hwtest_20260813/bringup_20260813T161638_245786_*`。I2C console rawなし
+
+### BR-008: microSDとflightlog test sector
+
+- date/time: 2026-08-13
+- test name: `sd-test` 6回、`flash-test`、esptoolによる試験前後4 KiB確認
+- sample count: microSD 1 MiB×6、Flash 4 KiB 1 sector
+- error count: read/write/CRC/unmount error 0
+- max latency: SD block 712,668 us、Flash operation 9,221 us
+- observed behavior: SD CRC `D0F275EB`一致、write 0.550 MiB/s、read 1.760 MiB/s。flightlog先頭に既存bring-up magicを確認してから既知test sectorだけを試験し、reboot verification後に全`0xFF`へeraseされたことを確認
+- result: PASS (bring-up I/O)
+- remaining TODO: production append logger、50 Hz候補、1 kHz Realtime同時動作、queue overflow、耐久性は未評価。SDの大きなblocking時間はowner task分離を必須とする
+- data files: serial console、試験後4 KiB readback。Git管理対象rawなし
+
+### BR-009: AS5047D all-zero fail-closed
+
+- date/time: 2026-08-13
+- test name: `encoder-test`
+- observed behavior: driver beginとangle readは`ESP_OK`だが、offset_done=0、AGC=0、magnitude=0、DIAG fault bitも全0、angle raw=0。MISO stuck-low等でもparityを通る全0応答を正常扱いしないようbring-upの全status gateを`ESP_ERR_INVALID_RESPONSE`にした
+- result: FAIL (hardware/transport unresolved)、PASS (fail-closed gate)
+- fail-safe: motor characterization前のstatus gateで停止し、coast/disarmを維持する。raw angle 0単独は正常値として拒否しない
+- remaining TODO: AS5047D電源、CS/SCLK/MISO/MOSI、磁石、実波形を確認し、軸を手動回転してangle変化、offset_done、AGC/magnitudeを再試験する。production側のsensor health gateもflight enable前に検証する
+- data files: serial console。raw fileなし
+
+### BR-010: ESP-IDF 6.0.x TWAI diagnostic lifecycle
+
+- date/time: 2026-08-13
+- test name: `can-test` panic再現、root cause確認、安全guard後の`can-test`/`can-load-test`
+- observed behavior: TX完了後にTWAI nodeを削除すると、timer daemonへ遅延したevent callbackが解放済みevent groupへ触れてassert/panicした。Espressif issue #18803とupstream修正`6e0d480b2a630419456a04e3eb71d1a4062063ae`に一致。使用中のESP-IDF 6.0.xには修正がない
+- result: BLOCKED (CAN round-trip)、PASS (fail-closed guard/no reboot)
+- fail-safe: ESP-IDF 6.0.xでは両diagnostic commandを`ESP_ERR_NOT_SUPPORTED`で拒否する。private API、delay、task priorityによる不確実な回避は行わない
+- remaining TODO: upstream修正を含むIDFへ更新後、peerを接続して100 Hz 60秒、bus-off/recoveryを再実施する。task lifetime中nodeを保持するproduction CAN ownerは今回のcreate/delete raceとは別lifecycle
+- data files: serial console。panic dumpはGit管理対象外
+
+### 追記template
 
 各試験ごとに次を複製し、未測定値を空欄にせず`未測定`と記入します。
 
