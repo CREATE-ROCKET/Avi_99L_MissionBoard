@@ -1,5 +1,6 @@
 #include "bringup/i2c_bringup.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cinttypes>
 #include <cstdio>
@@ -10,6 +11,8 @@
 #include "avi_esp_libs/timeout.h"
 #include "config/board_config.hpp"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 namespace bringup {
 namespace {
@@ -52,12 +55,43 @@ esp_err_t verifyLpsCleanup(I2CCREATE &bus, LPS25HB::Address address,
   esp_err_t operation = ESP_OK;
   {
     LPS25HB sensor;
-    const esp_err_t begin_result = sensor.begin(bus, address);
+    LPS25HB::Config config{};
+    config.odr = LPS25HB::Odr::hz25;
+    config.pressure_average = LPS25HB::PressureAverage::samples8;
+    config.temperature_average = LPS25HB::TemperatureAverage::samples8;
+    const esp_err_t begin_result = sensor.begin(bus, address, config);
     if (begin_result == ESP_OK) {
-      std::printf("%s driver begin: PASS device_count=%zu\n", target.name,
-                  bus.deviceCount());
+      std::printf(
+          "%s driver begin: ESP_OK (transport/config only) device_count=%zu\n",
+          target.name, bus.deviceCount());
       if (bus.deviceCount() != before + 1)
         rememberFirst(ESP_FAIL, operation);
+
+      constexpr uint32_t kSamples = 25;
+      uint32_t successful = 0;
+      uint32_t errors = 0;
+      int64_t maximum_latency_us = 0;
+      for (uint32_t sample = 0; sample < kSamples; ++sample) {
+        vTaskDelay(pdMS_TO_TICKS(45));
+        LPS25HB::Data data{};
+        const int64_t started_us = esp_timer_get_time();
+        esp_err_t read_result = sensor.read(data);
+        const int64_t latency_us = esp_timer_get_time() - started_us;
+        maximum_latency_us = std::max(maximum_latency_us, latency_us);
+        if (read_result != ESP_OK) {
+          ++errors;
+          rememberFirst(read_result, operation);
+          continue;
+        }
+        ++successful;
+      }
+      // 現在のLPS25HB個体は物理値の妥当性を保証できないため、
+      // HW_TESTでは通信回数と処理時間だけを評価する。
+      std::printf(
+          "%s transport reads: odr_configured_hz=25 samples=%" PRIu32
+          "/%" PRIu32 " errors=%" PRIu32 " max_latency_us=%" PRId64
+          " physical_values=NOT_EVALUATED sample_cadence=NOT_EVALUATED\n",
+          target.name, successful, kSamples, errors, maximum_latency_us);
       const esp_err_t end_result = sensor.end();
       std::printf("%s driver end: %s\n", target.name,
                   esp_err_to_name(end_result));
@@ -178,6 +212,10 @@ esp_err_t I2cBringup::probe() {
         maximum_latency_us = latency;
       if (probe_result != ESP_ERR_NOT_FOUND) {
         ++repeated_errors;
+        std::printf("I2C no-device unexpected %s[0x%02X] attempt=%" PRIu32
+                    " result=%s latency_us=%" PRId64 "\n",
+                    target.name, target.address, attempt + 1U,
+                    esp_err_to_name(probe_result), latency);
         rememberFirst(probe_result == ESP_OK ? ESP_FAIL : probe_result, result);
       }
     }
