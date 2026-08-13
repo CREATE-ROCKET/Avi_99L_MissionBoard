@@ -99,13 +99,16 @@ esp_err_t BringupShell::initialize() {
     return ESP_OK;
   power_initialize_result_ = power::initialize();
   motor_initialize_result_ = motor_.initialize();
+  const esp_err_t para_safe_result = safe_outputs::setParaPower(false);
+  sts_initialize_result_ =
+      para_safe_result == ESP_OK ? sts_.initialize() : para_safe_result;
 
   queue_ = xQueueCreateStatic(1, sizeof(Command), queue_bytes_.data(),
                               &queue_storage_);
   if (queue_ == nullptr)
     return ESP_ERR_NO_MEM;
   worker_ = xTaskCreateStatic(workerEntry, "bringup_worker",
-                              kWorkerStackWords, this, 5,
+                              kWorkerStackBytes, this, 5,
                               worker_stack_.data(), &worker_storage_);
   return worker_ == nullptr ? ESP_ERR_NO_MEM : ESP_OK;
 }
@@ -208,9 +211,10 @@ void BringupShell::printHelp() const {
 void BringupShell::printStatus() const {
   std::printf(
       "status: safe=%s command_running=%s stream_active=%s dropped=%lu "
-      "output_error=%lu\n"
+      "output_error=%lu worker_stack_free_min_bytes=%u\n"
       "spi: encoder_bus=%s imu_bus=%s encoder_device=%s imu_device=%s\n"
       "power: initialized=%s init_result=%s\n"
+      "sts: bus=%s init_result=%s busy=%s\n"
       "motor: initialized=%s init_result=%s armed=%s busy=%s pwm_hz=%lu\n"
       "gpio: IN2=%d IN1=%d AUX5V=%d PARA=%d\n",
       safe_outputs::initialized() ? "yes" : "no",
@@ -218,12 +222,15 @@ void BringupShell::printStatus() const {
       stream_.active() ? "yes" : "no",
       static_cast<unsigned long>(stream_.droppedFrames()),
       static_cast<unsigned long>(stream_.outputErrors()),
+      static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)),
       spi_.encoderBusInitialized() ? "up" : "down",
       spi_.imuBusInitialized() ? "up" : "down",
       encoder_.initialized() ? "up" : "down",
       imu_.initialized() ? "up" : "down",
       power::initialized() ? "yes" : "no",
       esp_err_to_name(power_initialize_result_),
+      sts_.initialized() ? "up" : "down",
+      esp_err_to_name(sts_initialize_result_), sts_.busy() ? "yes" : "no",
       motor_.initialized() ? "yes" : "no",
       esp_err_to_name(motor_initialize_result_), motor_.armed() ? "yes" : "no",
       motor_.busy() ? "yes" : "no",

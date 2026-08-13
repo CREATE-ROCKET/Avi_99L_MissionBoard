@@ -19,6 +19,9 @@ namespace {
 
 // TODO(HW_TEST): para電源投入後に必要な安定待ち時間を実機で確定する
 constexpr uint32_t kPowerStabilizationMs = 100;
+// TODO(HW_TEST): 個体差・電源条件を含むservo起動上限を実機で確定する
+constexpr uint32_t kServoReadyTimeoutMs = 1'500;
+constexpr uint32_t kPingRetryDelayMs = 20;
 // TODO(HW_TEST): bring-up時のSTS torque上限を実機で確定する
 constexpr float kTorqueLimitPercent = 10.0F;
 // TODO(HW_TEST): 最初の小角度移動のspeed/accelerationを実機で確定する
@@ -149,28 +152,70 @@ STSCREATE::Config busConfig() {
 
 class Session {
 public:
+  Session(STSCREATE &bus, esp_err_t initialization_result)
+      : bus_(bus), initialization_result_(initialization_result) {}
   ~Session() { (void)close(); }
 
   [[nodiscard]] esp_err_t open() {
     if (!safe_outputs::initialized())
       return ESP_ERR_INVALID_STATE;
+    if (!bus_.initialized()) {
+      const esp_err_t result = initialization_result_ == ESP_OK
+                                   ? ESP_ERR_INVALID_STATE
+                                   : initialization_result_;
+      std::printf("STS command拒否: persistent bus=down init_result=%s\n",
+                  esp_err_to_name(result));
+      return result;
+    }
     power_attempted_ = true;
     esp_err_t result = safe_outputs::setParaPower(true);
     if (result != ESP_OK)
       return result;
+    power_enabled_ = true;
+    const int64_t ready_deadline_us =
+        esp_timer_get_time() +
+        static_cast<int64_t>(kServoReadyTimeoutMs) * 1'000;
     vTaskDelay(pdMS_TO_TICKS(kPowerStabilizationMs));
 
-    result = bus_.begin(busConfig());
-    if (result != ESP_OK)
-      return result;
-    bus_started_ = true;
+    uint32_t ping_attempt = 0;
+    uint8_t ping_device_error = 0;
+    while (true) {
+      ++ping_attempt;
+      ping_device_error = 0;
+      const int64_t ping_before = esp_timer_get_time();
+      result = bus_.ping(board::kParaServoId, &ping_device_error);
+      ping_latency_us_ = esp_timer_get_time() - ping_before;
+      std::printf("STS ping: attempt=%" PRIu32
+                  " result=%s latency_us=%" PRId64
+                  " device_error=0x%02X\n",
+                  ping_attempt, esp_err_to_name(result), ping_latency_us_,
+                  ping_device_error);
+      if (result == ESP_OK)
+        break;
+
+      // 通電直後の未応答と起動中の不完全応答だけを同一電源cycleで再試行する。
+      if (result != ESP_ERR_TIMEOUT && result != ESP_ERR_INVALID_RESPONSE)
+        return result;
+      const int64_t remaining_us = ready_deadline_us - esp_timer_get_time();
+      if (remaining_us <= 0)
+        return result;
+      const uint32_t remaining_ms =
+          static_cast<uint32_t>((remaining_us + 999) / 1'000);
+      const uint32_t delay_ms = remaining_ms < kPingRetryDelayMs
+                                    ? remaining_ms
+                                    : kPingRetryDelayMs;
+      vTaskDelay(pdMS_TO_TICKS(delay_ms));
+    }
+    if (ping_device_error != 0)
+      std::printf("STS ping device status: 0x%02X。設定readで詳細を確認する。\n",
+                  ping_device_error);
 
     std::printf("STS3215 beginはPINGと設定readのみを行い、motion/torque設定は変更しない。\n");
     const int64_t before = esp_timer_get_time();
     result = servo_.begin(bus_, board::kParaServoId);
     begin_latency_us_ = esp_timer_get_time() - before;
-    if (result == ESP_OK)
-      servo_started_ = true;
+    std::printf("STS begin: result=%s latency_us=%" PRId64 "\n",
+                esp_err_to_name(result), begin_latency_us_);
     return result;
   }
 
@@ -180,17 +225,17 @@ public:
     closed_ = true;
     esp_err_t result = ESP_OK;
 
-    if (servo_started_) {
+    if (servo_.initialized()) {
       disable_attempted_ = true;
       disable_result_ = servo_.disableTorque();
       disable_device_error_ = servo_.lastDeviceError();
       rememberFirst(disable_result_, result);
       if (disable_result_ == ESP_OK && disable_device_error_ != 0)
         rememberFirst(ESP_ERR_INVALID_STATE, result);
-      const esp_err_t servo_end = servo_.end();
-      rememberFirst(servo_end, result);
-      servo_started_ = false;
-    } else if (bus_started_) {
+      servo_end_attempted_ = true;
+      servo_end_result_ = servo_.end();
+      rememberFirst(servo_end_result_, result);
+    } else if (power_enabled_ && bus_.initialized()) {
       // begin失敗時も可能な範囲でTorque SwitchへOFFを書き、安全側へ戻す。
       const uint8_t disabled = 0;
       raw_disable_attempted_ = true;
@@ -201,17 +246,12 @@ public:
       rememberFirst(raw_disable_result_, result);
     }
 
-    if (bus_started_) {
-      bus_end_attempted_ = true;
-      bus_end_result_ = bus_.end();
-      rememberFirst(bus_end_result_, result);
-      bus_started_ = false;
-    }
     if (power_attempted_) {
       power_off_attempted_ = true;
       power_off_result_ = safe_outputs::setParaPower(false);
       rememberFirst(power_off_result_, result);
       power_attempted_ = false;
+      power_enabled_ = false;
     }
     cleanup_result_ = result;
     return result;
@@ -224,9 +264,9 @@ public:
     if (raw_disable_attempted_)
       std::printf("STS cleanup raw torque OFF: %s\n",
                   esp_err_to_name(raw_disable_result_));
-    if (bus_end_attempted_)
-      std::printf("STS cleanup bus end: %s\n",
-                  esp_err_to_name(bus_end_result_));
+    if (servo_end_attempted_)
+      std::printf("STS cleanup servo end: %s\n",
+                  esp_err_to_name(servo_end_result_));
     if (power_off_attempted_)
       std::printf("STS cleanup para power OFF: %s\n",
                   esp_err_to_name(power_off_result_));
@@ -236,22 +276,23 @@ public:
   [[nodiscard]] int64_t beginLatencyUs() const { return begin_latency_us_; }
 
 private:
-  STSCREATE bus_;
+  STSCREATE &bus_;
+  esp_err_t initialization_result_{ESP_ERR_INVALID_STATE};
   STS3215 servo_;
+  int64_t ping_latency_us_{0};
   int64_t begin_latency_us_{0};
   esp_err_t cleanup_result_{ESP_OK};
   esp_err_t disable_result_{ESP_OK};
   esp_err_t raw_disable_result_{ESP_OK};
-  esp_err_t bus_end_result_{ESP_OK};
+  esp_err_t servo_end_result_{ESP_OK};
   esp_err_t power_off_result_{ESP_OK};
   uint8_t disable_device_error_{0};
   bool power_attempted_{false};
-  bool bus_started_{false};
-  bool servo_started_{false};
+  bool power_enabled_{false};
   bool closed_{false};
   bool disable_attempted_{false};
   bool raw_disable_attempted_{false};
-  bool bus_end_attempted_{false};
+  bool servo_end_attempted_{false};
   bool power_off_attempted_{false};
 };
 
@@ -387,12 +428,21 @@ void printTelemetry(const TelemetryReport &report) {
 
 } // 無名名前空間
 
+esp_err_t StsBringup::initialize() {
+  if (bus_.initialized()) {
+    initialization_result_ = ESP_OK;
+    return ESP_OK;
+  }
+  initialization_result_ = bus_.begin(busConfig());
+  return initialization_result_;
+}
+
 esp_err_t StsBringup::probe() {
   BusyGuard guard(busy_);
   if (!guard.acquired())
     return ESP_ERR_INVALID_STATE;
 
-  Session session;
+  Session session{bus_, initialization_result_};
   esp_err_t result = session.open();
   std::printf("STS probe begin: %s latency_us=%" PRId64 "\n",
               esp_err_to_name(result), session.beginLatencyUs());
@@ -426,7 +476,7 @@ esp_err_t StsBringup::read() {
   if (!guard.acquired())
     return ESP_ERR_INVALID_STATE;
 
-  Session session;
+  Session session{bus_, initialization_result_};
   esp_err_t result = session.open();
   std::printf("STS read begin: %s latency_us=%" PRId64 "\n",
               esp_err_to_name(result), session.beginLatencyUs());
@@ -450,7 +500,7 @@ esp_err_t StsBringup::free() {
   if (!guard.acquired())
     return ESP_ERR_INVALID_STATE;
 
-  Session session;
+  Session session{bus_, initialization_result_};
   esp_err_t result = session.open();
   std::printf("STS free begin: %s latency_us=%" PRId64 "\n",
               esp_err_to_name(result), session.beginLatencyUs());
@@ -478,7 +528,7 @@ esp_err_t StsBringup::hold() {
   if (!guard.acquired())
     return ESP_ERR_INVALID_STATE;
 
-  Session session;
+  Session session{bus_, initialization_result_};
   esp_err_t result = session.open();
   std::printf("STS hold begin: %s latency_us=%" PRId64 "\n",
               esp_err_to_name(result), session.beginLatencyUs());
@@ -537,7 +587,7 @@ esp_err_t StsBringup::smallMove(float delta_degrees) {
       std::fabs(delta_degrees) > 3.0F)
     return ESP_ERR_INVALID_ARG;
 
-  Session session;
+  Session session{bus_, initialization_result_};
   esp_err_t result = session.open();
   std::printf("STS small move begin: %s latency_us=%" PRId64
               " delta_deg=%.3f\n",

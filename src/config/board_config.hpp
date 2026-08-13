@@ -61,9 +61,9 @@ constexpr gpio_num_t kParaDirectionEnable = GPIO_NUM_NC;
 constexpr uart_port_t kParaUart = UART_NUM_1;
 constexpr uint32_t kParaBaudrate = 1'000'000;
 constexpr uint8_t kParaServoId = 1;
-// TODO(HW_TEST): STS3215のtx/response timeoutを実測で確定する
-constexpr uint32_t kParaTxTimeoutMs = 5;
-constexpr uint32_t kParaResponseTimeoutMs = 10;
+// TODO(HW_TEST): bring-up実測後に100 msから安全に短縮できる値を確定する
+constexpr uint32_t kParaTxTimeoutMs = 100;
+constexpr uint32_t kParaResponseTimeoutMs = 100;
 
 constexpr gpio_num_t kMotorVoltageAdc = GPIO_NUM_2;
 constexpr gpio_num_t kLogicVoltageAdc = GPIO_NUM_1;

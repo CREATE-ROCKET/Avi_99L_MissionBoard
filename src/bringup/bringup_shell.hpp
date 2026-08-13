@@ -31,7 +31,8 @@ public:
 
 private:
   static constexpr std::size_t kLineCapacity = 96;
-  static constexpr std::size_t kWorkerStackWords = 4'096;
+  static constexpr std::size_t kWorkerStackBytes = 16 * 1'024;
+  static_assert(kWorkerStackBytes % sizeof(StackType_t) == 0);
 
   struct Command {
     std::array<char, kLineCapacity> text{};
@@ -58,7 +59,8 @@ private:
   std::array<uint8_t, sizeof(Command)> queue_bytes_{};
   QueueHandle_t queue_{nullptr};
   StaticTask_t worker_storage_{};
-  std::array<StackType_t, kWorkerStackWords> worker_stack_{};
+  std::array<StackType_t, kWorkerStackBytes / sizeof(StackType_t)>
+      worker_stack_{};
   TaskHandle_t worker_{nullptr};
   std::array<char, kLineCapacity> line_{};
   std::size_t line_length_{0};
@@ -66,6 +68,7 @@ private:
   std::atomic<bool> command_running_{false};
   esp_err_t power_initialize_result_{ESP_ERR_INVALID_STATE};
   esp_err_t motor_initialize_result_{ESP_ERR_INVALID_STATE};
+  esp_err_t sts_initialize_result_{ESP_ERR_INVALID_STATE};
 };
 
 } // 名前空間 bringup
