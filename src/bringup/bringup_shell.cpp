@@ -199,7 +199,8 @@ void BringupShell::printHelp() const {
   std::printf(
       "help\nstatus\nspi-test\nencoder-test\nencoder-stream <seconds>\n"
       "imu-selftest\nimu-stream <seconds>\nimu-static <seconds>\n"
-      "can-test\ncan-load-test <hz> <seconds>\n"
+      "can-lifecycle-test <count>\ncan-test\ncan-idf-lifecycle-test\n"
+      "can-load-test <hz> <seconds>\n"
       "sts-probe\nsts-read\nsts-free\nsts-hold\nsts-small-move <deg>\n"
       "i2c-probe\nsd-test\nflash-test\nadc-stream <seconds>\n"
       "aux5v-on\naux5v-off\n"
@@ -441,11 +442,38 @@ esp_err_t BringupShell::dispatch(char *line) {
     return status;
   }
   if (std::strcmp(command, "can-test") == 0) {
+    if (motor_.armed()) {
+      std::printf("ERR: motor armed中はCAN testを実行しない\n");
+      return ESP_ERR_INVALID_STATE;
+    }
     return noArguments(arguments) ? can_.test() : ESP_ERR_INVALID_ARG;
+  }
+  if (std::strcmp(command, "can-lifecycle-test") == 0) {
+    uint32_t count = 0;
+    if (motor_.armed()) {
+      std::printf("ERR: motor armed中はCAN testを実行しない\n");
+      return ESP_ERR_INVALID_STATE;
+    }
+    return arguments.count == 2 &&
+                   parseUint32(arguments.values[1], 1, 1'000, count)
+               ? can_.lifecycleTest(count)
+               : ESP_ERR_INVALID_ARG;
+  }
+  if (std::strcmp(command, "can-idf-lifecycle-test") == 0) {
+    if (motor_.armed()) {
+      std::printf("ERR: motor armed中はCAN testを実行しない\n");
+      return ESP_ERR_INVALID_STATE;
+    }
+    return noArguments(arguments) ? can_.idfLifecycleTest()
+                                  : ESP_ERR_INVALID_ARG;
   }
   if (std::strcmp(command, "can-load-test") == 0) {
     uint32_t frequency = 0;
     uint32_t seconds = 0;
+    if (motor_.armed()) {
+      std::printf("ERR: motor armed中はCAN testを実行しない\n");
+      return ESP_ERR_INVALID_STATE;
+    }
     return arguments.count == 3 &&
                    parseUint32(arguments.values[1], 1, 1'000, frequency) &&
                    parseUint32(arguments.values[2], 1, 3'600, seconds)

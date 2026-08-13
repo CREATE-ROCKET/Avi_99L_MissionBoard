@@ -34,6 +34,7 @@
 #include "runtime/recovery_boot.hpp"
 #include "runtime/emergency_latch.hpp"
 #include "sensors/air_data_flight_logic.hpp"
+#include "sensors/as5047d_health.hpp"
 #include "sensors/attitude_estimator.hpp"
 #include "sensors/flight_detectors.hpp"
 
@@ -494,14 +495,28 @@ void missionRealtimeTask(void *) {
       spi_result == ESP_OK ? imu.begin(spi, true) : ESP_ERR_INVALID_STATE;
   const esp_err_t encoder_result =
       spi_result == ESP_OK ? encoder.begin(spi) : ESP_ERR_INVALID_STATE;
-  const esp_err_t pipeline_result =
-      encoder_result == ESP_OK ? encoder.startPipelinedRead()
+  std::printf("MissionRealtimeTask spi=%s imu=%s\n",
+              esp_err_to_name(spi_result), esp_err_to_name(imu_result));
+  std::printf("MissionRealtimeTask encoder begin result=%s\n",
+              esp_err_to_name(encoder_result));
+  AS5047D::Status encoder_status{};
+  esp_err_t encoder_status_result =
+      encoder_result == ESP_OK ? encoder.getStatus(encoder_status)
                                : ESP_ERR_INVALID_STATE;
+  if (encoder_status_result == ESP_OK &&
+      sensors::as5047d_health::statusFaulted(encoder_status))
+    encoder_status_result = ESP_ERR_INVALID_RESPONSE;
+  std::printf("MissionRealtimeTask encoder status result=%s\n",
+              esp_err_to_name(encoder_status_result));
+  const esp_err_t pipeline_result =
+      encoder_status_result == ESP_OK ? encoder.startPipelinedRead()
+                                      : ESP_ERR_INVALID_STATE;
+  if (encoder_result == ESP_OK && encoder_status_result != ESP_OK)
+    (void)encoder.end();
   imu_ready.store(imu_result == ESP_OK, std::memory_order_release);
   encoder_ready.store(pipeline_result == ESP_OK, std::memory_order_release);
-  std::printf("MissionRealtimeTask spi=%s imu=%s encoder=%s pipeline=%s\n",
-              esp_err_to_name(spi_result), esp_err_to_name(imu_result),
-              esp_err_to_name(encoder_result), esp_err_to_name(pipeline_result));
+  std::printf("MissionRealtimeTask encoder pipeline result=%s\n",
+              esp_err_to_name(pipeline_result));
 
   uint32_t timestamp_epoch = 1;
   TickType_t wake = xTaskGetTickCount();

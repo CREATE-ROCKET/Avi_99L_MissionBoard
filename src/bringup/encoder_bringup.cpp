@@ -7,6 +7,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "sensors/as5047d_health.hpp"
 
 namespace bringup {
 namespace {
@@ -49,32 +50,6 @@ bool hasError(const AS5047D::ErrorFlags &flags) {
   return flags.parity_error || flags.invalid_command || flags.framing_error;
 }
 
-constexpr bool statusResponseAllZero(const AS5047D::Status &status) {
-  return !status.magnetic_too_low && !status.magnetic_too_high &&
-         !status.cordic_overflow && !status.offset_compensation_finished &&
-         status.agc == 0 && status.magnitude == 0;
-}
-
-constexpr bool hasSensorFault(const AS5047D::Status &status) {
-  return status.magnetic_too_low || status.magnetic_too_high ||
-         status.cordic_overflow || statusResponseAllZero(status);
-}
-
-esp_err_t validatedStatusResult(esp_err_t result,
-                                const AS5047D::Status &status) {
-  // MISO stuck-lowではparityを含む全responseが0となりdriver上は成功し得る。
-  // 角度0自体は正常値なので、DIAG/AGC/magnitude全体が0のstatusだけを拒否する。
-  return result == ESP_OK && statusResponseAllZero(status)
-             ? ESP_ERR_INVALID_RESPONSE
-             : result;
-}
-
-static_assert(hasSensorFault(AS5047D::Status{}));
-static_assert(!hasSensorFault(
-    AS5047D::Status{false, false, false, true, 0, 0}));
-static_assert(!hasSensorFault(
-    AS5047D::Status{false, false, false, false, 0, 1}));
-
 bool appendSample(StreamPayload &payload, const EncoderSample &sample) {
   return payload.u64(sample.host_timestamp_us) &&
          payload.u16(sample.angle_raw) && payload.f32(sample.angle_degrees) &&
@@ -91,7 +66,8 @@ bool EncoderTestResult::passed() const {
          pipeline_read_result == ESP_OK && pipeline_stop_result == ESP_OK &&
          error_flags_result == ESP_OK && end_result == ESP_OK &&
          direct_sample.valid && pipelined_sample.valid &&
-         !hasSensorFault(status) && !hasError(error_flags);
+         !sensors::as5047d_health::statusFaulted(status) &&
+         !hasError(error_flags);
 }
 
 bool EncoderStreamResult::passed() const {
@@ -105,7 +81,8 @@ bool EncoderStreamResult::passed() const {
          final_status_result == ESP_OK &&
          final_error_flags_result == ESP_OK &&
          stream_finish_result == ESP_OK && end_result == ESP_OK &&
-         !hasSensorFault(final_status) && !hasError(final_error_flags);
+         !sensors::as5047d_health::statusFaulted(final_status) &&
+         !hasError(final_error_flags);
 }
 
 esp_err_t EncoderBringup::beginImpl(SpiBringup &spi) {
@@ -164,7 +141,8 @@ esp_err_t EncoderBringup::getStatus(AS5047D::Status &status) {
   ExclusiveGuard guard{busy_};
   if (!guard.acquired())
     return ESP_ERR_INVALID_STATE;
-  return validatedStatusResult(encoder_.getStatus(status), status);
+  return sensors::as5047d_health::validateStatus(encoder_.getStatus(status),
+                                                status);
 }
 
 esp_err_t
@@ -191,8 +169,8 @@ esp_err_t EncoderBringup::test(SpiBringup &spi, EncoderTestResult &result) {
     return result.begin_result;
   }
 
-  result.status_result =
-      validatedStatusResult(encoder_.getStatus(result.status), result.status);
+  result.status_result = sensors::as5047d_health::validateStatus(
+      encoder_.getStatus(result.status), result.status);
   result.read_result = readImpl(result.direct_sample, false);
   result.pipeline_start_result = encoder_.startPipelinedRead();
   if (result.pipeline_start_result == ESP_OK) {
@@ -327,7 +305,7 @@ esp_err_t EncoderBringup::stream(SpiBringup &spi, uint32_t seconds,
     rememberFirst(result.pipeline_stop_result, first_error);
   }
   if (encoder_.initialized() && !encoder_.pipelinedReadActive()) {
-    result.final_status_result = validatedStatusResult(
+    result.final_status_result = sensors::as5047d_health::validateStatus(
         encoder_.getStatus(result.final_status), result.final_status);
     rememberFirst(result.final_status_result, first_error);
     result.final_error_flags_result =

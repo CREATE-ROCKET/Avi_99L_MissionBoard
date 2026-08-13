@@ -3,15 +3,18 @@
 ## 1. 現在の識別情報
 
 - 最新検証日時: 2026-08-13
-- 作業開始時Mission Board HEAD: `31cadbc`
-- 現在のMission Board HEAD: `5ff403309fb2eb1611d0f8e663993552f3d76941` + working tree変更
+- 今回変更のbase Mission Board HEAD: `442adb8a74451de71eeb91e9d211ab15a5811d7c`
 - branch: `main`
 - Avi_ESP_Libs branch: `refactor`
-- Avi_ESP_Libs HEAD: `9bd7a365057b3f532f25166a2620b45c20df0783`
-- submodule状態: clean。今回変更していない
-- serial port: `/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_44:1B:F6:D1:DC:A8-if00`。`ttyACM`番号は固定しない
+- Avi_ESP_Libs作業開始時HEAD: `9bd7a365057b3f532f25166a2620b45c20df0783`
+- Avi_ESP_Libs検証済みHEAD: `43a185ab2a570d4e1b889a4a534984fd19b2194f`
+- submodule状態: clean。親repositoryのgitlinkを上記検証済みrevisionへ固定
+- serial port: `/dev/ttyACM0`（serial `44:1B:F6:D1:DC:A8`）
 - MCU確認: PlatformIO付属esptoolでESP32-S3 revision 0.2を確認
-- commit: 実施していない
+- 実際のESP-IDF: 6.0.1。build log、build metadata、`esp_idf_version.h`で確認
+- local TWAI source: `/home/hotaru/.platformio/packages/framework-espidf/components/esp_driver_twai/esp_twai_onchip.c`、SHA-256 `40a53f7a2fc14a6d1045bd9e209239a2cc9d2e13056f9348b442e1ca174297dd`
+- upstream fix: `_node_flush_pended_set_bits`相当なし。issue [#18803](https://github.com/espressif/esp-idf/issues/18803)の修正`6e0d480b2a630419456a04e3eb71d1a4062063ae`未適用
+- commit: Avi_ESP_Libsを上記revisionへcommitし、親repositoryは本記録を含むcommitでgitlinkを固定
 
 ## 2. 現時点の要約
 
@@ -19,16 +22,21 @@
 |---|---|---|
 | 作業前状態・docs確認 | PASS | 未commit変更を保持し、branch/HEADとrepository内docsを確認 |
 | 変更前empty firmware build | FAIL | 旧環境名のstale sdkconfigとESP-IDF 6.0.1の組合せで`kconfgen`が`AttributeError` |
-| Avi_ESP_Libs submodule | PASS | `refactor`、SHA `9bd7a365...`、clean。今回変更なし |
-| production/bring-up build | PASS | ESP-IDF 6.0.1で両environmentの`pio run`成功 |
+| Avi_ESP_Libs submodule | PASS | `refactor`、開始SHA `9bd7a365...`。ESP-IDF 6以上を既知safe release確認まで`CANCREATE::test()`で安全拒否し、library smoke buildとMission実機で確認 |
+| production/bring-up/CAN診断 build | PASS | 実際のESP-IDF 6.0.1でlibrary guardと最終phase log追加後に3 environmentを再build |
 | upload/boot | PASS | serial `44:1B:F6:D1:DC:A8`を再識別し、最新bring-upをflash/boot |
 | safe output初期化 | PASS | boot先頭のGPIO38/39/40/44 LOW設定が`ESP_OK`、意図しないactuator動作なし |
 | Flash/PSRAM runtime確認 | PASS | Flash 16 MiB、PSRAM 8 MiB initialized、QIO 80 MHzを確認 |
 | custom partition boot確認 | PASS | NVS 64 KiB、PHY 4 KiB、factory 4 MiB、flightlog 2 MiBのtableを確認 |
 | host capture parser self-test | PASS | CRC、分割frame、破損frame、sequence gap、encoder/IMU/ADC decode、CSV出力を確認 |
 | ICM42688 | PASS (静置/通信) | self-test 10/10、1 kHz 5分で300,000 sample、欠落・FIFO fault・CRC error 0 |
-| AS5047D | FAIL | DIAG/AGC/magnitudeを含むstatusが全0。`ESP_ERR_INVALID_RESPONSE`としてmotor試験を拒否 |
-| CANCREATE bring-up診断 | BLOCKED | ESP-IDF 6.0.xのTWAI lifecycle既知問題を実機panicで確認し、診断commandを安全拒否 |
+| AS5047D hardware | PASS (最終再試験) | 先行試験ではall-zeroを検出したが、最終`encoder-test`はraw 6447、offset done、AGC 61、magnitude 4616、pipelineを含めPASS |
+| AS5047D production startup gate | PASS (実装/build)、BLOCKED (実機到達) | 共通health判定後だけpipelineを開始。productionはMissionRealtimeTask開始前にTG1WDT resetし、正負いずれの実機startup gateにも到達せず |
+| CANCREATE begin/end lifecycle | PASS | TXなしの`can-lifecycle-test 100`を100/100完走、panicなし |
+| raw ESP-IDF TWAI lifecycle | PASS | public APIだけの単発1回と続く20回反復を全て完走、panicなし |
+| 修正前`CANCREATE::test()` | FAIL (PANIC) | 1回目で`xEventGroupSetBits`経由のassert/panic。backtraceはissue #18803と一致 |
+| library fail-closed guard | NOT_SUPPORTED (意図どおり) | 実機`can-test`はnode再生成前に`ESP_ERR_NOT_SUPPORTED`、state/restored未評価、続くstatus/read/endは正常、panicなし |
+| CAN peer round-trip/load | BLOCKED | 通信基板未接続。normal TX ACKと`can-load-test`は評価していない |
 | I2CCREATE address probe | FAIL (intermittent) | 100 ms以上安定後も未使用LPS high addressで1/3,200 false ACK。原因未確定 |
 | LPS25HB transport timing | MEASURED | config/read/end、400/400 read成功、最大transaction latency 710 us。値・実効ODRは未評価 |
 | LPS25HB pressure/temperature | NOT EVALUATED | 現在個体の物理値妥当性を保証できないため、値決め・判定へ不使用 |
@@ -38,9 +46,9 @@
 | flightlog Flash | PASS (bring-up sector) | 既知test sectorのwrite/read/CRC/reboot/eraseを確認。production appendは未評価 |
 | ADC | PARTIAL | motor source 10.17 V相当、logic senseは0 V。bench基準との校正と閾値決定は未実施 |
 | calibration | PARTIAL | 3秒×10回、IMU 10/10成功、SSC 0/10。stationary acceptance値は未決定 |
-| motor/combined identification | BLOCKED | AS5047D異常をfail-closed検出したためarm/駆動を実施せず |
+| motor/combined identification | BLOCKED | 今回の安全条件に従いmotorをarmせず、駆動試験を実施していない |
 
-`PARTIAL`、`BLOCKED`、`MEASURED`、`NOT EVALUATED`はPASSではありません。LPS25HBのtransaction timing取得は、address probe、pressure/temperature、実効ODR、freshness、離床・頂点判定のPASSを意味しません。
+`PARTIAL`、`BLOCKED`、`MEASURED`、`NOT_SUPPORTED`、`NOT EVALUATED`、`PENDING`はPASSではありません。PANICはFAILです。LPS25HBのtransaction timing取得は、address probe、pressure/temperature、実効ODR、freshness、離床・頂点判定のPASSを意味しません。
 
 ## 3. 実施記録
 
@@ -78,7 +86,7 @@
 - result: PASS
 - cause: 最初のCAN変更ではidentifier helperを`static_assert`から呼べない定義にしてbuildが失敗した
 - library fix: helperを`constexpr`化。加えて次項の診断ID opt-inを実装
-- remaining TODO: library実機test後に修正を正式commitへ固定する。今回はcommit禁止のためsubmoduleはdirty
+- remaining TODO: 当時の未commit変更は後続の実機検証を経て、現在の検証済みsubmodule revisionへ固定済み
 
 ### BR-002: project-local board build
 
@@ -142,14 +150,25 @@
 - 原因: 診断frameを明示的に許可するpublic Configが無く、共通identifier validationが診断範囲を拒否していた
 - 修正: `CANCREATE::Config`へdefault `false`の`allow_diagnostic_frames`を追加し、opt-in時だけ`0x400..0x7FE`を許可。内部test予約ID `0x7FF`は引き続きapplicationから拒否
 - API影響: additiveでdefault-off。既存利用側の動作は変わらない。破壊変更ではない
-- 検証: library ESP-IDF smoke buildとMission Board foundation buildはPASS。実CAN busでの再試験はPENDING
+- 検証: library ESP-IDF smoke buildとMission Board foundation buildはPASS。通信基板未接続のためpeerを含む実CAN bus再試験はBLOCKED
+
+### 影響を受けるESP-IDFで`CANCREATE::test()`がdriver panicを誘発する
+
+- 症状: ESP-IDF 6.0.1で`CANCREATE::test()`を1回実行すると、self-test TX後のnode削除に続いてFreeRTOS timer taskが`xEventGroupSetBits`でassert/panicした
+- 切り分け: CANCREATEのTXなしbegin/endを100回完走し、同じpin/configを使うraw public TWAI lifecycleも単発1回と20回反復を完走した。一方、panic stackとlocal driver sourceはEspressif issue #18803のdeferred event-group pointer use-after-freeに一致した
+- 原因分類: 主因はupstream ESP-IDF TWAI driver bug。CANCREATEのbackend/callback lifetimeやdisable/delete/destroy順序に別のlibrary bugを示す証拠は得られなかった。Mission bring-up側の一律拒否では3層を比較できなかったため、専用unsafe環境とlayer別commandへ修正した
+- library修正: public `CANCREATE::test()`自身をESP-IDF 6以上で`ESP_ERR_NOT_SUPPORTED`にするfail-closed guardを追加。既知safe releaseをsourceで確認するまで将来versionをsafe扱いしない
+- API影響: signature、Config、Frame、Status、TestResult、通常の`begin`/`end`/`read`/`write`は変更なし。該当driverで危険な診断だけを安全拒否する
+- 検証: guard追加後のlibrary ESP-IDF smoke build、Mission 3 environment build、実機`can-test`で`ESP_ERR_NOT_SUPPORTED`、panicなしを確認
 
 ## 5. 取得data
 
 - ICM 60秒/5分、ADC 10秒、calibration 10回のraw/CSV/summary: `data/bringup/hwtest_20260813/`（Git管理外）
-- STS、I2C、SD、Flash、AS5047D、CAN guard: serial consoleで観察。raw fileなし
+- STS、I2C、SD、Flash、AS5047D: serial consoleで観察
+- CAN診断raw: `/tmp/avi_can_diag.tsEKwA/bringup_20260813T193506_868398.raw`（修正前lifecycle 100）、`bringup_20260813T193526_910188.raw`（raw TWAI単発）、`bringup_20260813T193547_806618.raw`（修正前CANCREATE panic）。guard後は`/tmp/avi_can_guard.i2pGEM/bringup_20260813T211106_901752.raw`（lifecycle 100）、`bringup_20260813T211122_851128.raw`（raw TWAI）、`bringup_20260813T211138_758945.raw`（CANCREATE NOT_SUPPORTED）。一時fileでGit管理外
+- production boot: `/tmp/avi_can_guard.i2pGEM/production_boot_phases.log`。MissionRealtimeTask開始前のTG1WDT resetを記録
 - host parser self-test: temporary directoryだけを使用し、終了時に削除
-- motor実測data: AS5047D異常のため安全側に未取得
+- motor実測data: 今回の安全条件に従いmotorをarmせず未取得。先行all-zeroの原因も未確定
 - raw/CSV/summaryはGit管理外とし、このfileにsummaryだけを記録する
 
 ## 6. 実測から分かった値
@@ -161,6 +180,10 @@
 | physical Flash | 16 MiB | runtime確認 |
 | PSRAM | 8 MiB、initialized | runtime確認 |
 | Flash mode/frequency | QIO、80 MHz | boot/build設定確認 |
+| compile対象ESP-IDF | 6.0.1 | build log、build metadata、header |
+| local TWAI #18803 fix | なし | `esp_twai_onchip.c`実ファイル確認 |
+| CANCREATE TXなしlifecycle | 100/100 PASS | `can-lifecycle-test 100` |
+| raw TWAI node lifecycle | 単発PASS、反復20/20 PASS | `can-idf-lifecycle-test`、panic 0 |
 | Mission USB serial | `44:1B:F6:D1:DC:A8` | udev VID/PIDとserial |
 | ICM FIFO read latency | 5分試験最大231 us（全試験最大259 us） | 300,000 sample |
 | ICM 60秒gyro平均 X/Y/Z | 0.00038 / 0.11117 / 0.07467 dps | 静置capture。正式bias値ではない |
@@ -197,8 +220,9 @@ LPS25HBのpressure/temperature読値は現在個体の妥当性を保証でき�
 
 ## 9. Mission実装へ進むblocker
 
-- AS5047Dがall-zero statusを返し、角度feedbackの有効性を確認できない。motor試験はfail-closedで停止中
-- CAN bring-upはESP-IDF 6.0.x TWAI lifecycle問題により禁止中。upstream修正版IDFとComBoard復旧後に再試験が必要
+- AS5047Dの最終再試験は正常だが、先行all-zeroの原因は未確定。再発時はmotor試験をfail-closedで停止する
+- production runtimeはMissionRealtimeTask開始前のTG1WDT resetを解消し、startup encoder gateまで到達させる必要がある
+- CANCREATE自己診断はESP-IDF 6以上を既知safe release確認まで禁止中。upstream修正版IDFとComBoard復旧後に再試験が必要
 - LPS25HBの物理値は未検証で、pressure trend、離床・頂点判定の根拠にできない
 - SSC未接続のため400 Hz AirData、zero、airspeed、Control gateを完了できない
 - logic電源ADCが0の原因、battery threshold/debounce、production loggingのRealtime影響が未解決
@@ -267,22 +291,31 @@ LPS25HBのpressure/temperature読値は現在個体の妥当性を保証でき�
 ### BR-009: AS5047D all-zero fail-closed
 
 - date/time: 2026-08-13
-- test name: `encoder-test`
+- test name: `encoder-test`、共通health判定とproduction startup gate
 - observed behavior: driver beginとangle readは`ESP_OK`だが、offset_done=0、AGC=0、magnitude=0、DIAG fault bitも全0、angle raw=0。MISO stuck-low等でもparityを通る全0応答を正常扱いしないようbring-upの全status gateを`ESP_ERR_INVALID_RESPONSE`にした
-- result: FAIL (hardware/transport unresolved)、PASS (fail-closed gate)
-- fail-safe: motor characterization前のstatus gateで停止し、coast/disarmを維持する。raw angle 0単独は正常値として拒否しない
-- remaining TODO: AS5047D電源、CS/SCLK/MISO/MOSI、磁石、実波形を確認し、軸を手動回転してangle変化、offset_done、AGC/magnitudeを再試験する。production側のsensor health gateもflight enable前に検証する
-- data files: serial console。raw fileなし
+- implementation: `sensors::as5047d_health::{statusResponseAllZero,statusFaulted,validateStatus}`へ共通化し、encoder/motor bring-upとproduction `MissionRealtimeTask`から使用。productionはbegin成功後にstatusを検証し、成功時だけpipelineを開始する
+- follow-up: 最終bring-up再試験ではraw 6447、offset_done=1、AGC=61、magnitude=4616、direct/pipeline readを含めPASS。all-zeroは再現しなかった
+- result: PASS (最終hardware再試験)、PASS (共通fail-closed実装/build)、BLOCKED (production実機gate到達)
+- fail-safe: motor characterization前のstatus gateで停止し、coast/disarmを維持する。productionもstatus不良時はpipelineを開始せず、fin angle/rateをunavailableにする。raw angle 0単独は正常値として拒否しない
+- scope: startupと明示reinitializeだけを保証する。1 kHz loopへ周期的なpipeline stop/DIAG/restartは追加していない
+- remaining TODO: 先行all-zeroの再発条件を電源、CS/SCLK/MISO/MOSI、磁石、実波形で切り分ける。productionのTG1WDT resetを別件で解消後、all-zero時のstatus `ESP_ERR_INVALID_RESPONSE`、pipeline未開始、coastを確認する。飛行中にMISO stuck-lowへ遷移した場合を既存read error以外で検出する方法を別途設計する
+- data files: `/tmp/avi_can_guard.i2pGEM/`内の最終`encoder-test` rawとproduction boot log。Git管理対象外
 
-### BR-010: ESP-IDF 6.0.x TWAI diagnostic lifecycle
+### BR-010: ESP-IDF 6.0.1 TWAI diagnostic lifecycle
 
 - date/time: 2026-08-13
-- test name: `can-test` panic再現、root cause確認、安全guard後の`can-test`/`can-load-test`
-- observed behavior: TX完了後にTWAI nodeを削除すると、timer daemonへ遅延したevent callbackが解放済みevent groupへ触れてassert/panicした。Espressif issue #18803とupstream修正`6e0d480b2a630419456a04e3eb71d1a4062063ae`に一致。使用中のESP-IDF 6.0.xには修正がない
-- result: BLOCKED (CAN round-trip)、PASS (fail-closed guard/no reboot)
-- fail-safe: ESP-IDF 6.0.xでは両diagnostic commandを`ESP_ERR_NOT_SUPPORTED`で拒否する。private API、delay、task priorityによる不確実な回避は行わない
+- test name: `can-lifecycle-test 100`、raw `can-idf-lifecycle-test`、修正前`can-test`、root cause確認
+- firmware build: `avi_99l_missionboard_can_diag`、ESP-IDF 6.0.1
+- serial port: `/dev/ttyACM0`
+- sample count: CANCREATE TXなしlifecycle 100/100、raw TWAI単発1回＋反復20/20、修正前`CANCREATE::test()` 1回
+- observed behavior: TXなしCANCREATE lifecycleは100回完走し、raw public TWAI lifecycleも全反復をpanicなしで完走した。修正前`CANCREATE::test()`は最初の1回で`assert failed: spinlock_acquire spinlock.h:142`となり、symbolicateしたstackは`xEventGroupSetBits`、`vEventGroupSetBitsCallback`、timer taskだった。local driverにはpending set-bits flushが無く、Espressif issue #18803と修正`6e0d480b2a630419456a04e3eb71d1a4062063ae`に一致した
+- result: PASS (`can-lifecycle-test` 100/100、guard前後)、PASS (raw TWAI 20/20とguard後単発、panicなし)、FAIL/PANIC (guard前`CANCREATE::test()`)、NOT_SUPPORTED (guard後`CANCREATE::test()`、panicなし)、BLOCKED (peer round-trip/load)
+- cause: upstream ESP-IDF TWAI node-delete use-after-freeが主因。CANCREATE backend lifetimeの別bugを示す証拠はなく、Mission bring-up側の問題は一律拒否でlibrary/raw/Missionを切り分けられなかったこと
+- library fix: `CANCREATE::test()`はESP-IDF 6以上を既知safe release確認まで`ESP_ERR_NOT_SUPPORTED`でfail-closedにする。公開APIの破壊変更なし
+- fail-safe: private API、delay、task priorityによる不確実な回避は行わない。guard後のNOT_SUPPORTEDはPASS扱いしない
+- final safety: 通常bring-up firmwareへ再flashし、safe=yes、motor disarmed、IN1/IN2/AUX5V/PARAすべて0を確認
 - remaining TODO: upstream修正を含むIDFへ更新後、peerを接続して100 Hz 60秒、bus-off/recoveryを再実施する。task lifetime中nodeを保持するproduction CAN ownerは今回のcreate/delete raceとは別lifecycle
-- data files: serial console。panic dumpはGit管理対象外
+- data files: guard前は`/tmp/avi_can_diag.tsEKwA/`、guard後は`/tmp/avi_can_guard.i2pGEM/`。Git管理対象外
 
 ### 追記template
 
@@ -301,7 +334,7 @@ LPS25HBのpressure/temperature読値は現在個体の妥当性を保証でき�
 - error count:
 - max latency:
 - observed behavior:
-- result: PASS / FAIL / SKIP
+- result: 判定label（PASS / FAIL / BLOCKED / NOT_SUPPORTED / PARTIAL / MEASURED / NOT EVALUATED / SKIP / PENDING）
 - cause:
 - library fix:
 - remaining TODO:

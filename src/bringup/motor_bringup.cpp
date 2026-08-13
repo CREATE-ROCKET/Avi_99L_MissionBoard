@@ -13,6 +13,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "sensors/as5047d_health.hpp"
 
 namespace bringup {
 namespace {
@@ -89,21 +90,6 @@ void rememberFirst(esp_err_t next, esp_err_t &first) {
   if (first == ESP_OK && next != ESP_OK)
     first = next;
 }
-
-constexpr bool encoderStatusResponseAllZero(const AS5047D::Status &status) {
-  return !status.magnetic_too_low && !status.magnetic_too_high &&
-         !status.cordic_overflow && !status.offset_compensation_finished &&
-         status.agc == 0 && status.magnitude == 0;
-}
-
-constexpr bool encoderFault(const AS5047D::Status &status) {
-  return status.magnetic_too_low || status.magnetic_too_high ||
-         status.cordic_overflow || encoderStatusResponseAllZero(status);
-}
-
-static_assert(encoderFault(AS5047D::Status{}));
-static_assert(!encoderFault(
-    AS5047D::Status{false, false, false, true, 0, 0}));
 
 bool encoderError(const AS5047D::ErrorFlags &flags) {
   return flags.parity_error || flags.invalid_command || flags.framing_error;
@@ -525,7 +511,8 @@ esp_err_t MotorBringup::run(TestKind kind, MotorTestResult &result) {
   if (first == ESP_OK) {
     operation = encoder_.getStatus(result.initial_encoder_status);
     rememberFirst(operation, first);
-    if (operation == ESP_OK && encoderFault(result.initial_encoder_status))
+    if (operation == ESP_OK && sensors::as5047d_health::statusFaulted(
+                                   result.initial_encoder_status))
       rememberFirst(ESP_ERR_INVALID_STATE, first);
   }
   if (first == ESP_OK) {
@@ -740,7 +727,8 @@ esp_err_t MotorBringup::run(TestKind kind, MotorTestResult &result) {
     rememberFirst(encoder_.getStatus(result.final_encoder_status), first);
     rememberFirst(
         encoder_.readAndClearErrorFlags(result.final_encoder_errors), first);
-    if (encoderFault(result.final_encoder_status) ||
+    if (sensors::as5047d_health::statusFaulted(
+            result.final_encoder_status) ||
         encoderError(result.final_encoder_errors))
       rememberFirst(ESP_ERR_INVALID_RESPONSE, first);
     rememberFirst(encoder_.end(), first);

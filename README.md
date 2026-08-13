@@ -27,6 +27,7 @@ ESP32-S3-WROOM-1-N16R8を搭載した99L Mission Board firmwareです。Vault 00
 - `aux5v-on`はGPIO40をHIGHにし、`aux5v-off`またはresetまで+5 Vを保持します。必要な試験中だけ明示的にONにし、終了後は必ずOFFへ戻します。
 - `pio device monitor`とbinary captureを同時に開かないでください。同じUSB deviceを同時利用できません。
 - motor capture中に`Ctrl-C`を入力するとhost toolはportを閉じる前に`motor-disarm`を送ります。ただしUSB通信不能時には届かないため、物理resetまたはmotor電源遮断を直ちに行える状態を必ず確保してください。
+- CAN診断前に`status`でmotor disarm、IN1/IN2 LOW、AUX5V OFF、Para電源OFFを確認します。CAN診断中はmotor arm/test、STS hold/move、AUX5V ON、actuator出力commandを実行しません。
 
 ## 初期取得とsubmodule
 
@@ -59,7 +60,13 @@ pio pkg install -e avi_99l_missionboard
 pio run
 ```
 
-既定は`MISSION_BRINGUP_SHELL=0`のproduction runtimeです。既存bring-up shellは`pio run -e avi_99l_missionboard_bringup`でbuildします。flight設定が未確定の既定buildではactuator commandを自動実行しません。
+既定は`MISSION_BRINGUP_SHELL=0`のproduction runtimeです。既存bring-up shellは`pio run -e avi_99l_missionboard_bringup`でbuildします。既知のdriver panicを再現し得るCAN比較診断は、専用environmentだけに隔離しています。
+
+```sh
+pio run -e avi_99l_missionboard_can_diag
+```
+
+`avi_99l_missionboard_can_diag`だけが`MISSION_CAN_UNSAFE_DIAG=1`を定義します。通常のproduction/bring-up buildでは`can-test`とraw ESP-IDF lifecycle試験を`ESP_ERR_NOT_SUPPORTED`で拒否します。2026-08-13のbuild logで実際にcompileされたESP-IDFは6.0.1であり、PlatformIO platform versionから推測した値ではありません。flight設定が未確定の既定buildではactuator commandを自動実行しません。
 
 host testはworkspace外の実行可能なbuild directoryを指定します。
 
@@ -115,8 +122,10 @@ pio device monitor --port "$MISSION_PORT" --baud 115200 --eol LF
 | `imu-selftest` | FIFO無効状態でICM42688 self-testを実行 |
 | `imu-stream <seconds>` | ICM42688 FIFOを1 kHzでbinary stream出力 |
 | `imu-static <seconds>` | stationary raw dataをbinary stream出力 |
-| `can-test` | CANCREATEのACK/self-loopback診断。ESP-IDF 6.0.xでは既知TWAI lifecycle問題を避けて実行拒否 |
-| `can-load-test <hz> <seconds>` | test ID `0x7FE`の負荷試験。ESP-IDF 6.0.xでは同じ理由で実行拒否 |
+| `can-lifecycle-test <count>` | TXせずCANCREATEの生成/begin/status/no-data read/end/破棄を1〜1000回確認 |
+| `can-test` | CANCREATEのACK/self-loopback診断。`can_diag` buildだけで許可されるが、Avi_ESP_LibsはESP-IDF 6以上を既知safe release確認まで安全拒否 |
+| `can-idf-lifecycle-test` | CANCREATEを使わずpublic ESP-IDF TWAI APIだけでself-test TX/node削除を比較。`can_diag` build専用 |
+| `can-load-test <hz> <seconds>` | test ID `0x7FE`の負荷試験。ESP-IDF 6以上では既知safe release確認まで実行拒否 |
 | `sts-probe` | persistent UARTで明示PING、servo begin、設定read後に安全cleanup |
 | `sts-read` | STS3215 telemetryを約50 Hzで取得 |
 | `sts-free` | torqueを無効化し、終了時にpara電源OFF |
@@ -194,7 +203,7 @@ CANはstandard 11-bit、125 kbit/s、DLC 8以下、multi-byteはlittle-endianで
 - Roll gain tableとmotor/fin configuration未確定のためproduction runtimeはflight-disabledです。
 - ICM history/replay、AS5047D unwrap、quadratic fin rateまではruntimeへ接続済みですが、Roll/ZeroHold/TorqueMapperからmotor出力への経路はprofile確定まで無効で、常にcoastします。
 - ParachuteTaskはSTS唯一ownerですが、Open位置永続loader未接続のためflight Openを安全拒否します。
-- AS5047DはDIAG/AGC/magnitudeが全て0の応答を返しており、bring-upは`ESP_ERR_INVALID_RESPONSE`としてmotor試験をfail-closedにします。配線・電源・SPI信号の切り分けが完了するまでmotorをarmしません。
-- ESP-IDF 6.0.xにはTWAI node削除後のdeferred callback問題があるため、nodeを作成・破棄するbring-up CAN診断は`ESP_ERR_NOT_SUPPORTED`で拒否します。常駐ownerを使うproduction CANとはlifecycleが異なります。
+- AS5047DではDIAG/AGC/magnitudeが全て0の応答を一度確認しましたが、最終再試験では`offset_done=1`、AGC 61、magnitude 4616で正常化しました。bring-upとproduction startupは共通health判定でall-zeroを`ESP_ERR_INVALID_RESPONSE`とし、productionはpipelineを開始せずfin angle/rateをunavailable、motorをcoastに保ちます。角度0度そのものは故障条件ではありません。このgateはstartupと明示reinitialize時だけで、1 kHz loopへ周期的なpipeline停止を追加していません。飛行中にMISOがstuck-lowへ遷移した場合のDIAG検出は残TODOです。
+- ESP-IDF 6.0.1のlocal `esp_twai_onchip.c`にはEspressif issue [#18803](https://github.com/espressif/esp-idf/issues/18803)の修正がありません。TX完了通知のevent-group更新がtimer taskへ遅延したままnodeを削除するuse-after-freeを実機で再現したため、Avi_ESP_Libsの`CANCREATE::test()`はESP-IDF 6以上を既知safe release確認まで`ESP_ERR_NOT_SUPPORTED`で拒否します。常駐ownerを使うproduction CANとはlifecycleが異なります。
 - Deep SleepはRTC marker/wake causeを検証した専用task subsetで10秒周期wakeします。Internal Flash/SD log reader未接続のためlog dump要求は`SourceUnavailable`です。2秒command windowは`TODO(HW_TEST)`です。
 - 実機flash、CAN/LoRa round-trip、actuator試験はREADMEのbuild/test完了とは別に記録します。未実施を成功扱いしません。

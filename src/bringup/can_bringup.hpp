@@ -9,7 +9,9 @@ namespace bringup {
 
 class CanBringup {
 public:
+  [[nodiscard]] esp_err_t lifecycleTest(uint32_t count);
   [[nodiscard]] esp_err_t test();
+  [[nodiscard]] esp_err_t idfLifecycleTest();
   [[nodiscard]] esp_err_t loadTest(uint32_t frequency_hz,
                                    uint32_t duration_seconds);
   [[nodiscard]] bool busy() const { return busy_.load(); }

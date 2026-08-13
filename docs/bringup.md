@@ -28,6 +28,8 @@
 
    ```sh
    pio run
+   pio run -e avi_99l_missionboard_bringup
+   pio run -e avi_99l_missionboard_can_diag
    ```
 
 3. portを列挙し、確認したpathを入力する。
@@ -86,6 +88,10 @@
 
 PASS条件は1 kHzで60秒、`angle_raw`が0..16383、degree/radian変換が整合、sequence gapなし、parity/framing errorなし、sensor error flagなしです。jitter、AGC、magnitude、磁界low/high、CORDIC overflow、sample数、error数、最大read latencyを記録します。pipelineがerrorで解除された場合は、その事実と再初期化結果を記録します。
 
+status responseの磁界low/high、CORDIC overflow、offset compensation finishedが全てfalse、かつAGCとmagnitudeがともに0ならall-zeroです。`angle_raw == 0`は正常な0度を表せるためpresence判定へ使いません。transportが`ESP_OK`でもall-zeroなら共通health判定は`ESP_ERR_INVALID_RESPONSE`を返します。
+
+production runtimeもstartupと明示reinitialize時に同じ判定を通し、`begin`、status、pipeline開始の結果を別々に表示します。statusが不良ならpipelineを開始せず、encoderをcleanupし、fin angle/rateをunavailable、motorをcoastに保ちます。制御周期へgap/jitterを加えないため、1 kHz loop内でpipeline停止、DIAG read、再開を周期実行しません。飛行中にMISOがstuck-lowへ遷移した場合を既存read error以外で検出する方法は残TODOであり、angle 0の連続を故障扱いしてはいけません。
+
 ### 3.3 ICM42688
 
 1. `imu-selftest`を先に実行する。self-test時はFIFOを有効化しない。
@@ -121,13 +127,19 @@ SSC `0x28`が見つからない結果は正常です。各未接続addressへの
 
 ### 3.5 CAN
 
-CAN配線とpeerのtest ID許可を確認してから実施します。ただし現在のESP-IDF 6.0.xでは、TWAI node削除後にdeferred callbackが解放済みevent groupへ触れ得る既知問題があるため、`can-test`と`can-load-test`は`ESP_ERR_NOT_SUPPORTED`で安全拒否します。
+CANCREATEとESP-IDF driverを同一hardware、同一ESP-IDFで比較するため、診断を次の3層に分けます。実際にcompileされたESP-IDF versionはbuild logまたは`ESP_IDF_VERSION`で確認し、PlatformIO platform versionから推測しません。さらにlocal `framework-espidf/components/esp_driver_twai/esp_twai_onchip.c`にEspressif issue [#18803](https://github.com/espressif/esp-idf/issues/18803)のflush修正`6e0d480b2a630419456a04e3eb71d1a4062063ae`相当があるか、version番号とは別に確認します。
 
-1. upstream修正を含むESP-IDFへ更新後、`can-test`を実行する。`CANCREATE::test`は標準ID `0x7FF`をnormal/single-shotで送り、ACKが無い場合はno-ack/self-loopbackでcontrollerとpeer不在を切り分け、最後に元Configを復元する。このcommandは`recover`を呼ばない。
-2. 同じ修正後、peer接続時に`can-load-test 100 60`を実行する。bring-up専用標準ID `0x7FE`、payload内sequence counterを使う。bus-offまたはrecoveringを検出した場合の`recover`はこの負荷試験で確認する。
-3. requested、driver queue投入成功、write error、RX error、bus error、dropped RX、bus-off回数、recovery成否、平均/最大write latencyを記録する。
+CAN診断前に`status`を実行し、motor `armed=no`、IN1/IN2 `0`、AUX5V `0`、PARA `0`を確認します。診断command自身もmotor coast、AUX5V OFF、Para電源OFFを再設定します。診断中は`motor-arm`、motor test、`sts-hold`、`sts-small-move`、`aux5v-on`、その他actuator出力commandを実行しません。
 
-`write == ESP_OK`はdriver queueへの投入成功であり、物理ACK完了数ではありません。100 Hzで問題が出た場合はlibrary、Mission Board、配線、peerを切り分け、peer処理能力またはbus loadが原因と確認できた場合だけ10 Hzを比較します。
+1. `can-lifecycle-test 100`を実行する。各iterationでCANCREATE objectを生成し、125 kbit/s normal modeで`begin`、`initialized`、`getStatus`、noWait `read`のno-data path、`end`、破棄、1 tick yieldを確認する。TXしないため、node callbackを使う診断と単純begin/end lifecycleを分離できる。100回完走と各集計が一致した場合だけPASSとする。
+2. `avi_99l_missionboard_can_diag`をflashし、`can-idf-lifecycle-test`を実行する。このcommandはCANCREATEを使わず、ESP-IDF 6以降のpublic TWAI APIだけでself-test/loopback frameを1回送信し、有限timeoutでTX完了を待ってnodeをdisable/deleteし、50 ms待つ。panicしなければ最大20回反復してtiming依存性を確認する。private APIや解放済みmemoryへの書込みによる再現強化は行わない。
+3. 必要ならreset/reflash後、同じ`can_diag` buildで`can-test`を実行する。これは`CANCREATE::test(TestResult&)`そのものを測る。通信基板が無い場合、修正済みdriverでの正常完走はAPI `ESP_OK`、state `no_peer_response`、`restored=true`を意味し、normal TXのACK成功は期待しない。Avi_ESP_LibsはESP-IDF 6以上を既知safe release確認まで`ESP_ERR_NOT_SUPPORTED`で拒否するため、これはPASSではなくNOT_SUPPORTEDと記録する。
+
+`MISSION_CAN_UNSAFE_DIAG=1`は専用`avi_99l_missionboard_can_diag`だけに定義します。通常のproduction/bring-up buildでは`can-test`と`can-idf-lifecycle-test`を実行できません。panicした場合はGuru Meditationと完全なbacktrace、直前phaseを保存し、build ELFでsymbolicateします。無限に再実行せず、reboot後に安全出力を再確認します。
+
+通信基板が無い試験では`can-load-test 100 60`を合格判定に使いません。peer接続後に実施する場合は、bring-up専用標準ID `0x7FE`、payload内sequence counterを使い、requested、driver queue投入成功、write error、RX error、bus error、dropped RX、bus-off回数、recovery成否、平均/最大write latencyを記録します。`write == ESP_OK`はdriver queue投入成功であり、物理ACK完了数ではありません。
+
+CAN診断終了後は通常bring-up firmwareを再flashし、boot後にsafe output、motor disarm、AUX5V OFF、Para電源OFFを確認します。
 
 ### 3.6 storage
 
@@ -241,6 +253,8 @@ capture中の`Ctrl-C`では`motor-disarm`送信を最大0.5秒試行します。
 
 - `PASS`: 要求されたdurationとsample数を満たし、driver error、sensor fault、予期しないsequence gap、hangが無い
 - `FAIL`: API/build/upload/verifyが失敗した、errorが非ゼロ、無限待ち相当の挙動、安全cleanupに失敗した
+- `NOT_SUPPORTED`: 現在のbuild/driverで意図的に安全拒否した。実行成功を意味しない
+- `BLOCKED`: peer未接続や安全条件不足などにより必要な試験を完了できない。PASSと混同しない
 - `SKIP`: 接続されていないdeviceのsensor値検証など、既知の試験条件不足
 - `PENDING`: 実施前。`SKIP`と混同しない
 
