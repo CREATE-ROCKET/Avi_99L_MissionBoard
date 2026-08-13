@@ -370,9 +370,9 @@ void safetyTask(void *) {
     if (!deployment_requested &&
         ((pressure_deploy && elapsed_us >= 10'000'000) ||
          elapsed_us >= 17'000'000)) {
-      deployment_requested = true;
       const ParaRequest para{ParaRequest::Kind::open, tracked_epoch};
-      (void)xQueueSendToFront(para_queue, &para, 0);
+      deployment_requested =
+          xQueueSendToFront(para_queue, &para, 0) == pdTRUE;
     }
     if (!cutoff_latched && liftoff_valid && now >= liftoff_time_us &&
         elapsed_us >= 25'000'000) {
@@ -885,8 +885,7 @@ void missionRealtimeTask(void *) {
     }
     if (deployment_started && !deployment_sent) {
       const ParaRequest para{ParaRequest::Kind::open, flight_epoch};
-      (void)xQueueSend(para_queue, &para, 0);
-      deployment_sent = true;
+      deployment_sent = xQueueSend(para_queue, &para, 0) == pdTRUE;
     }
     if (!deployment_started)
       deployment_sent = false;
