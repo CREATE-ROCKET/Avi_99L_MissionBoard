@@ -90,10 +90,20 @@ void rememberFirst(esp_err_t next, esp_err_t &first) {
     first = next;
 }
 
-bool encoderFault(const AS5047D::Status &status) {
-  return status.magnetic_too_low || status.magnetic_too_high ||
-         status.cordic_overflow;
+constexpr bool encoderStatusResponseAllZero(const AS5047D::Status &status) {
+  return !status.magnetic_too_low && !status.magnetic_too_high &&
+         !status.cordic_overflow && !status.offset_compensation_finished &&
+         status.agc == 0 && status.magnitude == 0;
 }
+
+constexpr bool encoderFault(const AS5047D::Status &status) {
+  return status.magnetic_too_low || status.magnetic_too_high ||
+         status.cordic_overflow || encoderStatusResponseAllZero(status);
+}
+
+static_assert(encoderFault(AS5047D::Status{}));
+static_assert(!encoderFault(
+    AS5047D::Status{false, false, false, true, 0, 0}));
 
 bool encoderError(const AS5047D::ErrorFlags &flags) {
   return flags.parity_error || flags.invalid_command || flags.framing_error;
