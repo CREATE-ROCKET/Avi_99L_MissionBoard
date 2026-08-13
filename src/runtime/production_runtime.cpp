@@ -101,6 +101,7 @@ struct EmergencyEnvelope {
 struct ParaRequest {
   enum class Kind : uint8_t { hold, open, power_off } kind{Kind::hold};
   uint32_t flight_epoch{};
+  bool safety_authorized{};
 };
 
 struct RecoveryRequest {
@@ -370,7 +371,7 @@ void safetyTask(void *) {
     if (!deployment_requested &&
         ((pressure_deploy && elapsed_us >= 10'000'000) ||
          elapsed_us >= 17'000'000)) {
-      const ParaRequest para{ParaRequest::Kind::open, tracked_epoch};
+      const ParaRequest para{ParaRequest::Kind::open, tracked_epoch, true};
       deployment_requested =
           xQueueSendToFront(para_queue, &para, 0) == pdTRUE;
     }
@@ -379,7 +380,8 @@ void safetyTask(void *) {
       cutoff_latched = true;
       (void)bringup::safe_outputs::setAux5v(false);
       (void)bringup::safe_outputs::setParaPower(false);
-      const ParaRequest para{ParaRequest::Kind::power_off, tracked_epoch};
+      const ParaRequest para{ParaRequest::Kind::power_off, tracked_epoch,
+                             true};
       (void)xQueueSend(para_queue, &para, 0);
     }
     resetWatchdog();
@@ -418,8 +420,12 @@ void parachuteTask(void *) {
         current_request = request.flight_epoch != 0 &&
                           request.flight_epoch == snapshot.flight_epoch &&
                           (request.kind != ParaRequest::Kind::open ||
+                           request.safety_authorized ||
                            snapshot.state == protocol::MissionState::descent);
         xSemaphoreGive(state_mutex);
+      } else {
+        (void)xQueueSendToFront(para_queue, &request, 0);
+        break;
       }
       if (!current_request) {
         powerOff();

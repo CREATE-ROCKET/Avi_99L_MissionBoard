@@ -1,6 +1,7 @@
 #include "runtime/recovery_boot.hpp"
 
 #include "esp_attr.h"
+#include "esp_rtc_time.h"
 #include "esp_system.h"
 #include "esp_sleep.h"
 #include "mission/recovery.hpp"
@@ -19,6 +20,7 @@ struct FlightCheckpointRecord {
   uint16_t checksum{};
   uint32_t flight_epoch{};
   uint64_t elapsed_us{};
+  uint64_t rtc_time_us{};
   uint8_t state{};
   bool elapsed_valid{};
   bool deployment_started{};
@@ -32,6 +34,7 @@ uint16_t checkpointChecksum(const FlightCheckpointRecord &record) {
                    (static_cast<uint32_t>(record.version) << 16U) ^
                    record.flight_epoch ^ record.elapsed_us ^
                    (record.elapsed_us >> 32U) ^
+                   record.rtc_time_us ^ (record.rtc_time_us >> 32U) ^
                    (static_cast<uint32_t>(record.state) << 24U) ^
                    (record.elapsed_valid ? 0xA55AU : 0U) ^
                    (record.deployment_started ? 0x5AA5U : 0U) ^
@@ -54,8 +57,7 @@ bool validFlightCheckpoint(const FlightCheckpointRecord &record) {
 
 bool resetPreservesRtcMemory() {
   const esp_reset_reason_t reason = esp_reset_reason();
-  return reason != ESP_RST_POWERON && reason != ESP_RST_DEEPSLEEP &&
-         reason != ESP_RST_BROWNOUT;
+  return reason != ESP_RST_POWERON && reason != ESP_RST_DEEPSLEEP;
 }
 
 } // 無名名前空間
@@ -83,12 +85,19 @@ bool loadFlightCheckpoint(mission::ResetCheckpoint &checkpoint) {
   checkpoint = {};
   if (!resetPreservesRtcMemory() || !validFlightCheckpoint(flight_checkpoint))
     return false;
+  const uint64_t rtc_now_us = esp_rtc_get_time_us();
+  if (rtc_now_us < flight_checkpoint.rtc_time_us)
+    return false;
+  const uint64_t reset_elapsed_us =
+      rtc_now_us - flight_checkpoint.rtc_time_us;
+  if (UINT64_MAX - flight_checkpoint.elapsed_us < reset_elapsed_us)
+    return false;
   checkpoint = {
       true,
       static_cast<protocol::MissionState>(flight_checkpoint.state),
       flight_checkpoint.flight_epoch,
       true,
-      flight_checkpoint.elapsed_us,
+      flight_checkpoint.elapsed_us + reset_elapsed_us,
       flight_checkpoint.deployment_started,
       flight_checkpoint.power_cutoff_latched,
   };
@@ -107,6 +116,7 @@ void storeFlightCheckpoint(const mission::MissionSnapshot &snapshot) {
   record.version = kFlightCheckpointVersion;
   record.flight_epoch = snapshot.flight_epoch;
   record.elapsed_us = snapshot.elapsed_us;
+  record.rtc_time_us = esp_rtc_get_time_us();
   record.state = static_cast<uint8_t>(snapshot.state);
   record.elapsed_valid = true;
   record.deployment_started = snapshot.deployment_started;
