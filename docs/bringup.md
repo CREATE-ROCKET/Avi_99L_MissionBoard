@@ -92,6 +92,8 @@ status responseの磁界low/high、CORDIC overflow、offset compensation finishe
 
 production runtimeもstartupと明示reinitialize時に同じ判定を通し、`begin`、status、pipeline開始の結果を別々に表示します。statusが不良ならpipelineを開始せず、encoderをcleanupし、fin angle/rateをunavailable、motorをcoastに保ちます。制御周期へgap/jitterを加えないため、1 kHz loop内でpipeline停止、DIAG read、再開を周期実行しません。飛行中にMISOがstuck-lowへ遷移した場合を既存read error以外で検出する方法は残TODOであり、angle 0の連続を故障扱いしてはいけません。
 
+production実機確認では、正常statusでpipeline開始まで完走することに加え、一時診断buildで取得済みstatusだけをall-zeroへ置換し、`ESP_ERR_INVALID_RESPONSE`とpipeline未開始を確認します。診断用置換や専用environmentは検証後にsourceへ残しません。`MissionRealtimeTask`の大型history/FIFO storageはtask stack外へ置き、1 kHz loop開始前までのstack最小空きを記録します。
+
 ### 3.3 ICM42688
 
 1. `imu-selftest`を先に実行する。self-test時はFIFOを有効化しない。

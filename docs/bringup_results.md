@@ -31,7 +31,8 @@
 | host capture parser self-test | PASS | CRC、分割frame、破損frame、sequence gap、encoder/IMU/ADC decode、CSV出力を確認 |
 | ICM42688 | PASS (静置/通信) | self-test 10/10、1 kHz 5分で300,000 sample、欠落・FIFO fault・CRC error 0 |
 | AS5047D hardware | PASS (最終再試験) | 先行試験ではall-zeroを検出したが、最終`encoder-test`はraw 6447、offset done、AGC 61、magnitude 4616、pipelineを含めPASS |
-| AS5047D production startup gate | PASS (実装/build)、BLOCKED (実機到達) | 共通health判定後だけpipelineを開始。productionはMissionRealtimeTask開始前にTG1WDT resetし、正負いずれの実機startup gateにも到達せず |
+| AS5047D production startup gate | PASS | 正常statusでpipeline開始を確認。一時診断buildのall-zeroでは`ESP_ERR_INVALID_RESPONSE`、pipeline未開始、panic/resetなしを確認 |
+| MissionRealtimeTask startup | PASS | 43,024-byte frameを6,144-byte stackへ置いたoverflowを修正。大型task専有storageをstatic化後のframeは2,352 byte、1 kHz loop開始前までの実機最小空き2,504 byte |
 | CANCREATE begin/end lifecycle | PASS | TXなしの`can-lifecycle-test 100`を100/100完走、panicなし |
 | raw ESP-IDF TWAI lifecycle | PASS | public APIだけの単発1回と続く20回反復を全て完走、panicなし |
 | 修正前`CANCREATE::test()` | FAIL (PANIC) | 1回目で`xEventGroupSetBits`経由のassert/panic。backtraceはissue #18803と一致 |
@@ -166,7 +167,7 @@
 - ICM 60秒/5分、ADC 10秒、calibration 10回のraw/CSV/summary: `data/bringup/hwtest_20260813/`（Git管理外）
 - STS、I2C、SD、Flash、AS5047D: serial consoleで観察
 - CAN診断raw: `/tmp/avi_can_diag.tsEKwA/bringup_20260813T193506_868398.raw`（修正前lifecycle 100）、`bringup_20260813T193526_910188.raw`（raw TWAI単発）、`bringup_20260813T193547_806618.raw`（修正前CANCREATE panic）。guard後は`/tmp/avi_can_guard.i2pGEM/bringup_20260813T211106_901752.raw`（lifecycle 100）、`bringup_20260813T211122_851128.raw`（raw TWAI）、`bringup_20260813T211138_758945.raw`（CANCREATE NOT_SUPPORTED）。一時fileでGit管理外
-- production boot: `/tmp/avi_can_guard.i2pGEM/production_boot_phases.log`。MissionRealtimeTask開始前のTG1WDT resetを記録
+- production boot: `/tmp/avi_can_guard.i2pGEM/production_boot_phases.log`に修正前TG1WDT、`/tmp/avi-production-gate2-tj5qflvh/production.log`に正常status、`/tmp/avi-production-zero-7ckc41rw/production_zero.log`に一時all-zero診断を記録
 - host parser self-test: temporary directoryだけを使用し、終了時に削除
 - motor実測data: 今回の安全条件に従いmotorをarmせず未取得。先行all-zeroの原因も未確定
 - raw/CSV/summaryはGit管理外とし、このfileにsummaryだけを記録する
@@ -221,7 +222,6 @@ LPS25HBのpressure/temperature読値は現在個体の妥当性を保証でき�
 ## 9. Mission実装へ進むblocker
 
 - AS5047Dの最終再試験は正常だが、先行all-zeroの原因は未確定。再発時はmotor試験をfail-closedで停止する
-- production runtimeはMissionRealtimeTask開始前のTG1WDT resetを解消し、startup encoder gateまで到達させる必要がある
 - CANCREATE自己診断はESP-IDF 6以上を既知safe release確認まで禁止中。upstream修正版IDFとComBoard復旧後に再試験が必要
 - LPS25HBの物理値は未検証で、pressure trend、離床・頂点判定の根拠にできない
 - SSC未接続のため400 Hz AirData、zero、airspeed、Control gateを完了できない
@@ -295,11 +295,13 @@ LPS25HBのpressure/temperature読値は現在個体の妥当性を保証でき�
 - observed behavior: driver beginとangle readは`ESP_OK`だが、offset_done=0、AGC=0、magnitude=0、DIAG fault bitも全0、angle raw=0。MISO stuck-low等でもparityを通る全0応答を正常扱いしないようbring-upの全status gateを`ESP_ERR_INVALID_RESPONSE`にした
 - implementation: `sensors::as5047d_health::{statusResponseAllZero,statusFaulted,validateStatus}`へ共通化し、encoder/motor bring-upとproduction `MissionRealtimeTask`から使用。productionはbegin成功後にstatusを検証し、成功時だけpipelineを開始する
 - follow-up: 最終bring-up再試験ではraw 6447、offset_done=1、AGC=61、magnitude=4616、direct/pipeline readを含めPASS。all-zeroは再現しなかった
-- result: PASS (最終hardware再試験)、PASS (共通fail-closed実装/build)、BLOCKED (production実機gate到達)
+- production bring-up bug: `MissionRealtimeTask`の関数frameは43,024 byteで、ESP-IDFのbyte単位6,144-byte task stackを入口で破壊していた。38,408-byteのgyro historyと2,256-byteのIMU wrapperをtask専有static storageへ移し、frameを2,352 byteへ削減した。これはAS5047D startup gateへの実機到達を阻害したroot-cause bugの修正であり、一般refactorではない
+- production validation: 正常statusではbegin/status/pipelineが全て`ESP_OK`。一時診断buildで取得済みstatusをall-zeroへ置換するとstatusは`ESP_ERR_INVALID_RESPONSE`、pipelineは`ESP_ERR_INVALID_STATE`となり、8秒間reset/panicなし。診断macro/environmentは検証後に削除した
+- result: PASS (最終hardware再試験)、PASS (共通fail-closed実装/build)、PASS (production正常/all-zero経路実機確認)
 - fail-safe: motor characterization前のstatus gateで停止し、coast/disarmを維持する。productionもstatus不良時はpipelineを開始せず、fin angle/rateをunavailableにする。raw angle 0単独は正常値として拒否しない
 - scope: startupと明示reinitializeだけを保証する。1 kHz loopへ周期的なpipeline stop/DIAG/restartは追加していない
-- remaining TODO: 先行all-zeroの再発条件を電源、CS/SCLK/MISO/MOSI、磁石、実波形で切り分ける。productionのTG1WDT resetを別件で解消後、all-zero時のstatus `ESP_ERR_INVALID_RESPONSE`、pipeline未開始、coastを確認する。飛行中にMISO stuck-lowへ遷移した場合を既存read error以外で検出する方法を別途設計する
-- data files: `/tmp/avi_can_guard.i2pGEM/`内の最終`encoder-test` rawとproduction boot log。Git管理対象外
+- remaining TODO: 先行all-zeroの再発条件を電源、CS/SCLK/MISO/MOSI、磁石、実波形で切り分ける。飛行中にMISO stuck-lowへ遷移した場合を既存read error以外で検出する方法を別途設計する
+- data files: `/tmp/avi_can_guard.i2pGEM/`内の最終`encoder-test` raw、`/tmp/avi-production-gate2-tj5qflvh/production.log`、`/tmp/avi-production-zero-7ckc41rw/production_zero.log`。Git管理対象外
 
 ### BR-010: ESP-IDF 6.0.1 TWAI diagnostic lifecycle
 

@@ -457,11 +457,14 @@ void parachuteTask(void *) {
 }
 
 void missionRealtimeTask(void *) {
+  std::printf("MissionRealtimeTask start\n");
   addWatchdog();
   bringup::SpiBringup spi;
-  bringup::ImuBringup imu;
+  // FIFO bufferを持つwrapperはtask専有だが、6 KiBのstackには置かない。
+  static bringup::ImuBringup imu;
   bringup::EncoderBringup encoder;
-  sensors::GyroHistoryRing gyro_history;
+  // 1200 sampleのhistoryは約38 KiBあり、6 KiBのtask stackへ置かない。
+  static sensors::GyroHistoryRing gyro_history;
   sensors::ImuLiftoffDetector liftoff_detector;
   sensors::AttitudeEstimator attitude;
   control::QuadraticN3FinVelocityEstimator fin_velocity;
@@ -490,13 +493,18 @@ void missionRealtimeTask(void *) {
   double unwrapped_fin_rad = 0.0;
   double fin_rate_rad_s = 0.0;
   bool fin_rate_valid = false;
+  std::printf("MissionRealtimeTask spi begin start\n");
   const esp_err_t spi_result = spi.begin();
+  std::printf("MissionRealtimeTask spi begin result=%s\n",
+              esp_err_to_name(spi_result));
+  std::printf("MissionRealtimeTask imu begin start\n");
   const esp_err_t imu_result =
       spi_result == ESP_OK ? imu.begin(spi, true) : ESP_ERR_INVALID_STATE;
+  std::printf("MissionRealtimeTask imu begin result=%s\n",
+              esp_err_to_name(imu_result));
+  std::printf("MissionRealtimeTask encoder begin start\n");
   const esp_err_t encoder_result =
       spi_result == ESP_OK ? encoder.begin(spi) : ESP_ERR_INVALID_STATE;
-  std::printf("MissionRealtimeTask spi=%s imu=%s\n",
-              esp_err_to_name(spi_result), esp_err_to_name(imu_result));
   std::printf("MissionRealtimeTask encoder begin result=%s\n",
               esp_err_to_name(encoder_result));
   AS5047D::Status encoder_status{};
@@ -517,6 +525,8 @@ void missionRealtimeTask(void *) {
   encoder_ready.store(pipeline_result == ESP_OK, std::memory_order_release);
   std::printf("MissionRealtimeTask encoder pipeline result=%s\n",
               esp_err_to_name(pipeline_result));
+  std::printf("MissionRealtimeTask stack free min bytes=%u\n",
+              static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
 
   uint32_t timestamp_epoch = 1;
   TickType_t wake = xTaskGetTickCount();
