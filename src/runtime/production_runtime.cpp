@@ -410,6 +410,19 @@ void parachuteTask(void *) {
     while (xQueueReceive(para_queue, &request, 0) == pdTRUE) {
       if (request.kind == ParaRequest::Kind::power_off) {
         powerOff();
+        continue;
+      }
+      bool current_request = false;
+      if (xSemaphoreTake(state_mutex, 0) == pdTRUE) {
+        const auto snapshot = state_machine.snapshot();
+        current_request = request.flight_epoch != 0 &&
+                          request.flight_epoch == snapshot.flight_epoch &&
+                          (request.kind != ParaRequest::Kind::open ||
+                           snapshot.state == protocol::MissionState::descent);
+        xSemaphoreGive(state_mutex);
+      }
+      if (!current_request) {
+        powerOff();
       } else if (request.kind == ParaRequest::Kind::hold) {
         // Open/Close設定未復元時はUARTへ駆動commandを送らない。
         if (servo.initialized())
@@ -493,52 +506,6 @@ void missionRealtimeTask(void *) {
           bringup::safe_outputs::motorCoast() == ESP_OK,
           std::memory_order_release);
     }
-    MissionCommandEnvelope command_envelope{};
-    while (xQueueReceive(transition_queue, &command_envelope, 0) == pdTRUE) {
-      if (xSemaphoreTake(executor_mutex, 0) != pdTRUE) {
-        if (xQueueSendToFront(transition_queue, &command_envelope, 0) !=
-            pdTRUE)
-          result_queue_overflow.fetch_add(1, std::memory_order_relaxed);
-        break;
-      }
-      if (xSemaphoreTake(state_mutex, 0) != pdTRUE) {
-        xSemaphoreGive(executor_mutex);
-        if (xQueueSendToFront(transition_queue, &command_envelope, 0) !=
-            pdTRUE)
-          result_queue_overflow.fetch_add(1, std::memory_order_relaxed);
-        break;
-      }
-      mission::TransitionResult transition =
-          mission::TransitionResult::not_configured;
-      protocol::MissionState transition_state =
-          protocol::MissionState::unknown;
-      const auto code = static_cast<mission::CommandCode>(
-          command_envelope.request.command);
-      if (code == mission::CommandCode::cancel_sequence)
-        transition = state_machine.cancelSequence();
-      else if (code == mission::CommandCode::disable_fin_control)
-        transition = state_machine.disableFinControl();
-      else if (code == mission::CommandCode::start_sequence)
-        transition = state_machine.startSequence(
-            static_cast<uint64_t>(esp_timer_get_time()), {});
-      transition_state = state_machine.snapshot().state;
-      xSemaphoreGive(state_mutex);
-      const auto reason = transitionReason(transition);
-      const auto final = command_executor.finish(
-          command_envelope.request.transaction_id,
-          reason == protocol::CommandReason::none
-              ? protocol::CommandPhase::completed
-              : protocol::CommandPhase::failed,
-          reason);
-      xSemaphoreGive(executor_mutex);
-      enqueueResult(final, false);
-      if (code == mission::CommandCode::disable_fin_control &&
-          transition == mission::TransitionResult::completed)
-        enqueueEvent(protocol::eventFlag(
-                         protocol::MissionEventFlag::
-                             fin_control_disabled_by_ground),
-                     transition_state);
-    }
     EmergencyEnvelope emergency{};
     while (xQueueReceive(emergency_queue, &emergency, 0) == pdTRUE) {
       if (xSemaphoreTake(executor_mutex, 0) != pdTRUE) {
@@ -573,16 +540,18 @@ void missionRealtimeTask(void *) {
             emergency.transaction_id, event_state);
         xSemaphoreGive(state_mutex);
         xSemaphoreGive(executor_mutex);
-        (void)bringup::safe_outputs::motorCoast();
-        const PowerRequest power{false, false, false};
-        (void)xQueueSend(power_queue, &power, 0);
         enqueueResult(decision.result, true);
-        for (std::size_t index = 0; index < decision.interrupted_count;
-             ++index)
-          enqueueResult(decision.interrupted[index], true);
-        enqueueEvent(protocol::eventFlag(
-                         protocol::MissionEventFlag::actuator_emergency_stop),
-                     event_state);
+        if (decision.execute) {
+          (void)bringup::safe_outputs::motorCoast();
+          const PowerRequest power{false, false, false};
+          (void)xQueueSend(power_queue, &power, 0);
+          for (std::size_t index = 0; index < decision.interrupted_count;
+               ++index)
+            enqueueResult(decision.interrupted[index], true);
+          enqueueEvent(protocol::eventFlag(
+                           protocol::MissionEventFlag::actuator_emergency_stop),
+                       event_state);
+        }
       }
     }
     uint8_t emergency_transaction = 0;
@@ -603,6 +572,51 @@ void missionRealtimeTask(void *) {
                                                 std::memory_order_relaxed);
       }
       (void)bringup::safe_outputs::motorCoast();
+    }
+
+    MissionCommandEnvelope command_envelope{};
+    while (xQueueReceive(transition_queue, &command_envelope, 0) == pdTRUE) {
+      if (xSemaphoreTake(executor_mutex, 0) != pdTRUE) {
+        if (xQueueSendToFront(transition_queue, &command_envelope, 0) !=
+            pdTRUE)
+          result_queue_overflow.fetch_add(1, std::memory_order_relaxed);
+        break;
+      }
+      if (xSemaphoreTake(state_mutex, 0) != pdTRUE) {
+        xSemaphoreGive(executor_mutex);
+        if (xQueueSendToFront(transition_queue, &command_envelope, 0) !=
+            pdTRUE)
+          result_queue_overflow.fetch_add(1, std::memory_order_relaxed);
+        break;
+      }
+      mission::TransitionResult transition =
+          mission::TransitionResult::not_configured;
+      const auto code = static_cast<mission::CommandCode>(
+          command_envelope.request.command);
+      if (code == mission::CommandCode::cancel_sequence)
+        transition = state_machine.cancelSequence();
+      else if (code == mission::CommandCode::disable_fin_control)
+        transition = state_machine.disableFinControl();
+      else if (code == mission::CommandCode::start_sequence)
+        transition = state_machine.startSequence(
+            static_cast<uint64_t>(esp_timer_get_time()), {});
+      const auto transition_state = state_machine.snapshot().state;
+      xSemaphoreGive(state_mutex);
+      const auto reason = transitionReason(transition);
+      const auto final = command_executor.finish(
+          command_envelope.request.transaction_id,
+          reason == protocol::CommandReason::none
+              ? protocol::CommandPhase::completed
+              : protocol::CommandPhase::failed,
+          reason);
+      xSemaphoreGive(executor_mutex);
+      enqueueResult(final, false);
+      if (code == mission::CommandCode::disable_fin_control &&
+          transition == mission::TransitionResult::completed)
+        enqueueEvent(protocol::eventFlag(
+                         protocol::MissionEventFlag::
+                             fin_control_disabled_by_ground),
+                     transition_state);
     }
 
     protocol::MissionState detector_state =
@@ -774,8 +788,12 @@ void missionRealtimeTask(void *) {
     tick.control.fin_zero_hold_valid =
         fin_zero_hold_valid.load(std::memory_order_acquire);
     tick.control.attitude_valid = attitude.state().valid;
-    tick.control.lps_available = lps_ready.load(std::memory_order_acquire);
-    tick.control.ssc_available = ssc_ready.load(std::memory_order_acquire);
+    tick.control.lps_available =
+        lps_ready.load(std::memory_order_acquire) && lps_fresh &&
+        latest_air_data.lps_valid;
+    tick.control.ssc_available =
+        ssc_ready.load(std::memory_order_acquire) && ssc_fresh &&
+        latest_air_data.ssc_valid;
     tick.control.gyro_bias_valid =
         attitude_epoch == current_epoch && attitude.state().valid;
     // TODO(HW_TEST): SSC zero確定まではControl gateをfail-safeで閉じる。
@@ -874,11 +892,31 @@ void missionRealtimeTask(void *) {
       deployment_sent = false;
     if (flight_epoch == 0)
       cutoff_sent = false;
-    status.lps_pressure_raw = latest_air_data.pressure_raw;
-    status.lps_temperature_raw = latest_air_data.temperature_raw;
-    status.airspeed_raw = latest_air_data.airspeed_raw;
+    status.lps_pressure_raw =
+        lps_fresh
+            ? latest_air_data.pressure_raw
+            : static_cast<uint16_t>(
+                  lps_ready.load(std::memory_order_acquire)
+                      ? protocol::quantization::LpsPressureError::stale
+                      : protocol::quantization::LpsPressureError::not_initialized);
+    status.lps_temperature_raw =
+        lps_fresh
+            ? latest_air_data.temperature_raw
+            : static_cast<uint8_t>(
+                  lps_ready.load(std::memory_order_acquire)
+                      ? protocol::quantization::LpsTemperatureError::stale
+                      : protocol::quantization::LpsTemperatureError::not_initialized);
+    status.airspeed_raw =
+        ssc_fresh
+            ? latest_air_data.airspeed_raw
+            : static_cast<uint8_t>(
+                  ssc_ready.load(std::memory_order_acquire)
+                      ? protocol::quantization::AirspeedError::ssc_stale
+                      : protocol::quantization::AirspeedError::
+                            ssc_not_initialized);
     status.lps_sample_valid = lps_fresh && latest_air_data.lps_valid;
-    status.airspeed_sample_valid = ssc_fresh && latest_air_data.ssc_valid;
+    status.airspeed_sample_valid =
+        ssc_fresh && latest_air_data.ssc_valid && status.airspeed_raw <= 245;
     status.deployment_power_cutoff = power_cutoff;
     status.flight_elapsed_us = mission_snapshot.elapsed_us;
     const bool air_data_error = !status.lps_sample_valid ||
@@ -995,34 +1033,22 @@ void airDataTask(void *) {
     const uint64_t now_us = static_cast<uint64_t>(esp_timer_get_time());
     if (now_us - last_ssc_us >= 2'500) {
       last_ssc_us = now_us;
-      snapshot.ssc_monotonic_us = now_us;
-      snapshot.ssc_valid = false;
-      snapshot.airspeed_raw = static_cast<uint8_t>(
-          protocol::quantization::AirspeedError::ssc_not_initialized);
       if (ssc.initialized()) {
         SSCDRRN005PD2A5::Data data{};
         const esp_err_t result = ssc.read(data);
-        snapshot.ssc_valid = result == ESP_OK;
-        // TODO(SIMULATION): Saint-Venant係数K=0.92の最終検証前は速度へ変換しない。
-        snapshot.airspeed_raw = static_cast<uint8_t>(
-            result == ESP_OK
-                ? protocol::quantization::AirspeedError::internal_invalid
-                : (result == ESP_ERR_TIMEOUT
-                       ? protocol::quantization::AirspeedError::ssc_i2c_timeout
-                       : protocol::quantization::AirspeedError::ssc_i2c_error));
+        if (result == ESP_OK) {
+          snapshot.ssc_monotonic_us = now_us;
+          snapshot.ssc_valid = true;
+          // TODO(SIMULATION): Saint-Venant係数K=0.92の最終検証前は速度へ変換しない。
+          snapshot.airspeed_raw = static_cast<uint8_t>(
+              protocol::quantization::AirspeedError::internal_invalid);
+        }
       }
-      ssc_ready.store(snapshot.ssc_valid, std::memory_order_release);
       (void)xQueueOverwrite(air_data_queue, &snapshot);
     }
 
     if (now_us - last_lps_us >= 40'000) {
       last_lps_us = now_us;
-      snapshot.lps_monotonic_us = now_us;
-      snapshot.lps_valid = false;
-      snapshot.pressure_raw = static_cast<uint16_t>(
-          protocol::quantization::LpsPressureError::not_initialized);
-      snapshot.temperature_raw = static_cast<uint8_t>(
-          protocol::quantization::LpsTemperatureError::not_initialized);
       double pressure_hpa = 0.0;
       if (xSemaphoreTake(state_mutex, pdMS_TO_TICKS(2)) == pdTRUE) {
         mission_snapshot = state_machine.snapshot();
@@ -1033,6 +1059,7 @@ void airDataTask(void *) {
       if (lps.initialized())
         read_result = lps.read(data);
       if (read_result == ESP_OK) {
+        snapshot.lps_monotonic_us = now_us;
         snapshot.lps_valid = true;
         pressure_hpa = static_cast<double>(data.pressure_pa) / 100.0;
         snapshot.pressure_raw = protocol::quantization::encodeLpsPressure(
@@ -1041,23 +1068,15 @@ void airDataTask(void *) {
             protocol::quantization::encodeLpsTemperature(
                 data.temperature_celsius,
                 protocol::quantization::LpsTemperatureError::unknown);
-      } else if (lps.initialized()) {
-        snapshot.pressure_raw = static_cast<uint16_t>(
-            read_result == ESP_ERR_TIMEOUT
-                ? protocol::quantization::LpsPressureError::i2c_timeout
-                : protocol::quantization::LpsPressureError::i2c_bus_error);
-        snapshot.temperature_raw = static_cast<uint8_t>(
-            read_result == ESP_ERR_TIMEOUT
-                ? protocol::quantization::LpsTemperatureError::i2c_timeout
-                : protocol::quantization::LpsTemperatureError::i2c_bus_error);
       }
-      lps_ready.store(lps_result == ESP_OK, std::memory_order_release);
-      snapshot.flight = flight_logic.update(
-          mission_snapshot.flight_epoch, mission_snapshot.state,
-          mission_snapshot.elapsed_us, pressure_hpa, snapshot.lps_valid);
-      if (snapshot.flight.pressure_apex_detected)
-        pressure_deployment_epoch.store(snapshot.flight.flight_epoch,
-                                        std::memory_order_release);
+      if (read_result == ESP_OK) {
+        snapshot.flight = flight_logic.update(
+            mission_snapshot.flight_epoch, mission_snapshot.state,
+            mission_snapshot.elapsed_us, pressure_hpa, true);
+        if (snapshot.flight.pressure_apex_detected)
+          pressure_deployment_epoch.store(snapshot.flight.flight_epoch,
+                                          std::memory_order_release);
+      }
       (void)xQueueOverwrite(air_data_queue, &snapshot);
     }
     resetWatchdog();

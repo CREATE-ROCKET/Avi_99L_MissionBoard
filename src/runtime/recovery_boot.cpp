@@ -54,9 +54,8 @@ bool validFlightCheckpoint(const FlightCheckpointRecord &record) {
 
 bool resetPreservesRtcMemory() {
   const esp_reset_reason_t reason = esp_reset_reason();
-  return reason == ESP_RST_SW || reason == ESP_RST_TASK_WDT ||
-         reason == ESP_RST_INT_WDT || reason == ESP_RST_WDT ||
-         reason == ESP_RST_PANIC;
+  return reason != ESP_RST_POWERON && reason != ESP_RST_DEEPSLEEP &&
+         reason != ESP_RST_BROWNOUT;
 }
 
 } // 無名名前空間
