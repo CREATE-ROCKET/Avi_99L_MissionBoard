@@ -6,6 +6,8 @@ ESP32-S3-WROOM-1-N16R8を搭載した99L Mission Board firmwareです。Vault 00
 
 詳細な試験順序は[docs/bringup.md](docs/bringup.md)、実施結果は[docs/bringup_results.md](docs/bringup_results.md)を参照してください。
 
+2026-08-14にMission `/dev/ttyACM1`、ComBoard `/dev/ttyACM0`、Ground `/dev/ttyUSB0`を同時接続し、bring-upとproductionを実機確認しました。Mission productionはICM42688、AS5047D health gate/pipeline、CAN、AirData、Parachuteの各taskを起動し、panic/reset loopなしで動作しました。CommandReceive中のproduction CANは、修正後30秒で`0x100/0x109`を各3,000 frame、`0x108`を750 frame、`0x102`を301 frame、`0x103/0x107`を各300 frame、`0x012`を30 frame受信側で確認し、sequence gapとdecode errorは0でした。安全なGround commandとActuatorEmergencyのend-to-end結果も確認済みです。数値と判定は[docs/bringup_results.md](docs/bringup_results.md#br-012-3基板production-canと安全command-round-trip)に記録しています。
+
 ## architecture
 
 - `src/protocol`: Classic CAN 11-bit/125 kbit/sのlittle-endian codec、04a量子化、ID別sequence/schedule
@@ -16,6 +18,8 @@ ESP32-S3-WROOM-1-N16R8を搭載した99L Mission Board firmwareです。Vault 00
 - `src/runtime`: fixed task/queue allocationとhardware owner。FSMは`MissionRealtimeTask`だけが更新し、CAN/CommandWorkerからmessageで遷移要求を受けます。
 
 優先順はSafety→Parachute→MissionRealtime→AirData→CAN→persistenceです。SPI2/SPI3とmotorはMissionRealtime、I2CはAirData、CAN controllerはCanTask、STS UARTはParachuteTaskがそれぞれ唯一ownerです。SafetyTaskはflight epoch/離床時刻を独立監視し、離床+25秒でUART taskに依存せずGPIO40/44を遮断します。
+
+ICM42688のfreshnessは取得時の`host_timestamp_us`と`esp_timer_get_time()`を同じhost clock domainで比較します。ICM sensor timestampはhistory/姿勢計算用に保持しますが、clock driftを含むsensor時刻とhost時刻を直接比較して再初期化を繰り返してはいけません。CAN送信はTX完了callbackまで1枠を占有するため、production telemetryは5 msの有限timeoutで直列化します。Emergencyのstate判定はCanTaskのmutex noWait snapshotに依存せず、nonzero transactionをlatchしてMissionRealtimeTaskへ渡します。
 
 ## 安全上の注意
 
@@ -206,4 +210,5 @@ CANはstandard 11-bit、125 kbit/s、DLC 8以下、multi-byteはlittle-endianで
 - AS5047DではDIAG/AGC/magnitudeが全て0の応答を一度確認しましたが、最終再試験では`offset_done=1`、AGC 61、magnitude 4616で正常化しました。bring-upとproduction startupは共通health判定でall-zeroを`ESP_ERR_INVALID_RESPONSE`とし、productionはpipelineを開始せずfin angle/rateをunavailable、motorをcoastに保ちます。角度0度そのものは故障条件ではありません。実機productionでは正常status時のpipeline開始と、一時診断buildでall-zeroを注入した際のstatus拒否/pipeline未開始を確認しました。確認を妨げていたMissionRealtimeTaskのstack overflowは、task専有の大型history/FIFO wrapperをstatic storageへ移して解消し、startup時点の最小空き2,504 byteを実測しています。このgateはstartupと明示reinitialize時だけで、1 kHz loopへ周期的なpipeline停止を追加していません。飛行中にMISOがstuck-lowへ遷移した場合のDIAG検出は残TODOです。
 - ESP-IDF 6.0.1のlocal `esp_twai_onchip.c`にはEspressif issue [#18803](https://github.com/espressif/esp-idf/issues/18803)の修正がありません。TX完了通知のevent-group更新がtimer taskへ遅延したままnodeを削除するuse-after-freeを実機で再現したため、Avi_ESP_Libsの`CANCREATE::test()`はESP-IDF 6以上を既知safe release確認まで`ESP_ERR_NOT_SUPPORTED`で拒否します。常駐ownerを使うproduction CANとはlifecycleが異なります。
 - Deep SleepはRTC marker/wake causeを検証した専用task subsetで10秒周期wakeします。Internal Flash/SD log reader未接続のためlog dump要求は`SourceUnavailable`です。2秒command windowは`TODO(HW_TEST)`です。
-- 実機flash、CAN/LoRa round-trip、actuator試験はREADMEのbuild/test完了とは別に記録します。未実施を成功扱いしません。
+- 3基板実機でMission→ComBoard CAN、ComBoard↔Ground LoRa、Ground→Missionの安全なcommand round-tripは確認済みです。motor motion、STS hold/move、パラシュートOpen/Close、flight enableは安全条件により未実施で、成功扱いしません。
+- Mission基板上のmicroSDはbring-up `sd-test`で1 MiB write/read/CRCをPASSしていますが、Mission production loggerは未接続です。今回BLOCKEDとなった`CAN.CSV` logging/readbackはComBoard側microSDの初期化問題であり、Missionのbring-up microSD PASSを取り消す結果ではありません。

@@ -279,7 +279,8 @@ esp_err_t writeFrame(CANCREATE &can, const protocol::CanFrame &frame) {
   output.identifier = frame.identifier;
   output.data_length = frame.data_length;
   std::copy_n(frame.data.begin(), frame.data_length, output.data);
-  return can.write(output, avi::Timeout::noWait());
+  // TX完了callbackまで1枠を占有するため、連続telemetryを有限時間で直列化する。
+  return can.write(output, avi::Timeout::milliseconds(5));
 }
 
 bool estimatePreflightGyroBias(const sensors::GyroHistoryRing &history,
@@ -483,7 +484,7 @@ void missionRealtimeTask(void *) {
   bool previous_encoder_error = false;
   bool previous_air_data_error = false;
   bool previous_reset_invalidated = false;
-  uint64_t last_imu_sample_us = 0;
+  uint64_t last_imu_host_sample_us = 0;
   uint64_t last_imu_recovery_attempt_us = 0;
   bool timestamp_offset_valid = false;
   uint64_t sensor_to_host_offset_us = 0;
@@ -720,7 +721,7 @@ void missionRealtimeTask(void *) {
             gyro.format_fault = status.faulted;
             gyro_history.push(gyro);
             if (gyro.valid && !gyro.format_fault)
-              last_imu_sample_us = gyro.timestamp_us;
+              last_imu_host_sample_us = sample.host_timestamp_us;
             if (attitude_epoch == current_epoch && current_epoch != 0)
               (void)attitude.update(gyro);
             const bool detected = liftoff_detector.update(
@@ -735,9 +736,9 @@ void missionRealtimeTask(void *) {
         imu_data_loss_latched = true;
     }
     const uint64_t imu_now_us = static_cast<uint64_t>(esp_timer_get_time());
-    const bool imu_stale = last_imu_sample_us == 0 ||
-                           imu_now_us < last_imu_sample_us ||
-                           imu_now_us - last_imu_sample_us > 3'000;
+    const bool imu_stale = last_imu_host_sample_us == 0 ||
+                           imu_now_us < last_imu_host_sample_us ||
+                           imu_now_us - last_imu_host_sample_us > 3'000;
     if (imu_data_loss_latched || imu_stale) {
       imu_ready.store(false, std::memory_order_release);
       if (attitude.state().valid)
@@ -754,7 +755,7 @@ void missionRealtimeTask(void *) {
         imu_ready.store(restart == ESP_OK, std::memory_order_release);
         if (restart == ESP_OK) {
           imu_data_loss_latched = false;
-          last_imu_sample_us = imu_now_us;
+          last_imu_host_sample_us = imu_now_us;
         }
       }
     } else {
@@ -1180,19 +1181,15 @@ void canTask(void *) {
           protocol::EmergencyStop emergency{};
           if (protocol::decode(input, protocol::CanId::actuator_emergency_stop,
                                emergency) == protocol::CodecError::none) {
-            protocol::MissionState state = protocol::MissionState::unknown;
-            if (xSemaphoreTake(state_mutex, 0) == pdTRUE) {
-              state = state_machine.snapshot().state;
-              xSemaphoreGive(state_mutex);
-            }
-            if (emergency.transaction_id != 0 &&
-                state == protocol::MissionState::command_receive)
+            if (emergency.transaction_id != 0) {
+              // state mutexの一時競合で安全側commandを取りこぼさない。
               latchPhysicalEmergency(emergency.transaction_id, false);
-            else {
+            } else {
               mission::EmergencyDecision result{};
               if (xSemaphoreTake(executor_mutex, pdMS_TO_TICKS(2)) == pdTRUE) {
                 result = command_executor.actuatorEmergency(
-                    emergency.transaction_id, state);
+                    emergency.transaction_id,
+                    protocol::MissionState::unknown);
                 xSemaphoreGive(executor_mutex);
               } else {
                 result.result = {emergency.transaction_id, 0xF0,
@@ -1209,13 +1206,8 @@ void canTask(void *) {
                   input,
                   protocol::CanId::liftoff_detection_emergency_stop,
                   emergency) == protocol::CodecError::none) {
-            protocol::MissionState state = protocol::MissionState::unknown;
-            if (xSemaphoreTake(state_mutex, 0) == pdTRUE) {
-              state = state_machine.snapshot().state;
-              xSemaphoreGive(state_mutex);
-            }
-            if (emergency.transaction_id != 0 &&
-                state == protocol::MissionState::engine_burn) {
+            if (emergency.transaction_id != 0) {
+              // 実state判定はmutex取得をretryするRealtimeTaskへ一元化する。
               latchPhysicalEmergency(emergency.transaction_id, true);
             } else {
               enqueueResult(command_executor.liftoffEmergencyResult(

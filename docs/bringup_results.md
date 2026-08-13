@@ -2,19 +2,19 @@
 
 ## 1. 現在の識別情報
 
-- 最新検証日時: 2026-08-13
-- 今回変更のbase Mission Board HEAD: `442adb8a74451de71eeb91e9d211ab15a5811d7c`
+- 最新検証日時: 2026-08-14 JST（3基板同時接続）
+- 今回実測開始時Mission Board HEAD: `bea8c544b07b6421583bcb85bc5564b8ebd0cdc5`
 - branch: `main`
 - Avi_ESP_Libs branch: `refactor`
 - Avi_ESP_Libs作業開始時HEAD: `9bd7a365057b3f532f25166a2620b45c20df0783`
 - Avi_ESP_Libs検証済みHEAD: `43a185ab2a570d4e1b889a4a534984fd19b2194f`
 - submodule状態: clean。親repositoryのgitlinkを上記検証済みrevisionへ固定
-- serial port: `/dev/ttyACM0`（serial `44:1B:F6:D1:DC:A8`）
+- serial port: `/dev/ttyACM1`（serial `44:1B:F6:D1:DC:A8`）。今回のComBoardは`/dev/ttyACM0`、Groundは`/dev/ttyUSB0`
 - MCU確認: PlatformIO付属esptoolでESP32-S3 revision 0.2を確認
 - 実際のESP-IDF: 6.0.1。build log、build metadata、`esp_idf_version.h`で確認
 - local TWAI source: `/home/hotaru/.platformio/packages/framework-espidf/components/esp_driver_twai/esp_twai_onchip.c`、SHA-256 `40a53f7a2fc14a6d1045bd9e209239a2cc9d2e13056f9348b442e1ca174297dd`
 - upstream fix: `_node_flush_pended_set_bits`相当なし。issue [#18803](https://github.com/espressif/esp-idf/issues/18803)の修正`6e0d480b2a630419456a04e3eb71d1a4062063ae`未適用
-- commit: Avi_ESP_Libsを上記revisionへcommitし、親repositoryは本記録を含むcommitでgitlinkを固定
+- 今回実測開始時状態: Missionとsubmoduleはclean。以下はこのbase HEADに対する修正を実機検証した結果
 
 ## 2. 現時点の要約
 
@@ -33,17 +33,27 @@
 | AS5047D hardware | PASS (最終再試験) | 先行試験ではall-zeroを検出したが、最終`encoder-test`はraw 6447、offset done、AGC 61、magnitude 4616、pipelineを含めPASS |
 | AS5047D production startup gate | PASS | 正常statusでpipeline開始を確認。一時診断buildのall-zeroでは`ESP_ERR_INVALID_RESPONSE`、pipeline未開始、panic/resetなしを確認 |
 | MissionRealtimeTask startup | PASS | 43,024-byte frameを6,144-byte stackへ置いたoverflowを修正。大型task専有storageをstatic化後のframeは2,352 byte、1 kHz loop開始前までの実機最小空き2,504 byte |
+| 2026-08-14 Mission bring-up再確認 | PASS (安全/read-only) | safe=yes、motor disarm、IN1/IN2/AUX5V/PARA=0。SPI、encoder、IMU、LPS transport、Mission microSD、flightlog、CAN lifecycle、STS probe/read/freeを完走 |
+| production sensor startup | PASS | SPI/ICM begin、AS5047D begin/status/pipeline、AirData LPS、CanTaskを起動。10秒観測でpanic/reset loopなし |
+| production IMU freshness | PASS (修正後) | sensor時刻とhost時刻の混在で約100 msごとに再初期化していた。freshnessをsampleの`host_timestamp_us`へ統一し、10秒実機観測で再発なし |
+| production CAN telemetry | PASS | 30秒で`0x100/109`各3,000、`0x108` 750、`0x102` 301、`0x103/107`各300、`0x012` 30。active sequence gap/decode error 0 |
+| production CAN burst送信 | PASS (修正後) | TX枠へ`noWait`で複数frameを連続投入していたため一部IDが欠落。5 ms有限timeoutで直列化し、予定ID/rateを受信側で確認 |
+| Emergency state判定 | PASS (修正後) | CanTaskのstate mutex noWait競合でfalse rejectionし得た。nonzero transactionをlatchしRealtimeTaskで判定、実機ActuatorEmergencyは`Completed/None` |
+| safe command round-trip | PASS | `0x7F`→`Rejected/NotSupported`、`0x02`とLiftoff Emergency→`Rejected/InvalidState`。Ground→LoRa→CAN→Mission→CAN→LoRa→Groundを確認 |
+| Emergency result tracking | PASS (修正後) | untracked F0/F1の過剰warningを止め、CAN ownerをblockしない専用priority LoRa queueへ正常/失敗resultを統一。Liftoff Emergencyを最終実機で再送しwarning/drop 0 |
 | CANCREATE begin/end lifecycle | PASS | TXなしの`can-lifecycle-test 100`を100/100完走、panicなし |
 | raw ESP-IDF TWAI lifecycle | PASS | public APIだけの単発1回と続く20回反復を全て完走、panicなし |
 | 修正前`CANCREATE::test()` | FAIL (PANIC) | 1回目で`xEventGroupSetBits`経由のassert/panic。backtraceはissue #18803と一致 |
 | library fail-closed guard | NOT_SUPPORTED (意図どおり) | 実機`can-test`はnode再生成前に`ESP_ERR_NOT_SUPPORTED`、state/restored未評価、続くstatus/read/endは正常、panicなし |
-| CAN peer round-trip/load | BLOCKED | 通信基板未接続。normal TX ACKと`can-load-test`は評価していない |
+| CAN peer round-trip | PASS (production) | 接続済みComBoardとのtelemetry、TimeResponse、safe command/結果を双方向確認。bus-off/recovery loopなし |
+| `can-load-test` | NOT_EVALUATED | production実trafficで確認したため、診断ID `0x7FE`の負荷試験は実施していない |
 | I2CCREATE address probe | FAIL (intermittent) | 100 ms以上安定後も未使用LPS high addressで1/3,200 false ACK。原因未確定 |
 | LPS25HB transport timing | MEASURED | config/read/end、400/400 read成功、最大transaction latency 710 us。値・実効ODRは未評価 |
 | LPS25HB pressure/temperature | NOT EVALUATED | 現在個体の物理値妥当性を保証できないため、値決め・判定へ不使用 |
 | SSCDRRN005PD2A5 sensor値 | SKIP | 未接続。Unavailable条件だけ確認 |
 | STSCREATE/STS3215 | PASS (read-only) | persistent UARTでprobe/read、50 sample、torque OFF、Para電源OFFを確認。hold/small moveは未実施 |
 | microSD | PASS (bring-up I/O) | 1 MiB write/read/CRC/unmountを6/6成功。production logger throughputは未評価 |
+| ComBoard microSD/CAN.CSV | BLOCKED (ComBoard側) | ComBoard productionでSD初期化`TimeoutCommand(41)`。Mission基板の上記microSD PASSとは別hardware |
 | flightlog Flash | PASS (bring-up sector) | 既知test sectorのwrite/read/CRC/reboot/eraseを確認。production appendは未評価 |
 | ADC | PARTIAL | motor source 10.17 V相当、logic senseは0 V。bench基準との校正と閾値決定は未実施 |
 | calibration | PARTIAL | 3秒×10回、IMU 10/10成功、SSC 0/10。stationary acceptance値は未決定 |
@@ -168,6 +178,7 @@
 - STS、I2C、SD、Flash、AS5047D: serial consoleで観察
 - CAN診断raw: `/tmp/avi_can_diag.tsEKwA/bringup_20260813T193506_868398.raw`（修正前lifecycle 100）、`bringup_20260813T193526_910188.raw`（raw TWAI単発）、`bringup_20260813T193547_806618.raw`（修正前CANCREATE panic）。guard後は`/tmp/avi_can_guard.i2pGEM/bringup_20260813T211106_901752.raw`（lifecycle 100）、`bringup_20260813T211122_851128.raw`（raw TWAI）、`bringup_20260813T211138_758945.raw`（CANCREATE NOT_SUPPORTED）。一時fileでGit管理外
 - production boot: `/tmp/avi_can_guard.i2pGEM/production_boot_phases.log`に修正前TG1WDT、`/tmp/avi-production-gate2-tj5qflvh/production.log`に正常status、`/tmp/avi-production-zero-7ckc41rw/production_zero.log`に一時all-zero診断を記録
+- 2026-08-14の3基板raw log: `/tmp/99l_hwtest_20260814_G8Eh5f/`（Git管理外）。Mission bring-upは`mission_bringup/`、IMU freshness修正後bootは`mission_imu_clock_fix.log`、CAN ID別修正前後は`canid35/`と`canid_after_fix/`、安全commandは`rx_window_validation/`、`safe_e2e_commands/`、`ae_safe_path/`
 - host parser self-test: temporary directoryだけを使用し、終了時に削除
 - motor実測data: 今回の安全条件に従いmotorをarmせず未取得。先行all-zeroの原因も未確定
 - raw/CSV/summaryはGit管理外とし、このfileにsummaryだけを記録する
@@ -197,6 +208,16 @@
 | logic電源ADC | 0 V相当 | 接続条件との矛盾があり未解決 |
 | microSD throughput | write 0.550 MiB/s、read 1.760 MiB/s | 1 MiB bring-up file |
 | Flash test block | 最大9,221 us | 4 KiB test sector |
+| 3基板接続時CAN RX | 約256 frame/s、decode error 0 | 修正後30秒のactive ID count合計7,682、ComBoard HWSTAT |
+| CAN `0x100` / `0x109` | 各3,000 / 30秒、100 Hz、gap 0 | 修正後ComBoard受信counter |
+| CAN `0x108` | 750 / 30秒、25 Hz、gap 0 | 修正後ComBoard受信counter |
+| CAN `0x102` | 301 / 30秒、約10 Hz、gap 0 | 修正後ComBoard受信counter |
+| CAN `0x103` / `0x107` | 各300 / 30秒、10 Hz、gap 0 | 修正後ComBoard受信counter |
+| CAN `0x012` | 30 / 30秒、1 Hz | 時刻未同期中のTimeRequest |
+| unknown generic round-trip | 0.515秒 | Ground入力から`Rejected/NotSupported` B0まで |
+| CancelSequence round-trip | 0.745秒 | Ground入力から`Rejected/InvalidState` B0まで |
+| Liftoff Emergency round-trip | 1.581秒 | Ground入力から`Rejected/InvalidState` B0まで |
+| ActuatorEmergency round-trip | 1.614秒 | Ground入力から`Completed/None` B0まで |
 
 LPS25HBのpressure/temperature読値は現在個体の妥当性を保証できないため、この表とparameter判断から除外しました。
 
@@ -204,6 +225,7 @@ LPS25HBのpressure/temperature読値は現在個体の妥当性を保証でき�
 
 - ICM連続欠落許容sample数をSpicaで決定する
 - alpha/betaをSpica + 実encoder logで確定する
+- ICM sensor timestampをhostへ写像する固定offsetのclock scale driftを長時間logで評価し、姿勢・離床時刻比較へ必要ならscale補正を入れる
 
 ## 8. 残っているTODO(HW_TEST)
 
@@ -217,15 +239,15 @@ LPS25HBのpressure/temperature読値は現在個体の妥当性を保証でき�
 - 動翼・stopper組付後のfin software limit
 - Flash logging rateとRealtimeへの影響
 - SSCDRRN005PD2A5接続後の400 Hz通信、zero、sensor値
-- encoder、CAN、STS motion、production storage、ADC校正、motorの各実機長時間試験
+- encoder長時間、upstream修正版でのCANCREATE診断、STS motion、production storage、ADC校正、motorの各実機長時間試験
 
 ## 9. Mission実装へ進むblocker
 
 - AS5047Dの最終再試験は正常だが、先行all-zeroの原因は未確定。再発時はmotor試験をfail-closedで停止する
-- CANCREATE自己診断はESP-IDF 6以上を既知safe release確認まで禁止中。upstream修正版IDFとComBoard復旧後に再試験が必要
+- production CAN peer通信はPASSしたが、CANCREATE自己診断はESP-IDF 6以上を既知safe release確認まで禁止中。upstream修正版IDFで再試験が必要
 - LPS25HBの物理値は未検証で、pressure trend、離床・頂点判定の根拠にできない
 - SSC未接続のため400 Hz AirData、zero、airspeed、Control gateを完了できない
-- logic電源ADCが0の原因、battery threshold/debounce、production loggingのRealtime影響が未解決
+- logic電源ADCが0の原因、battery threshold/debounce、Mission production loggingのRealtime影響が未解決。ComBoard `CAN.CSV`はComBoard microSD初期化失敗で別途BLOCKED
 - STS motion/open/stall/retryは安全監視・fixtureなしで実施していない
 - motor polarity/profile、filter係数、欠落sample許容値、fin limitが未確定
 
@@ -318,6 +340,63 @@ LPS25HBのpressure/temperature読値は現在個体の妥当性を保証でき�
 - final safety: 通常bring-up firmwareへ再flashし、safe=yes、motor disarmed、IN1/IN2/AUX5V/PARAすべて0を確認
 - remaining TODO: upstream修正を含むIDFへ更新後、peerを接続して100 Hz 60秒、bus-off/recoveryを再実施する。task lifetime中nodeを保持するproduction CAN ownerは今回のcreate/delete raceとは別lifecycle
 - data files: guard前は`/tmp/avi_can_diag.tsEKwA/`、guard後は`/tmp/avi_can_guard.i2pGEM/`。Git管理対象外
+
+### BR-011: 3基板接続前のMission bring-up再確認
+
+- date/time: 2026-08-14T00:11〜00:17+09:00
+- Mission Board git HEAD: `bea8c544b07b6421583bcb85bc5564b8ebd0cdc5`
+- Avi_ESP_Libs submodule HEAD: `43a185ab2a570d4e1b889a4a534984fd19b2194f`
+- test name: `status`、`spi-test`、`encoder-test`、`imu-selftest`、AUX5V ON/OFFを挟む`i2c-probe`、`sd-test`、二段階`flash-test`、`adc-stream 10`、`calibrate`、`calibration-repeat 10`、`can-lifecycle-test 100`、`sts-probe`、`sts-read`、`sts-free`
+- firmware build: `avi_99l_missionboard_bringup`
+- serial port: `/dev/ttyACM1`、serial `44:1B:F6:D1:DC:A8`
+- duration: 各command 3〜45秒。ADCは10秒、calibrationは3秒×11 attempt
+- sample count: encoder 1 test、IMU self-test 1、LPS 25/25、SD 1 MiB、Flash 4 KiB、ADC 1,000/1,000、calibration IMU 11/11、CAN lifecycle 100/100、STS telemetry 50/50
+- error count: encoder/IMU/LPS/SD/Flash/ADC/CAN/STS operation error 0。SSCは未接続で11/11 zero invalid。`calibration-repeat`では既にinstall済みのGPIO ISR serviceに対するESP-IDF error logが9回出たが、全attemptは完走
+- max latency: LPS 704 us、SD block 931,771 us、Flash 9,908 us、ADC 369 us、STS telemetry 917 us
+- observed behavior: 開始前と終了後の`status`はsafe=yes、motor armed=no、IN1/IN2/AUX5V/PARA=0、STS persistent bus up。AS5047Dはraw 12,930、284.106度、offset done、AGC 61、magnitude 4,629。SSC `0x28`はNACK、LPS `0x5C`はtransport PASS、`0x5D`はno device。STSはcold startの7回目にPING成功し、position 50.625度、speed/load/current 0、fault 0、最後にtorque OFF/Para電源OFF
+- result: PASS（安全状態、SPI、AS5047D、ICM self-test、LPS transport、Mission microSD、flightlog、ADC capture、CAN lifecycle、STS read/free）、PARTIAL（calibration parameter）、SKIP（SSC）、NOT_EVALUATED（LPS物理値）、NOT_EXERCISED（motor/STS motion/Para motion）
+- cause: SSCは意図どおり未接続。calibrationのGPIO ISR再install logは結果を隠さず残し、別途owner/lifecycleを確認する
+- library fix: なし
+- remaining TODO: GPIO ISR serviceの重複install log、LPS物理値、SSC実機、ADC校正、actuator motionは別試験
+- data files: `/tmp/99l_hwtest_20260814_G8Eh5f/mission_bringup/`。Git管理外
+
+### BR-012: 3基板production CANと安全command round-trip
+
+- date/time: 2026-08-14 JST（raw log UTCでは2026-08-13T15:28〜16:22）
+- Mission Board base HEAD: `bea8c544b07b6421583bcb85bc5564b8ebd0cdc5` + 本試験の`src/runtime/production_runtime.cpp`修正
+- Avi_ESP_Libs submodule HEAD: `43a185ab2a570d4e1b889a4a534984fd19b2194f`、変更なし
+- test name: Mission production boot、Mission→ComBoard CAN ID別観測、Ground→LoRa→ComBoard→CAN→Mission→CAN→ComBoard→LoRa→Groundのsafe command、TimeResponse、ActuatorEmergency
+- firmware build: Mission `avi_99l_missionboard`、ComBoard/Groundは各production firmware
+- serial port: Mission `/dev/ttyACM1`、ComBoard `/dev/ttyACM0`、Ground `/dev/ttyUSB0`
+- duration: production boot 10秒以上、ID別修正後計測30秒、安全command個別capture、最終production同時capture 65秒
+- sample count: 修正後30秒の受信は`0x012=30`、`0x020=1`、`0x100=3,000`、`0x102=301`、`0x103=300`、`0x107=300`、`0x108=750`、`0x109=3,000`
+- error count: 上記active IDのsequence gap 0、ComBoard CAN decode/RX error 0、TEC 0、REC 0。Mission/ComBoard/Groundのpanic/Guru Meditation 0。修正前EmergencyではComBoardの過剰warningを各1回記録
+- max latency: unknown generic 0.515秒、CancelSequence 0.745秒、Liftoff Emergency 1.581秒、ActuatorEmergency 1.614秒（Ground入力からfinal B0）。最終revisionはunknown/F1ともuplink送信後0.360秒
+- observed behavior: productionはsafe outputを先に設定し、SPI/ICM、AS5047D begin/status/pipeline、CanTask 125 kbit/s、AirData LPSをすべて`ESP_OK`で開始した。SSCは`ESP_ERR_NOT_FOUND`のまま継続し、flight_enabled=false、motor coast、Para電源OFFを維持した。CommandReceive schedule対象のCAN IDは修正後すべて期待rateとなり、`0x101/0x104/0x105/0x106`はstate/機能条件によりNOT_EXERCISED
+- result: PASS（production boot、sensor startup、CAN peer telemetry、active ID rate/gap、safe commandのfinal round-trip、TimeResponse経路、Emergency result priority経路、ActuatorEmergency安全側経路）、NOT_EXERCISED（flight-state telemetry、actuator motion）、BLOCKED（ComBoard microSD `CAN.CSV`。Mission microSDではない）
+- cause: 修正前は`writeFrame`がTX queue depth 1へ`noWait`で100 Hz tick内の複数frameを連続投入し、TX完了前のframeを落としていた。5 msの有限timeoutで同一CanTask内を直列化して解消した
+- library fix: なし。CANCREATE通常production pathは正常で、Avi_ESP_Libsの変更を要するlibrary bugは本試験で確認していない
+- remaining TODO: Mission非接続でのEmergency `Failed/Timeout` B0を実機確認する。加えてupstream修正版IDFでのCANCREATE lifecycle、flight state別ID、bus-off/recovery、ComBoard SD復旧後のCAN.CSV、長時間CAN error率を確認する
+- data files: `/tmp/99l_hwtest_20260814_G8Eh5f/canid35/`（修正前）、`canid_after_fix/`（修正後）、`rx_window_validation/`、`safe_e2e_commands/`、`time_sync_fixed/`、`ae_safe_path/`、`final_production_65s_v5/`。Git管理外
+
+### BR-013: production IMU freshnessとEmergency mutex競合
+
+- date/time: 2026-08-14 JST
+- Mission Board base HEAD: `bea8c544b07b6421583bcb85bc5564b8ebd0cdc5` + 本試験修正
+- Avi_ESP_Libs submodule HEAD: `43a185ab2a570d4e1b889a4a534984fd19b2194f`
+- test name: production IMU 10秒連続boot観測、safe commandとActuatorEmergency end-to-end
+- firmware build: `avi_99l_missionboard`
+- serial port: `/dev/ttyACM1`
+- duration: IMU修正後10秒、ActuatorEmergency前後約15秒
+- sample count: IMU startup 1、ActuatorEmergency transaction 11を1回
+- error count: 修正後IMU recovery 0、panic/reset 0。ActuatorEmergency final B0 error 0。ComBoardはF0/F1がgeneric tracker対象外なのに修正前は過剰warningを1回出した
+- max latency: ActuatorEmergency final B0まで1.614秒
+- observed behavior: 修正前はICM sensor timestampを固定offsetでhostへ写像した値と`esp_timer_get_time()`を3 ms freshness gateで比較し、clock driftで`now < last_sample`となって約100 ms周期のend/beginを繰り返した。sample取得時の`host_timestamp_us`へfreshness clock domainを統一後、10秒間再初期化なし。Emergency受信ではCanTaskの`state_mutex` noWait snapshotを廃止し、nonzero transactionをlatchしてRealtimeTaskで実stateを判定した。ActuatorEmergencyは`command=0xF0 phase=Completed reason=None`、MissionEvent flag `0x2000`
+- result: PASS（IMU freshness root-cause修正後の短時間実機確認、ActuatorEmergencyのMission処理/final B0、ComBoard Emergency修正後のLiftoff invalid-state経路）、PARTIAL（IMU長時間clock drift）、NOT_EXERCISED（Liftoff Emergencyのvalid EngineBurn path）
+- cause: freshness bugは異なるclock domainの比較。Emergency bugは一時的なmutex競合を実state不一致として扱うrace
+- library fix: なし
+- remaining TODO: sensor→host timestamp写像のscale driftを長時間測定する。飛行enable前に姿勢history/liftoff時刻比較への影響を評価する。Emergency valid-state pathは安全fixtureで別途確認する
+- data files: `/tmp/99l_hwtest_20260814_G8Eh5f/mission_imu_diag.log`、`mission_imu_clock_fix.log`、`safe_e2e_commands/`、`ae_safe_path/`。Git管理外
 
 ### 追記template
 

@@ -8,7 +8,7 @@
 2. 制御・推定・filter係数を決めるためのraw dataを取得する
 3. PASSしたdriverだけを後段のMission実装へ引き渡す
 
-完全なMission FSM、LQR、ZeroHold gain、TorqueMapper tuning、LoRa protocol、ComBoard、ground stationは対象外です。物理方向または係数が未確定の場合は推測せず`Unconfigured`のまま扱います。
+bring-up commandによる完全なMission FSM、LQR、ZeroHold gain、TorqueMapper tuningは対象外です。物理方向または係数が未確定の場合は推測せず`Unconfigured`のまま扱います。ComBoard/Groundを含むproduction通信は3.5.1/3.5.2で別試験とし、actuator motionを伴わない経路だけを確認します。
 
 ## 2. 試験前check
 
@@ -113,6 +113,8 @@ production実機確認では、正常statusでpipeline開始まで完走する�
 
 `timestamp_ticks`、`timestamp_us`、timestamp単調性/wrap、accel/gyro validity、ODR change、FIFO full、lost packet、FIFO fault、sample数、read latencyを確認します。`body_z = -sensor_z`だけが確定済みで、X/Yは変換しません。通常動作のlost packetを先にゼロへすることを優先し、1 sample補間候補の評価はraw data取得後に行います。
 
+productionのfreshness判定は、FIFO sampleをhostが取得した`host_timestamp_us`と判定時の`esp_timer_get_time()`を比較します。ICM sensor timestampをhostへ写像した時刻はhistoryと姿勢計算へ使用しますが、sensor clockとhost clockには実機driftがあるため、3 ms freshness gateへ直接使いません。2026-08-14の修正前productionではclock domain混在により`now < last_sample`となり、約100 msごとに不要なIMU再初期化を繰り返しました。修正後の10秒boot観測では再初期化、panic、resetを認めませんでした。sensor→hostの固定offset写像にclock scale補正を加えるかは、飛行enable前の長時間試験TODOです。
+
 ### 3.4 I2C/AirData no-device
 
 `i2c-probe`を実行します。I2C_NUM_0、SDA GPIO47、SCL GPIO48、300 kHz、internal pull-upなし、lock noWait、有限operation timeoutを使います。
@@ -142,6 +144,34 @@ CAN診断前に`status`を実行し、motor `armed=no`、IN1/IN2 `0`、AUX5V `0`
 通信基板が無い試験では`can-load-test 100 60`を合格判定に使いません。peer接続後に実施する場合は、bring-up専用標準ID `0x7FE`、payload内sequence counterを使い、requested、driver queue投入成功、write error、RX error、bus error、dropped RX、bus-off回数、recovery成否、平均/最大write latencyを記録します。`write == ESP_OK`はdriver queue投入成功であり、物理ACK完了数ではありません。
 
 CAN診断終了後は通常bring-up firmwareを再flashし、boot後にsafe output、motor disarm、AUX5V OFF、Para電源OFFを確認します。
+
+#### 3.5.1 peer接続production CAN
+
+Mission/ComBoardを同じ125 kbit/s busへ接続した試験では、先にcurrent MissionStateとscheduleから送信対象IDを導出します。CommandReceiveでは`0x100` Kinematicsと`0x109` Airspeedが100 Hz、`0x108` LPSが25 Hz、`0x102` MissionStatus、`0x103` PowerTime、`0x107` AttitudeTiltが10 Hz、時刻未同期中の`0x012` TimeRequestが1 Hzです。`0x020` MissionEventはevent発生時だけです。`0x101` Control、`0x104` DescentCore、`0x105/0x106` Recoveryは現在stateで送信されないため、0件をFAILにしません。
+
+productionのCAN controllerはTX完了callbackまで1枠を占有します。100 Hz tickで複数IDを`noWait`連続投入すると、最初のframe以外が`ESP_ERR_NOT_FINISHED`となるため、`writeFrame`は5 msの有限timeoutで同一owner内の送信を直列化します。timeoutを無限化せず、受信側でID別count、DLC/decode error、sequence gap、freshnessを再確認します。2026-08-14の修正後30秒では次を実測しました。
+
+| CAN ID | count | 実測rate | sequence gap | 判定 |
+|---:|---:|---:|---:|---|
+| `0x012` | 30 | 1 Hz | 対象外 | PASS |
+| `0x020` | 1 | event 1回 | 0 | PASS |
+| `0x100` | 3,000 | 100 Hz | 0 | PASS |
+| `0x102` | 301 | 約10 Hz | 0 | PASS |
+| `0x103` | 300 | 10 Hz | 0 | PASS |
+| `0x107` | 300 | 10 Hz | 0 | PASS |
+| `0x108` | 750 | 25 Hz | 0 | PASS |
+| `0x109` | 3,000 | 100 Hz | 0 | PASS |
+| `0x101/0x104/0x105/0x106` | 0 | state依存 | 対象外 | NOT_EXERCISED |
+
+同区間のComBoard側CAN receive/decode error、TEC、RECは0でした。ComBoardのraw logging queue dropはComBoard microSD初期化失敗時に発生した別問題であり、CAN wire receive/decode errorと混同しません。
+
+#### 3.5.2 安全なcommand round-trip
+
+Ground→LoRa→ComBoard→CAN→Mission→CAN→ComBoard→LoRa→Groundを確認するときは、motionを起こさないerror pathから実行します。CommandReceiveでは未知generic command `0x7F`は`Rejected/NotSupported`、`CancelSequence 0x02`とLiftoff Emergencyは`Rejected/InvalidState`が期待値です。ActuatorEmergencyは全通常試験の最後に、motor coastとPara電源OFFを確認してから1回だけ実行します。
+
+nonzero transactionのEmergencyを受信したCanTaskは、`state_mutex`のnoWait取得成否で受理可否を決めません。commandをlatchし、MissionRealtimeTaskがmutexを取得して実stateを判定することで、一時競合によるfalse rejectionを防ぎます。2026-08-14の実機ではActuatorEmergency transaction 11が`Completed/None`となり、MissionEvent `0x2000`を確認しました。試験後はMissionをresetしてproduction通常bootへ戻します。
+
+final B0の到達とComBoard内部のresult処理は別判定にします。Liftoff/Actuator Emergencyはgeneric trackerに登録せず安全優先CAN queueへ直接送る設計です。修正前の「pending requestに一致しないCommandResult」は過剰warningで、Groundへのfinal B0はPASSしていました。ComBoardはuntracked F0/F1を専用priority LoRa queueへnon-blocking投入し、CAN TX失敗時も`Failed/Timeout`のterminal B0を返します。修正後のLiftoff Emergencyも実機でfinal B0とwarningなしを確認済みです。
 
 ### 3.6 storage
 
