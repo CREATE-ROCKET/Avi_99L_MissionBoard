@@ -1,8 +1,21 @@
 # C-99L Mission Board
 
-ESP32-S3-WROOM-1-N16R8を搭載したMission Boardのbring-up firmwareです。現段階の目的は、`Avi_ESP_Libs`の公開APIを実機で検証し、制御・推定・filter係数を決めるための実測データを取得することです。完全なMission FSM、LQR、ZeroHold、LoRa protocolはこの段階では実装しません。
+ESP32-S3-WROOM-1-N16R8を搭載した99L Mission Board firmwareです。Vault 00〜07/04aに基づくMission FSM、CAN codec、command lifecycle、sensor continuity、制御pipeline、パラシュート安全coreをproduction moduleとして実装し、既存bring-up firmwareも明示選択できる形で維持しています。
+
+現時点ではMotorProfile、fin software limit、パラシュートOpen/Close永続設定が未確定・未接続です。既定production buildは各owner taskとsensor/CANを起動しますが、`StartSequence`を`NotConfigured`で拒否し、motor coast/パラシュート電源OFFを維持します。飛行可能firmwareを意味しません。
 
 詳細な試験順序は[docs/bringup.md](docs/bringup.md)、実施結果は[docs/bringup_results.md](docs/bringup_results.md)を参照してください。
+
+## architecture
+
+- `src/protocol`: Classic CAN 11-bit/125 kbit/sのlittle-endian codec、04a量子化、ID別sequence/schedule
+- `src/mission`: 5状態FSM、flight epoch、reset/Deep Sleep recovery、16件transaction cacheとreplay
+- `src/sensors`: liftoff/apex detector、freshness、ICM timestamp continuity、1 sample欠落補間
+- `src/control`: Roll/ZeroHold、60〜180 m/s gain interpolation、quadratic N=3、TorqueMapper、stopper判定
+- `src/actuators`: power cutoff latch、パラシュートstall retry/global deadline
+- `src/runtime`: fixed task/queue allocationとhardware owner。FSMは`MissionRealtimeTask`だけが更新し、CAN/CommandWorkerからmessageで遷移要求を受けます。
+
+優先順はSafety→Parachute→MissionRealtime→AirData→CAN→persistenceです。SPI2/SPI3とmotorはMissionRealtime、I2CはAirData、CAN controllerはCanTask、STS UARTはParachuteTaskがそれぞれ唯一ownerです。SafetyTaskはflight epoch/離床時刻を独立監視し、離床+25秒でUART taskに依存せずGPIO40/44を遮断します。
 
 ## 安全上の注意
 
@@ -35,7 +48,7 @@ git -C lib/Avi_ESP_Libs branch --show-current
 git -C lib/Avi_ESP_Libs rev-parse HEAD
 ```
 
-`lib/Avi_ESP_Libs`は`refactor` branchから取得しますが、実際のrevisionは親repositoryのgitlinkが示すcommit SHAで固定します。今回の検証開始点は`0701132deb1d662732059a505001d0e238bc0d13`です。現在は検証中のlibrary修正がsubmodule内に未commitで存在するため、最終的な検証済みrevisionはまだ固定されていません。
+`lib/Avi_ESP_Libs`は`refactor` branchから取得し、親repositoryのgitlinkでrevisionを固定します。Mission側へdriverをvendor化しません。
 
 ## build
 
@@ -45,6 +58,19 @@ PlatformIOと`espressif32@7.0.1`、指定されたtool packageを初回だけnet
 pio pkg install -e avi_99l_missionboard
 pio run
 ```
+
+既定は`MISSION_BRINGUP_SHELL=0`のproduction runtimeです。既存bring-up shellは`pio run -e avi_99l_missionboard_bringup`でbuildします。flight設定が未確定の既定buildではactuator commandを自動実行しません。
+
+host testはworkspace外の実行可能なbuild directoryを指定します。
+
+```sh
+cmake -S host_test -B /tmp/avi-99l-mission-host
+cmake --build /tmp/avi-99l-mission-host --parallel
+ctest --test-dir /tmp/avi-99l-mission-host --output-on-failure
+python3 tools/capture_bringup.py --self-test
+```
+
+共通golden vectorは`testdata/99l_protocol_golden_vectors.txt`です。Mission/ComBoard/Groundでbyte-identicalに保ちます。
 
 次の条件を満たせば、通常の`pio run`にnetworkは不要です。
 
@@ -74,6 +100,8 @@ pio device monitor --port "$MISSION_PORT" --baud 115200 --eol LF
 ```
 
 ## BringupShell command
+
+以下は`MISSION_BRINGUP_SHELL=1`でのみ有効です。production runtimeのUSB console commandではありません。
 
 全commandは1行ずつ送ります。不正な引数、未初期化、timeout、driver error、別testの実行中をshellが明示します。
 
@@ -142,3 +170,26 @@ record type 1〜5をすべてCSVへ変換します。
 出力はbyte列をそのまま保存する`.raw`、capture統計とsequence gapを記録する`_summary.json`、record種別ごとのCSVです。IMU recordについてはgyroの平均・標本標準偏差・時間drift、accelerationの平均・norm・標本標準偏差、1/3/10秒window biasのばらつきもsummaryへ逐次集計します。
 
 `Ctrl-C`時は`motor-disarm`送信を最大0.5秒試行し、成否を`emergency_disarm_attempted`と`emergency_disarm_error`へ記録します。これは物理resetまたは電源遮断の代替ではありません。`data/bringup/`は`.gitignore`対象で、結果の要約だけを`docs/bringup_results.md`へ残します。詳細なwire formatは[docs/bringup.md](docs/bringup.md#binary-stream-protocol)を参照してください。
+
+## protocol
+
+CANはstandard 11-bit、125 kbit/s、DLC 8以下、multi-byteはlittle-endianです。`0x001/002` Emergency、`0x008/105` Recovery、`0x010/011` generic request/result、`0x012/013` Time、`0x020` MissionEvent、`0x100..109` telemetryを実装します。Emergencyはgeneric commandへ統合しません。transaction ID 0は禁止、pending ID再利用禁止、同一requestはreplay、同一ID異payloadは`ProtocolError`です。
+
+100 HzはKinematics/Control/AirspeedとDescent中のDescentCore、25 HzはLPS、10 HzはMissionStatus/PowerTime/Tiltです。AirData power cutoff後はLPS/Airspeedを停止します。未取得物理値は04aのsemantic error rawを送信し、0として偽装しません。
+
+## hardware assumptions
+
+- ICM42688とAS5047Dは各独立SPI busで1 kHz acquisition候補
+- LPS25HB/SSCは外部pull-upのI2C0 300 kHz。SSC未接続は正常な起動条件で、Controlだけをinhibitします。
+- STS3215はUART1唯一owner。Open位置未復元時は動作せずpower cutoffします。
+- MotorProfile polarity/個体値、fin software limitは`TODO(HW_TEST)`のまま未設定です。
+- Roll gain table、freshness/debounce、quadratic estimator、torque scaleは`TODO(SIMULATION)`を保持します。
+
+## known limitations
+
+- NVS para設定、Internal Flash append log、SD production loggerはowner taskの安全stubまでで、flight pathへ未接続です。software/watchdog reset用checkpointはversion/CRC付きRTC memoryで復旧し、POR後の絶対時刻復旧は未接続のため安全側に飛行再開しません。
+- Roll gain tableとmotor/fin configuration未確定のためproduction runtimeはflight-disabledです。
+- ICM history/replay、AS5047D unwrap、quadratic fin rateまではruntimeへ接続済みですが、Roll/ZeroHold/TorqueMapperからmotor出力への経路はprofile確定まで無効で、常にcoastします。
+- ParachuteTaskはSTS唯一ownerですが、Open位置永続loader未接続のためflight Openを安全拒否します。
+- Deep SleepはRTC marker/wake causeを検証した専用task subsetで10秒周期wakeします。Internal Flash/SD log reader未接続のためlog dump要求は`SourceUnavailable`です。2秒command windowは`TODO(HW_TEST)`です。
+- 実機flash、CAN/LoRa round-trip、actuator試験はREADMEのbuild/test完了とは別に記録します。未実施を成功扱いしません。
