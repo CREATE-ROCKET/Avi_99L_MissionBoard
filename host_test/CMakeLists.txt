@@ -12,6 +12,7 @@ add_executable(mission_host_tests
   ../src/mission/recovery.cpp
   ../src/protocol/can_protocol.cpp
   ../src/protocol/quantization.cpp
+  ../src/sensors/air_data_flight_logic.cpp
   ../src/sensors/attitude_estimator.cpp
   ../src/sensors/flight_detectors.cpp
   ../src/sensors/sensor_health.cpp

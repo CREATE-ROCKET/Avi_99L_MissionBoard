@@ -153,6 +153,16 @@ CommandDecision CommandExecutor::begin(const GenericCommandRequest &request,
            (domain == CommandDomain::parachute &&
             !context.parachute_available))
     rejection = CommandReason::device_unavailable;
+  else if (domain == CommandDomain::fin &&
+           !context.fin_safe_commands_supported)
+    rejection = CommandReason::not_supported;
+  else if ((domain == CommandDomain::calibration &&
+            !context.calibration_supported) ||
+           (domain == CommandDomain::storage &&
+            !context.storage_export_supported) ||
+           (domain == CommandDomain::motor_profile &&
+            !context.motor_profile_selection_supported))
+    rejection = CommandReason::not_supported;
   else if (busy(domain))
     rejection = CommandReason::busy;
   else if (code == CommandCode::start_sequence && cachedCount() != 0 &&

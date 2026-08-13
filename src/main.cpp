@@ -9,10 +9,20 @@
 #include "esp_psram.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "runtime/production_runtime.hpp"
+#include "runtime/recovery_boot.hpp"
+
+#ifndef MISSION_BRINGUP_SHELL
+#define MISSION_BRINGUP_SHELL 0
+#endif
 
 namespace {
+#if MISSION_BRINGUP_SHELL
 bringup::StreamProtocol stream;
 bringup::BringupShell shell{stream};
+#else
+runtime::ProductionRuntime *production_runtime{};
+#endif
 
 esp_err_t initializeConsole() {
   if (!usb_serial_jtag_is_driver_installed()) {
@@ -64,7 +74,13 @@ extern "C" void app_main() {
   }
   std::setvbuf(stdout, nullptr, _IONBF, 0);
 
-  std::printf("\nC-99L Mission Board bring-up\n");
+  std::printf("\nC-99L Mission Board %s\n",
+#if MISSION_BRINGUP_SHELL
+              "bring-up"
+#else
+              "production"
+#endif
+  );
   std::printf("safe_outputs=%s console=%s\n", esp_err_to_name(safe_result),
               esp_err_to_name(console_result));
   const bool memory_valid = printMemoryInfo();
@@ -77,6 +93,7 @@ extern "C" void app_main() {
       vTaskDelay(pdMS_TO_TICKS(1'000));
   }
 
+#if MISSION_BRINGUP_SHELL
   const esp_err_t stream_result = stream.initialize();
   const esp_err_t shell_result = shell.initialize();
   std::printf("stream=%s shell=%s\n", esp_err_to_name(stream_result),
@@ -92,4 +109,26 @@ extern "C" void app_main() {
       vTaskDelay(pdMS_TO_TICKS(1'000));
   }
   shell.run();
+#else
+  const bool marker_valid = runtime::recovery_boot::markerValid();
+  const bool wake_cause_valid = runtime::recovery_boot::wakeCauseValid();
+  const bool recovery_only = marker_valid || wake_cause_valid;
+  static runtime::ProductionRuntime runtime{
+      recovery_only, marker_valid && wake_cause_valid};
+  production_runtime = &runtime;
+  const esp_err_t runtime_result = production_runtime->start();
+  std::printf("runtime=%s flight_enabled=%s\n",
+              esp_err_to_name(runtime_result),
+              production_runtime->flightEnabled() ? "true" : "false");
+  if (runtime_result != ESP_OK) {
+    (void)bringup::safe_outputs::motorCoast();
+    (void)bringup::safe_outputs::setAux5v(false);
+    (void)bringup::safe_outputs::setParaPower(false);
+    std::printf("production task起動失敗のため安全状態を維持します。\n");
+    while (true)
+      vTaskDelay(pdMS_TO_TICKS(1'000));
+  }
+  // runtime taskへ所有権を移したためapp_main taskは終了する。
+  vTaskDelete(nullptr);
+#endif
 }

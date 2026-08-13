@@ -40,6 +40,7 @@ struct MissionSnapshot {
   uint32_t flight_epoch{};
   bool liftoff_time_valid{};
   uint64_t liftoff_time_us{};
+  uint64_t elapsed_us{};
   bool fin_control_disabled{};
   bool control_reentry_inhibited{};
   bool reset_invalidated{};

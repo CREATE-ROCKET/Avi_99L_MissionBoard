@@ -47,6 +47,10 @@ struct CommandContext {
   bool fin_available{true};
   bool parachute_available{true};
   bool motor_test_busy{};
+  bool calibration_supported{};
+  bool storage_export_supported{};
+  bool motor_profile_selection_supported{};
+  bool fin_safe_commands_supported{};
 };
 
 struct CommandDecision {

@@ -6,6 +6,8 @@
 #include "protocol/can_protocol.hpp"
 #include "protocol/quantization.hpp"
 #include "runtime/task_architecture.hpp"
+#include "runtime/emergency_latch.hpp"
+#include "sensors/air_data_flight_logic.hpp"
 #include "sensors/attitude_estimator.hpp"
 #include "sensors/flight_detectors.hpp"
 #include "sensors/sensor_health.hpp"
@@ -77,6 +79,12 @@ void expectScalar(const std::map<std::string, std::vector<uint8_t>> &golden,
 void testCanGolden(
     const std::map<std::string, std::vector<uint8_t>> &golden) {
   using namespace protocol;
+  const uint16_t event_flags =
+      eventFlag(MissionEventFlag::icm_data_loss_or_error) |
+      eventFlag(MissionEventFlag::state_changed) |
+      eventFlag(MissionEventFlag::liftoff_detected) |
+      eventFlag(MissionEventFlag::fin_control_disabled_by_ground);
+  assert(event_flags == 0x4061);
   expectFrame(golden, "CAN_001",
               encode(CanId::actuator_emergency_stop, EmergencyStop{0x2A}));
   expectFrame(golden, "CAN_002", encode(
@@ -96,7 +104,7 @@ void testCanGolden(
   expectFrame(golden, "CAN_013",
               encode(TimeResponse{7, TimeSource::ground, 0x12345678, 999}));
   expectFrame(golden, "CAN_020",
-              encode(MissionEvent{0xFF, 0x4061, MissionState::control, 1234,
+              encode(MissionEvent{0xFF, event_flags, MissionState::control, 1234,
                                   0xBEEF}));
   expectFrame(golden, "CAN_100",
               encode(KinematicsTelemetry{0xFF, 0x800D, 0xFFF6, 0xFE,
@@ -341,6 +349,15 @@ void testMissionStateMachine() {
   assert(reset.snapshot().state == MissionState::descent);
   reset.tick({105'000'000, false, false, readyControl()});
   assert(reset.snapshot().deployment_power_cutoff_latched);
+  assert(reset.snapshot().elapsed_us == 25'000'000);
+
+  MissionStateMachine reset_near_cutoff;
+  assert(reset_near_cutoff.restoreAfterReset(
+             5'000'000,
+             {true, MissionState::descent, 8, true, 24'999'000, true,
+              false}) == TransitionResult::completed);
+  reset_near_cutoff.tick({5'001'000, false, false, readyControl()});
+  assert(reset_near_cutoff.snapshot().deployment_power_cutoff_latched);
 }
 
 protocol::GenericCommandRequest command(uint8_t transaction, uint8_t code) {
@@ -358,6 +375,7 @@ void testCommandExecutor() {
   CommandContext context{};
   context.sequence_configured = true;
   context.resources_preallocated = true;
+  context.fin_safe_commands_supported = true;
   CommandExecutor executor;
   auto decision = executor.begin(
       command(0, static_cast<uint8_t>(CommandCode::start_sequence)), context);
@@ -423,6 +441,11 @@ void testCommandExecutor() {
   para_limit.arguments[1] = 0x07;
   assert(executor.begin(para_limit, context).result.reason ==
          CommandReason::invalid_argument);
+  assert(executor.begin(
+             command(11, static_cast<uint8_t>(
+                             CommandCode::run_preflight_calibration)),
+             context)
+             .result.reason == CommandReason::not_supported);
 
   CommandExecutor cache;
   for (uint8_t id = 1; id <= CommandExecutor::kResultCacheSize; ++id) {
@@ -480,6 +503,22 @@ void testSensors() {
     assert(!apex.update(900.0 + index, true, 10'000'000));
   assert(apex.update(929.0, true, 10'000'000));
   assert(!apex.update(NAN, false, 11'000'000));
+
+  sensors::AirDataFlightLogic air_data_logic;
+  sensors::AirDataFlightEvent event{};
+  for (int index = 0; index < 10; ++index)
+    event = air_data_logic.update(
+        1, protocol::MissionState::liftoff_detection, 0,
+        1000.0 - index * 0.3, true);
+  assert(event.flight_epoch == 1 && event.lps_liftoff_detected);
+  for (int index = 0; index < 30; ++index)
+    event = air_data_logic.update(1, protocol::MissionState::engine_burn,
+                                  10'000'000, 900.0 + index, true);
+  assert(event.pressure_apex_detected);
+  event = air_data_logic.update(2, protocol::MissionState::liftoff_detection,
+                                0, 800.0, true);
+  assert(event.flight_epoch == 2 && !event.lps_liftoff_detected &&
+         !event.pressure_apex_detected);
 }
 
 void testAttitudeContinuity() {
@@ -647,6 +686,14 @@ void testRuntimeQueue() {
          runtime::HardwareOwner::deployment_power);
   assert(runtime::kTaskArchitecture[2].owner ==
          runtime::HardwareOwner::mission_spi_and_motor);
+
+  runtime::EmergencyLatch emergency;
+  assert(!emergency.signal(42));
+  assert(emergency.signal(43));
+  uint8_t transaction{};
+  assert(emergency.pending());
+  assert(emergency.take(transaction) && transaction == 43);
+  assert(!emergency.take(transaction));
 }
 
 } // 無名名前空間

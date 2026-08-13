@@ -84,6 +84,27 @@ enum class RecoveryStatusCode : uint8_t {
   aborted = 8,
   internal_error = 9,
 };
+enum class MissionEventFlag : uint16_t {
+  icm_data_loss_or_error = 1U << 0U,
+  encoder_error = 1U << 1U,
+  air_data_error = 1U << 2U,
+  fin_motor_saturation = 1U << 3U,
+  reset_or_recovery = 1U << 4U,
+  state_changed = 1U << 5U,
+  liftoff_detected = 1U << 6U,
+  parachute_open_started = 1U << 7U,
+  deployment_power_cutoff = 1U << 8U,
+  persistence_error = 1U << 9U,
+  mission_sd_error = 1U << 10U,
+  can_recovery = 1U << 11U,
+  liftoff_emergency_rollback = 1U << 12U,
+  actuator_emergency_stop = 1U << 13U,
+  fin_control_disabled_by_ground = 1U << 14U,
+};
+
+[[nodiscard]] constexpr uint16_t eventFlag(MissionEventFlag flag) {
+  return static_cast<uint16_t>(flag);
+}
 enum class FinMode : uint8_t {
   free = 0,
   brake = 1,

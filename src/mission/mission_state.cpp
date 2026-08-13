@@ -111,6 +111,7 @@ TransitionResult MissionStateMachine::restoreAfterReset(
   snapshot_.liftoff_time_valid = true;
   snapshot_.liftoff_time_us =
       now_us;
+  snapshot_.elapsed_us = checkpoint.elapsed_us;
   snapshot_.control_reentry_inhibited = true;
   snapshot_.reset_invalidated = true;
   snapshot_.deployment_started = checkpoint.deployment_started;
@@ -153,6 +154,7 @@ void MissionStateMachine::tick(const MissionTickInput &input,
       input.monotonic_us >= snapshot_.liftoff_time_us)
     elapsed_us = elapsed_offset_us_ +
                  input.monotonic_us - snapshot_.liftoff_time_us;
+  snapshot_.elapsed_us = elapsed_us;
   fin_control_available_ = input.control.fin_control_available;
 
   const bool flight_state =
@@ -226,6 +228,7 @@ void MissionStateMachine::updateDirectives(uint64_t now_us) {
 void MissionStateMachine::invalidateLiftoff() {
   snapshot_.liftoff_time_valid = false;
   snapshot_.liftoff_time_us = 0;
+  snapshot_.elapsed_us = 0;
   elapsed_offset_us_ = 0;
 }
 
