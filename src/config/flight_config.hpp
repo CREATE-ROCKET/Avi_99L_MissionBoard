@@ -67,8 +67,15 @@ inline constexpr AirDataConfig kAirData{
 
 // TODO(HW_TEST): ADCによる実測値へ置換し、電圧低下時の制御停止条件を決定する。
 inline constexpr double kMotorBusVoltageV = 9.0;
+#if defined(AVI_99L_CHARACTERIZATION) && AVI_99L_CHARACTERIZATION
+// Characterization profileは最大30%までを実測し、wire contractは35%を上限とする。
+// production flightの15%暫定limitを流用すると、logger上30%でも実PWMが15%へ
+// silent clampされるため、専用buildだけdriver上限を35%へ広げる。
+inline constexpr double kProductionMotorMaximumDuty = 0.35;
+#else
 // TODO(HW_TEST): 初期HILではbring-upと同じ15%へ制限し、実機同定後に確定する。
 inline constexpr double kProductionMotorMaximumDuty = 0.15;
+#endif
 
 // TODO(SIMULATION): Spicaの同定結果から60～180 m/sのgain tableへ置換する。
 // 暫定値は全速度点で同一とし、補間そのものだけをproduction経路で検証する。
@@ -100,4 +107,4 @@ inline constexpr mission::SequenceConfiguration kSequenceConfiguration{
          kProductionMotorMaximumDuty <= 1.0;
 }
 
-} // 名前空間 flight_config
+} // namespace flight_config
