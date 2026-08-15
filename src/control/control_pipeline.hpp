@@ -9,35 +9,10 @@
 namespace control {
 
 struct RollState {
-  double roll_rad{};
+  double roll_deviation_unwrapped_rad{};
   double fin_rad{};
   double roll_rate_rad_s{};
   double fin_rate_rad_s{};
-};
-
-class ControlRollReference {
-public:
-  [[nodiscard]] bool capture(uint32_t flight_epoch, double roll_rad,
-                             uint64_t sample_timestamp_us,
-                             uint64_t control_tick_us);
-  void invalidate();
-  [[nodiscard]] bool validFor(uint32_t flight_epoch) const;
-  [[nodiscard]] uint32_t flightEpoch() const { return flight_epoch_; }
-  [[nodiscard]] double referenceRad() const { return reference_rad_; }
-  [[nodiscard]] uint64_t sampleTimestampUs() const {
-    return sample_timestamp_us_;
-  }
-  [[nodiscard]] uint64_t captureTickUs() const { return capture_tick_us_; }
-  [[nodiscard]] bool deviation(uint32_t flight_epoch,
-                               double current_roll_rad,
-                               double &deviation_rad) const;
-
-private:
-  uint32_t flight_epoch_{};
-  double reference_rad_{};
-  uint64_t sample_timestamp_us_{};
-  uint64_t capture_tick_us_{};
-  bool valid_{};
 };
 
 struct GainPoint {
@@ -56,14 +31,16 @@ struct TorqueRequest {
   bool valid{};
 };
 
+enum class RollControlAuthority : uint8_t { gentle, high_authority };
+
 class RollController {
 public:
   explicit RollController(const RollGainSchedule &schedule)
       : schedule_(schedule) {}
   [[nodiscard]] TorqueRequest compute(const RollState &state,
                                       double airspeed_mps,
-                                      double output_limit_nm) const;
-  [[nodiscard]] static double wrapRollError(double roll_rad);
+                                      RollControlAuthority authority,
+                                      const board::ControlAuthorityLimits &limits = {}) const;
 
 private:
   RollGainSchedule schedule_{};
@@ -73,7 +50,7 @@ struct ZeroHoldConfig {
   // TODO(SIMULATION): Phase 7/9で実測actuator modelを用いて確定する。
   double proportional_gain{2.32};
   double derivative_gain{0.296};
-  double torque_limit_nm{0.80};
+  double zero_hold_requested_torque_limit_Nm{0.80};
   double valid_angle_rad{0.017453292519943295};
   double valid_rate_rad_s{0.08726646259971647};
   uint16_t valid_samples{100};

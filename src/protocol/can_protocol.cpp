@@ -1,4 +1,5 @@
 #include "protocol/can_protocol.hpp"
+#include "protocol/quantization.hpp"
 
 #include <algorithm>
 
@@ -75,6 +76,12 @@ bool validParaMode(ParaMode value) {
          value == ParaMode::unknown;
 }
 
+uint8_t controlRollQualityCode(uint16_t raw) {
+  return raw >= 0x8000U && raw <= 0x800FU
+             ? static_cast<uint8_t>((raw & 0x000FU) + 1U)
+             : 0U;
+}
+
 std::size_t sequenceIndex(CanId id) {
   switch (id) {
   case CanId::kinematics_telemetry:
@@ -97,12 +104,26 @@ std::size_t sequenceIndex(CanId id) {
     return 8;
   case CanId::airspeed_telemetry:
     return 9;
+  case CanId::control_roll_telemetry_v2:
+    return 10;
   default:
     return 0;
   }
 }
 
 } // 無名名前空間
+
+uint32_t controlRollStatusSignature(uint16_t reference_raw,
+                                    uint16_t deviation_raw, uint8_t flags) {
+  constexpr uint8_t kStatusFlagMask =
+      ControlRollTelemetryV2::reference_valid |
+      ControlRollTelemetryV2::control_active |
+      ControlRollTelemetryV2::reference_out_of_range |
+      ControlRollTelemetryV2::deviation_out_of_range;
+  return static_cast<uint32_t>(flags & kStatusFlagMask) |
+         static_cast<uint32_t>(controlRollQualityCode(reference_raw)) << 8U |
+         static_cast<uint32_t>(controlRollQualityCode(deviation_raw)) << 13U;
+}
 
 CanFrame encode(CanId id, const EmergencyStop &message) {
   auto result = frame(id, 1);
@@ -257,6 +278,17 @@ CanFrame encode(const AirspeedTelemetry &message) {
   auto result = frame(CanId::airspeed_telemetry, 2);
   result.data[0] = message.sequence;
   result.data[1] = message.airspeed_raw;
+  return result;
+}
+
+CanFrame encode(const ControlRollTelemetryV2 &message) {
+  auto result = frame(CanId::control_roll_telemetry_v2, 8);
+  result.data[0] = message.sequence;
+  result.data[1] = ControlRollTelemetryV2::schema_version;
+  putU16(result.data, 2, message.control_roll_reference_unwrapped_raw);
+  putU16(result.data, 4, message.roll_deviation_unwrapped_raw);
+  result.data[6] = static_cast<uint8_t>(message.flags & 0x1FU);
+  result.data[7] = message.reference_capture_event_sequence;
   return result;
 }
 
@@ -448,6 +480,30 @@ CodecError decode(const CanFrame &input, AirspeedTelemetry &message) {
   return error;
 }
 
+CodecError decode(const CanFrame &input, ControlRollTelemetryV2 &message) {
+  const auto error = validate(input, CanId::control_roll_telemetry_v2, 8);
+  if (error != CodecError::none)
+    return error;
+  if (input.data[1] != ControlRollTelemetryV2::schema_version)
+    return CodecError::invalid_enum;
+  if ((input.data[6] & 0xE0U) != 0)
+    return CodecError::reserved_bits;
+  const uint16_t reference_raw = getU16(input.data, 2);
+  const uint16_t deviation_raw = getU16(input.data, 4);
+  const uint16_t out_of_range =
+      static_cast<uint16_t>(quantization::RollError::out_of_range);
+  const bool reference_out_of_range =
+      (input.data[6] & ControlRollTelemetryV2::reference_out_of_range) != 0;
+  const bool deviation_out_of_range =
+      (input.data[6] & ControlRollTelemetryV2::deviation_out_of_range) != 0;
+  if ((reference_raw == out_of_range) != reference_out_of_range ||
+      (deviation_raw == out_of_range) != deviation_out_of_range)
+    return CodecError::invalid_enum;
+  message = {input.data[0], reference_raw, deviation_raw, input.data[6],
+             input.data[7]};
+  return CodecError::none;
+}
+
 uint16_t canPeriodMilliseconds(CanId id) {
   switch (id) {
   case CanId::kinematics_telemetry:
@@ -455,6 +511,8 @@ uint16_t canPeriodMilliseconds(CanId id) {
   case CanId::descent_core_telemetry:
   case CanId::airspeed_telemetry:
     return 10;
+  case CanId::control_roll_telemetry_v2:
+    return 100;
   case CanId::lps_telemetry:
     return 40;
   case CanId::mission_status_telemetry:

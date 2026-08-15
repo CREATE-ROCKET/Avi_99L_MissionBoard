@@ -46,7 +46,7 @@ enum class AttitudeInvalidReason : uint8_t {
 };
 
 struct AttitudeState {
-  double roll_rad{};
+  double roll_estimate_liftoff_relative_unwrapped_rad{};
   double roll_rate_rad_s{};
   uint64_t timestamp_us{};
   uint32_t interpolated_sample_count{};

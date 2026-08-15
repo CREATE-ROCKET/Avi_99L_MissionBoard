@@ -135,6 +135,14 @@ void testCanGolden(
               encode(AttitudeTiltTelemetry{0xFA, 20, 280}));
   expectFrame(golden, "CAN_108", encode(LpsTelemetry{0xF9, 1066, 70}));
   expectFrame(golden, "CAN_109", encode(AirspeedTelemetry{0xF8, 61}));
+  expectFrame(golden, "CAN_10A_POS",
+              encode(ControlRollTelemetryV2{0xF7, 760, 1440, 0x07, 0x2A}));
+  expectFrame(golden, "CAN_10A_NEG",
+              encode(ControlRollTelemetryV2{
+                  0xF8, 0, static_cast<uint16_t>(-1440), 0x05, 0x2A}));
+  expectFrame(golden, "CAN_10A_OUT_OF_RANGE",
+              encode(ControlRollTelemetryV2{0xF9, 0x800A, 0x800A, 0x19,
+                                            0x2B}));
 
   ControlTelemetry control{};
   auto invalid = encode(ControlTelemetry{1, 2, 3});
@@ -157,6 +165,53 @@ void testCanGolden(
   assert(canPeriodMilliseconds(CanId::descent_core_telemetry) == 10);
   assert(canPeriodMilliseconds(CanId::lps_telemetry) == 40);
   assert(canPeriodMilliseconds(CanId::mission_status_telemetry) == 100);
+  assert(canPeriodMilliseconds(CanId::control_roll_telemetry_v2) == 100);
+
+  ControlRollTelemetryV2 control_roll{};
+  const auto control_roll_frame =
+      encode(ControlRollTelemetryV2{1, 760, 1440, 0x07, 2});
+  assert(decode(control_roll_frame, control_roll) == CodecError::none);
+  assert(control_roll.control_roll_reference_unwrapped_raw == 760);
+  assert(control_roll.roll_deviation_unwrapped_raw == 1440);
+  const uint32_t nominal_control_roll_signature = controlRollStatusSignature(
+      control_roll.control_roll_reference_unwrapped_raw,
+      control_roll.roll_deviation_unwrapped_raw, control_roll.flags);
+  const uint8_t flags_without_capture = static_cast<uint8_t>(
+      control_roll.flags &
+      ~ControlRollTelemetryV2::reference_captured_since_previous_frame);
+  assert(nominal_control_roll_signature ==
+         controlRollStatusSignature(
+             control_roll.control_roll_reference_unwrapped_raw,
+             control_roll.roll_deviation_unwrapped_raw,
+             flags_without_capture));
+  const auto out_of_range_control_roll =
+      CanFrame{static_cast<uint16_t>(CanId::control_roll_telemetry_v2), 8,
+               {0xF9, 0x02, 0x0A, 0x80, 0x0A, 0x80, 0x19, 0x2B}};
+  assert(decode(out_of_range_control_roll, control_roll) == CodecError::none);
+  assert(control_roll.control_roll_reference_unwrapped_raw == 0x800A);
+  assert(control_roll.roll_deviation_unwrapped_raw == 0x800A);
+  assert(nominal_control_roll_signature !=
+         controlRollStatusSignature(
+             control_roll.control_roll_reference_unwrapped_raw,
+             control_roll.roll_deviation_unwrapped_raw, control_roll.flags));
+  auto invalid_control_roll = control_roll_frame;
+  invalid_control_roll.data[1] = 1;
+  assert(decode(invalid_control_roll, control_roll) ==
+         CodecError::invalid_enum);
+  invalid_control_roll = control_roll_frame;
+  invalid_control_roll.data[6] = 0x80;
+  assert(decode(invalid_control_roll, control_roll) ==
+         CodecError::reserved_bits);
+  invalid_control_roll = control_roll_frame;
+  invalid_control_roll.data[6] |=
+      ControlRollTelemetryV2::reference_out_of_range;
+  assert(decode(invalid_control_roll, control_roll) ==
+         CodecError::invalid_enum);
+  invalid_control_roll = out_of_range_control_roll;
+  invalid_control_roll.data[6] &=
+      static_cast<uint8_t>(~ControlRollTelemetryV2::deviation_out_of_range);
+  assert(decode(invalid_control_roll, control_roll) ==
+         CodecError::invalid_enum);
 }
 
 void testQuantization(
@@ -168,6 +223,14 @@ void testQuantization(
                encodeRoll(-16376.0, RollError::unknown));
   expectScalar(golden, "SCALAR_ROLL_RESET_INVALIDATED",
                encodeRoll(NAN, RollError::reset_invalidated));
+  expectScalar(golden, "SCALAR_ROLL_POS_380",
+               encodeRoll(380.0, RollError::unknown));
+  expectScalar(golden, "SCALAR_ROLL_POS_720",
+               encodeRoll(720.0, RollError::unknown));
+  expectScalar(golden, "SCALAR_ROLL_NEG_720",
+               encodeRoll(-720.0, RollError::unknown));
+  expectScalar(golden, "SCALAR_ROLL_OUT_OF_RANGE",
+               encodeRoll(20'000.0, RollError::unknown));
   assert(decodeRoll(0x8000).semantic == Semantic::error);
   assert(decodeRoll(0x8010).semantic == Semantic::numeric);
   assert(encodeRoll(-16376.5, RollError::unknown) ==
@@ -252,7 +315,19 @@ void testQuantization(
 }
 
 mission::ControlAvailability readyControl() {
-  return {true, true, true, true, true, true, true, true};
+  mission::ControlAvailability result{};
+  result.fin_control_available = true;
+  result.fin_zero_hold_valid = true;
+  result.attitude_valid = true;
+  result.airspeed_above_60 = true;
+  result.lps_available = true;
+  result.ssc_available = true;
+  result.gyro_bias_valid = true;
+  result.ssc_zero_valid = true;
+  result.roll_estimate_liftoff_relative_unwrapped_rad = 12.75;
+  result.roll_estimator_timestamp_us = 8'999'900;
+  result.attitude_fresh = true;
+  return result;
 }
 
 void testMissionStateMachine() {
@@ -288,15 +363,41 @@ void testMissionStateMachine() {
   control.tick({2'000'000, true, false, readyControl()});
   control.tick({8'999'999, false, false, readyControl()});
   assert(control.snapshot().state == MissionState::engine_burn);
-  control.tick({9'000'000, false, false, readyControl()});
+  auto entry_tick = mission::MissionTickInput{
+      9'000'000, false, false, readyControl(), 9'000};
+  control.tick(entry_tick);
   assert(control.snapshot().state == MissionState::control);
+  assert(control.snapshot().control_roll_reference_valid);
+  assert(control.snapshot().control_roll_reference_unwrapped_rad == 12.75);
+  assert(control.snapshot().control_roll_reference_estimator_timestamp_us ==
+         8'999'900);
+  assert(control.snapshot().control_roll_reference_capture_tick == 9'000);
+  assert(entry_tick.control.roll_estimate_liftoff_relative_unwrapped_rad -
+             control.snapshot().control_roll_reference_unwrapped_rad ==
+         0.0);
+  const uint8_t capture_sequence =
+      control.snapshot().control_roll_reference_capture_event_sequence;
+  auto changed_roll = readyControl();
+  changed_roll.roll_estimate_liftoff_relative_unwrapped_rad +=
+      2.0 * 3.14159265358979323846;
+  changed_roll.roll_estimator_timestamp_us = 9'000'900;
+  control.tick({9'001'000, false, false, changed_roll, 9'001});
+  assert(control.snapshot().state == MissionState::control);
+  assert(control.snapshot().control_roll_reference_unwrapped_rad == 12.75);
+  assert(control.snapshot().control_roll_reference_capture_event_sequence ==
+         capture_sequence);
   auto unavailable = readyControl();
   unavailable.ssc_available = false;
-  control.tick({9'001'000, false, false, unavailable});
+  control.tick({9'002'000, false, false, unavailable});
   assert(control.snapshot().state == MissionState::engine_burn);
   assert(control.snapshot().control_reentry_inhibited);
   control.tick({10'000'000, false, false, readyControl()});
   assert(control.snapshot().state == MissionState::engine_burn);
+  assert(control.snapshot().control_roll_reference_capture_event_sequence ==
+         capture_sequence);
+  assert(control.liftoffDetectionEmergencyStop() ==
+         TransitionResult::completed);
+  assert(!control.snapshot().control_roll_reference_valid);
 
   MissionStateMachine gate_failure;
   assert(gate_failure.startSequence(0, ready) == TransitionResult::completed);
@@ -305,6 +406,39 @@ void testMissionStateMachine() {
   assert(gate_failure.snapshot().control_reentry_inhibited);
   gate_failure.tick({9'100'000, false, false, readyControl()});
   assert(gate_failure.snapshot().state == MissionState::engine_burn);
+  assert(!gate_failure.snapshot().control_roll_reference_valid);
+
+  MissionStateMachine stale_reference;
+  assert(stale_reference.startSequence(0, ready) ==
+         TransitionResult::completed);
+  stale_reference.tick({2'000'000, true, false, readyControl()});
+  auto stale_control = readyControl();
+  stale_control.roll_estimator_timestamp_us = 8'996'000;
+  stale_reference.tick({9'000'000, false, false, stale_control, 9'000});
+  assert(stale_reference.snapshot().state == MissionState::engine_burn);
+  assert(stale_reference.snapshot().control_reentry_inhibited);
+  assert(!stale_reference.snapshot().control_roll_reference_valid);
+
+  MissionStateMachine future_reference;
+  assert(future_reference.startSequence(0, ready) ==
+         TransitionResult::completed);
+  future_reference.tick({2'000'000, true, false, readyControl()});
+  auto future_control = readyControl();
+  future_control.roll_estimator_timestamp_us = 9'000'001;
+  future_reference.tick({9'000'000, false, false, future_control, 9'000});
+  assert(future_reference.snapshot().state == MissionState::engine_burn);
+  assert(!future_reference.snapshot().control_roll_reference_valid);
+
+  MissionStateMachine disabled_after_capture;
+  assert(disabled_after_capture.startSequence(0, ready) ==
+         TransitionResult::completed);
+  disabled_after_capture.tick({2'000'000, true, false, readyControl()});
+  disabled_after_capture.tick(
+      {9'000'000, false, false, readyControl(), 9'000});
+  assert(disabled_after_capture.snapshot().control_roll_reference_valid);
+  assert(disabled_after_capture.disableFinControl() ==
+         TransitionResult::completed);
+  assert(!disabled_after_capture.snapshot().control_roll_reference_valid);
 
   MissionStateMachine disabled;
   assert(disabled.startSequence(0, ready) == TransitionResult::completed);
@@ -345,6 +479,7 @@ void testMissionStateMachine() {
               false}) == TransitionResult::completed);
   assert(reset.snapshot().state == MissionState::engine_burn);
   assert(reset.snapshot().reset_invalidated);
+  assert(!reset.snapshot().control_roll_reference_valid);
   assert(reset.snapshot().fin == FinDirective::brake);
   reset.tick({100'000'000, false, false, readyControl()});
   assert(reset.snapshot().state == MissionState::descent);
@@ -566,7 +701,9 @@ void testAttitudeContinuity() {
   assert(estimator.state().valid);
   assert(estimator.update({4'000, 3.0, 4, 1, true, false, false, false}));
   assert(estimator.state().interpolated_sample_count == 1);
-  assert(std::abs(estimator.state().roll_rad - 0.005) < 1.0e-12);
+  assert(std::abs(
+             estimator.state().roll_estimate_liftoff_relative_unwrapped_rad -
+             0.005) < 1.0e-12);
   assert(!estimator.update(
       {5'000, 3.0, 5, 0, true, false, false, false}));
   assert(estimator.state().invalid_reason ==
@@ -583,59 +720,105 @@ void testAttitudeContinuity() {
   assert(!loss.update({4'000, 1.0, 4, 2, true, false, false, false}));
   assert(loss.state().invalid_reason ==
          AttitudeInvalidReason::excess_data_loss);
+
+  constexpr double kPi = 3.14159265358979323846;
+  for (const double direction : {1.0, -1.0}) {
+    GyroHistoryRing multi_turn_history;
+    const double rate = direction * 2.0 * kPi;
+    multi_turn_history.push(
+        {1'000, rate, 6, 0, true, false, false, false});
+    AttitudeEstimator multi_turn;
+    assert(multi_turn.beginFlight(multi_turn_history, 1'000, 0.0));
+    for (uint64_t index = 1; index <= 2'000; ++index) {
+      assert(multi_turn.update({1'000 + index * 1'000, rate, 6, 0, true,
+                                false, false, false}));
+      if (index == 1'000)
+        assert(std::abs(multi_turn.state()
+                            .roll_estimate_liftoff_relative_unwrapped_rad -
+                        direction * 2.0 * kPi) < 1.0e-9);
+    }
+    assert(std::abs(multi_turn.state()
+                        .roll_estimate_liftoff_relative_unwrapped_rad -
+                    direction * 4.0 * kPi) < 1.0e-9);
+  }
 }
 
 void testControlPipeline() {
   using namespace control;
   constexpr double kPi = 3.14159265358979323846;
 
-  ControlRollReference reference;
-  double deviation_rad = 123.0;
-  assert(!reference.validFor(1));
-  assert(!reference.capture(0, 1.0, 100, 100));
-  assert(!reference.capture(1, NAN, 100, 100));
-  assert(!reference.capture(1, 1.0, 101, 100));
-  const double captured_roll = 6.0 * kPi + 0.25;
-  assert(reference.capture(7, captured_roll, 100, 120));
-  assert(reference.validFor(7));
-  assert(reference.flightEpoch() == 7);
-  assert(reference.referenceRad() == captured_roll);
-  assert(reference.sampleTimestampUs() == 100);
-  assert(reference.captureTickUs() == 120);
-  assert(reference.deviation(7, captured_roll, deviation_rad));
-  assert(std::abs(deviation_rad) < 1.0e-12);
-  assert(!reference.capture(7, captured_roll + 1.0, 101, 101));
-  assert(reference.deviation(7, captured_roll + 0.5, deviation_rad));
-  assert(std::abs(deviation_rad - 0.5) < 1.0e-12);
-  assert(!reference.deviation(8, captured_roll, deviation_rad));
-  reference.invalidate();
-  assert(!reference.validFor(7));
-  assert(reference.flightEpoch() == 0);
-  assert(reference.sampleTimestampUs() == 0);
-  assert(reference.captureTickUs() == 0);
-  assert(reference.capture(8, captured_roll + 2.0 * kPi, 200, 200));
-  assert(reference.deviation(8, captured_roll + 2.0 * kPi + 0.5,
-                             deviation_rad));
-  assert(std::abs(deviation_rad - 0.5) < 1.0e-12);
-
   RollGainSchedule schedule{};
   schedule.configured = true;
   for (std::size_t index = 0; index < schedule.points.size(); ++index) {
     schedule.points[index].airspeed_mps = 60.0 + index * 20.0;
     schedule.points[index].gain[0] = 1.0 + index * 2.0;
+    schedule.points[index].gain[2] = 3.0;
   }
   RollController roll{schedule};
-  const double degrees370 = 370.0 * 3.14159265358979323846 / 180.0;
-  assert(std::abs(RollController::wrapRollError(degrees370) +
-                  10.0 * 3.14159265358979323846 / 180.0) < 1.0e-12);
-  const auto request = roll.compute({0.1, 0, 0, 0}, 70.0, 1.0);
+  const auto request =
+      roll.compute({0.1, 0, 0, 0}, 70.0, RollControlAuthority::gentle);
   assert(request.valid && !request.saturated);
   assert(std::abs(request.output_torque_nm + 0.2) < 1.0e-12);
-  const auto multi_turn = roll.compute({degrees370, 0, 0, 0}, 70.0, 20.0);
-  assert(multi_turn.valid && !multi_turn.saturated);
-  assert(std::abs(multi_turn.output_torque_nm + 2.0 * degrees370) <
+  assert(roll.compute({0, 0, 0, 0}, 60.0,
+                      RollControlAuthority::gentle).valid);
+  const double radians380 = 380.0 * kPi / 180.0;
+  const double reference720 = 720.0 * kPi / 180.0;
+  const double current1100 = 1100.0 * kPi / 180.0;
+  assert(std::abs((current1100 - reference720) - radians380) < 1.0e-12);
+  const double positive_pi_crossing =
+      181.0 * kPi / 180.0 - 179.0 * kPi / 180.0;
+  const double negative_pi_crossing =
+      -181.0 * kPi / 180.0 - (-179.0 * kPi / 180.0);
+  assert(std::abs(positive_pi_crossing - 2.0 * kPi / 180.0) < 1.0e-12);
+  assert(std::abs(negative_pi_crossing + 2.0 * kPi / 180.0) < 1.0e-12);
+  assert(std::abs(((current1100 + 4.0 * kPi) -
+                   (reference720 + 4.0 * kPi)) -
+                  radians380) < 1.0e-12);
+  assert(std::abs(((current1100 + 2.0 * kPi) - reference720) -
+                  (radians380 + 2.0 * kPi)) <
          1.0e-12);
-  assert(!roll.compute({0, 0, 0, 0}, 60.0, 1.0).valid);
+  const auto positive_turn = roll.compute(
+      {radians380, 0, 0, 0}, 60.0, RollControlAuthority::gentle);
+  const auto negative_turn = roll.compute(
+      {-radians380, 0, 0, 0}, 60.0, RollControlAuthority::gentle);
+  assert(positive_turn.output_torque_nm == -1.21208);
+  assert(negative_turn.output_torque_nm == 1.21208);
+  assert(roll.compute({radians380 + 2.0 * kPi, 0, 0, 0},
+                      60.0, RollControlAuthority::high_authority)
+             .output_torque_nm == -3.0);
+  const auto entry_rate_feedback = roll.compute(
+      {0.0, 0.0, 0.2, 0.0}, 60.0, RollControlAuthority::gentle);
+  assert(entry_rate_feedback.valid);
+  assert(std::abs(entry_rate_feedback.output_torque_nm + 0.6) < 1.0e-12);
+
+  const board::ControlAuthorityLimits authority{};
+  assert(authority.hold_position_limit_Nm == 0.30);
+  assert(authority.zero_hold_requested_torque_limit_Nm == 0.80);
+  assert(authority.roll_control_gentle_limit_Nm == 1.21208);
+  assert(authority.roll_control_high_authority_limit_Nm == 3.0);
+  assert(authority.valid());
+  assert(board::kControlAuthorityLimits.roll_control_gentle_limit_Nm ==
+         1.21208);
+  assert(board::kControlAuthorityLimits
+             .zero_hold_requested_torque_limit_Nm == 0.80);
+  const board::EncoderPipelineConfig encoder_2k{2'000, 1'000};
+  const board::EncoderPipelineConfig encoder_5k{5'000, 1'000};
+  const board::EncoderPipelineConfig encoder_invalid{2'500, 1'000};
+  assert(encoder_2k.samplesPerBlock() == 2);
+  assert(encoder_5k.samplesPerBlock() == 5);
+  assert(!encoder_invalid.valid());
+  const board::PitotCoefficientDiagnosticsConfig pitot{};
+  assert(pitot.pitot_coefficient_assumed == 0.92);
+  assert(pitot.pitot_coefficient_true_min == 0.60);
+  assert(pitot.pitot_coefficient_true_max == 1.20);
+  assert(pitot.valid());
+  assert(board::kPitotCoefficientDiagnostics.pitot_coefficient_assumed ==
+         0.92);
+  assert(board::kPitotCoefficientDiagnostics.pitot_coefficient_true_min ==
+         0.60);
+  assert(board::kPitotCoefficientDiagnostics.pitot_coefficient_true_max ==
+         1.20);
+  assert(board::kEncoderPipeline.valid());
 
   ZeroHoldController zero;
   const auto zero_request = zero.compute(1.0, 0.0);

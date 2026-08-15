@@ -25,6 +25,7 @@ enum class CanId : uint16_t {
   attitude_tilt_telemetry = 0x107,
   lps_telemetry = 0x108,
   airspeed_telemetry = 0x109,
+  control_roll_telemetry_v2 = 0x10A,
 };
 
 enum class MissionState : uint8_t {
@@ -256,6 +257,25 @@ struct AirspeedTelemetry {
   uint8_t airspeed_raw{};
 };
 
+struct ControlRollTelemetryV2 {
+  static constexpr uint8_t schema_version = 2;
+  static constexpr uint8_t reference_valid = 1U << 0U;
+  static constexpr uint8_t reference_captured_since_previous_frame = 1U << 1U;
+  static constexpr uint8_t control_active = 1U << 2U;
+  static constexpr uint8_t reference_out_of_range = 1U << 3U;
+  static constexpr uint8_t deviation_out_of_range = 1U << 4U;
+
+  uint8_t sequence{};
+  uint16_t control_roll_reference_unwrapped_raw{};
+  uint16_t roll_deviation_unwrapped_raw{};
+  uint8_t flags{};
+  uint8_t reference_capture_event_sequence{};
+};
+
+[[nodiscard]] uint32_t controlRollStatusSignature(uint16_t reference_raw,
+                                                  uint16_t deviation_raw,
+                                                  uint8_t flags);
+
 [[nodiscard]] CanFrame encode(CanId id, const EmergencyStop &message);
 [[nodiscard]] CanFrame encode(const RecoveryControl &message);
 [[nodiscard]] CanFrame encode(const GenericCommandRequest &message);
@@ -273,6 +293,7 @@ struct AirspeedTelemetry {
 [[nodiscard]] CanFrame encode(const AttitudeTiltTelemetry &message);
 [[nodiscard]] CanFrame encode(const LpsTelemetry &message);
 [[nodiscard]] CanFrame encode(const AirspeedTelemetry &message);
+[[nodiscard]] CanFrame encode(const ControlRollTelemetryV2 &message);
 
 [[nodiscard]] CodecError decode(const CanFrame &frame, CanId id,
                                 EmergencyStop &message);
@@ -303,6 +324,8 @@ struct AirspeedTelemetry {
 [[nodiscard]] CodecError decode(const CanFrame &frame, LpsTelemetry &message);
 [[nodiscard]] CodecError decode(const CanFrame &frame,
                                 AirspeedTelemetry &message);
+[[nodiscard]] CodecError decode(const CanFrame &frame,
+                                ControlRollTelemetryV2 &message);
 
 [[nodiscard]] uint16_t canPeriodMilliseconds(CanId id);
 
@@ -311,7 +334,7 @@ public:
   [[nodiscard]] uint8_t next(CanId id);
 
 private:
-  std::array<uint8_t, 10> counters_{};
+  std::array<uint8_t, 11> counters_{};
 };
 
 } // 名前空間 protocol

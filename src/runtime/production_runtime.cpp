@@ -73,6 +73,17 @@ struct RuntimeStatus {
       protocol::quantization::FinRateError::estimator_not_ready)};
   uint16_t requested_torque_raw{static_cast<uint16_t>(
       protocol::quantization::TorqueError::unavailable)};
+  uint16_t control_roll_reference_unwrapped_raw{
+      static_cast<uint16_t>(protocol::quantization::RollError::unavailable)};
+  uint16_t roll_deviation_unwrapped_raw{
+      static_cast<uint16_t>(protocol::quantization::RollError::unavailable)};
+  uint8_t control_roll_flags{};
+  uint8_t control_roll_reference_capture_event_sequence{};
+  double roll_estimate_liftoff_relative_unwrapped_rad{};
+  double control_roll_reference_unwrapped_rad{};
+  double roll_deviation_unwrapped_rad{};
+  uint64_t control_roll_reference_capture_tick{};
+  uint64_t control_roll_reference_estimator_timestamp_us{};
 };
 
 struct AirDataSnapshot {
@@ -749,7 +760,12 @@ void missionRealtimeTask(void *) {
   sensors::AttitudeEstimator attitude;
   sensors::AirspeedGate airspeed_gate;
   control::QuadraticN3FinVelocityEstimator fin_velocity;
-  control::ZeroHoldController zero_hold_controller;
+  control::ZeroHoldController zero_hold_controller{
+      control::ZeroHoldConfig{
+          2.32, 0.296,
+          board::kControlAuthorityLimits
+              .zero_hold_requested_torque_limit_Nm,
+          0.017453292519943295, 0.08726646259971647, 100}};
   control::RollController roll_controller{flight_config::kRollGainSchedule};
   control::TorqueMapper torque_mapper{board::kFlightMotorA,
                                       board::kFinSoftwareLimits};
@@ -783,7 +799,7 @@ void missionRealtimeTask(void *) {
   double fin_angle_rad = 0.0;
   double fin_rate_rad_s = 0.0;
   bool fin_rate_valid = false;
-  control::ControlRollReference control_reference;
+  uint64_t control_tick = 0;
   std::printf("MissionRealtimeTask spi begin start\n");
   const esp_err_t spi_result = spi.begin();
   std::printf("MissionRealtimeTask spi begin result=%s\n",
@@ -992,7 +1008,6 @@ void missionRealtimeTask(void *) {
       airspeed_gate.reset();
       zero_hold_controller.resetValidity();
       fin_zero_hold_valid.store(false, std::memory_order_release);
-      control_reference.invalidate();
       liftoff_detected = false;
       imu_liftoff_latched = false;
       lps_liftoff_latched = false;
@@ -1164,6 +1179,8 @@ void missionRealtimeTask(void *) {
 
     mission::MissionTickInput tick{};
     tick.monotonic_us = static_cast<uint64_t>(esp_timer_get_time());
+    ++control_tick;
+    tick.control_tick = control_tick;
     tick.liftoff_detected = liftoff_detected;
     const bool lps_fresh =
         latest_air_data.lps_monotonic_us != 0 &&
@@ -1186,6 +1203,13 @@ void missionRealtimeTask(void *) {
     tick.control.fin_zero_hold_valid =
         fin_zero_hold_valid.load(std::memory_order_acquire);
     tick.control.attitude_valid = attitude.state().valid;
+    tick.control.roll_estimate_liftoff_relative_unwrapped_rad =
+        attitude.state().roll_estimate_liftoff_relative_unwrapped_rad;
+    tick.control.roll_estimator_timestamp_us = attitude.state().timestamp_us;
+    tick.control.attitude_fresh =
+        attitude.state().valid && attitude.state().timestamp_us != 0 &&
+        tick.monotonic_us >= attitude.state().timestamp_us &&
+        tick.monotonic_us - attitude.state().timestamp_us <= 3'000;
     tick.control.lps_available =
         lps_ready.load(std::memory_order_acquire) && lps_fresh &&
         latest_air_data.lps_valid;
@@ -1241,7 +1265,6 @@ void missionRealtimeTask(void *) {
     if (mission_snapshot.reset_invalidated) {
       attitude.invalidateForReset();
       attitude_epoch = 0;
-      control_reference.invalidate();
     }
 
     control::TorqueRequest torque_request{};
@@ -1253,20 +1276,6 @@ void missionRealtimeTask(void *) {
         recovery_requested.load(std::memory_order_acquire) ||
         actuator_output_inhibited.load(std::memory_order_acquire) ||
         mission_snapshot.reset_invalidated;
-
-    if (previous_state == protocol::MissionState::control &&
-        mission_snapshot.state != protocol::MissionState::control)
-      control_reference.invalidate();
-    if (mission_snapshot.state == protocol::MissionState::control &&
-        !control_reference.validFor(mission_snapshot.flight_epoch)) {
-      const auto &attitude_state = attitude.state();
-      if (previous_state != protocol::MissionState::control &&
-          attitude_state.valid &&
-          attitude_epoch == mission_snapshot.flight_epoch)
-        (void)control_reference.capture(
-            mission_snapshot.flight_epoch, attitude_state.roll_rad,
-            attitude_state.timestamp_us, tick.monotonic_us);
-    }
 
     auto applyTorque = [&](const control::TorqueRequest &request) {
       torque_request = request;
@@ -1320,12 +1329,13 @@ void missionRealtimeTask(void *) {
       }
     } else if (mission_snapshot.fin == mission::FinDirective::roll_control) {
       const auto &attitude_state = attitude.state();
-      double roll_deviation_rad = 0.0;
-      const bool reference_valid = control_reference.deviation(
-          mission_snapshot.flight_epoch, attitude_state.roll_rad,
-          roll_deviation_rad);
+      const double roll_deviation_rad =
+          attitude_state.roll_estimate_liftoff_relative_unwrapped_rad -
+          mission_snapshot.control_roll_reference_unwrapped_rad;
       const bool inputs_valid =
-          fin_sample_valid && reference_valid && attitude_state.valid &&
+          fin_sample_valid && mission_snapshot.control_roll_reference_valid &&
+          attitude_state.valid && tick.control.attitude_fresh &&
+          std::isfinite(roll_deviation_rad) &&
           attitude_epoch == mission_snapshot.flight_epoch &&
           airspeed_available;
       if (inputs_valid) {
@@ -1334,7 +1344,8 @@ void missionRealtimeTask(void *) {
             attitude_state.roll_rate_rad_s, fin_rate_rad_s};
         const auto request = roll_controller.compute(
             state, latest_air_data.airspeed_mps,
-            board::kFlightMotorA.max_output_torque_nm);
+            control::RollControlAuthority::gentle,
+            board::kControlAuthorityLimits);
         motor_output_result = applyTorque(request);
         motor_output_braking = !request.valid || !motor_command.valid;
       } else {
@@ -1363,7 +1374,8 @@ void missionRealtimeTask(void *) {
     constexpr double kRadiansToDegrees = 57.29577951308232;
     if (attitude.state().valid) {
       status.roll_raw = protocol::quantization::encodeRoll(
-          attitude.state().roll_rad * kRadiansToDegrees,
+          attitude.state().roll_estimate_liftoff_relative_unwrapped_rad *
+              kRadiansToDegrees,
           protocol::quantization::RollError::unknown);
       status.roll_rate_raw = protocol::quantization::encodeRollRate(
           attitude.state().roll_rate_rad_s * kRadiansToDegrees,
@@ -1385,6 +1397,54 @@ void missionRealtimeTask(void *) {
                   encoder_alive
                       ? protocol::quantization::FinAngleError::zero_not_configured
                       : protocol::quantization::FinAngleError::not_initialized);
+    status.control_roll_reference_capture_event_sequence =
+        mission_snapshot.control_roll_reference_capture_event_sequence;
+    status.control_roll_reference_capture_tick =
+        mission_snapshot.control_roll_reference_capture_tick;
+    status.control_roll_reference_estimator_timestamp_us =
+        mission_snapshot.control_roll_reference_estimator_timestamp_us;
+    status.roll_estimate_liftoff_relative_unwrapped_rad =
+        attitude.state().roll_estimate_liftoff_relative_unwrapped_rad;
+    status.control_roll_reference_unwrapped_rad =
+        mission_snapshot.control_roll_reference_unwrapped_rad;
+    status.control_roll_flags =
+        mission_snapshot.control_roll_reference_valid
+            ? protocol::ControlRollTelemetryV2::reference_valid
+            : 0;
+    if (mission_snapshot.state == protocol::MissionState::control)
+      status.control_roll_flags |=
+          protocol::ControlRollTelemetryV2::control_active;
+    if (mission_snapshot.control_roll_reference_valid) {
+      status.control_roll_reference_unwrapped_raw =
+          protocol::quantization::encodeRoll(
+              mission_snapshot.control_roll_reference_unwrapped_rad *
+                  kRadiansToDegrees,
+              protocol::quantization::RollError::unknown);
+      if (attitude.state().valid) {
+        status.roll_deviation_unwrapped_rad =
+            attitude.state().roll_estimate_liftoff_relative_unwrapped_rad -
+            mission_snapshot.control_roll_reference_unwrapped_rad;
+        status.roll_deviation_unwrapped_raw =
+            protocol::quantization::encodeRoll(
+                status.roll_deviation_unwrapped_rad * kRadiansToDegrees,
+                protocol::quantization::RollError::unknown);
+      }
+    } else {
+      const auto error = mission_snapshot.reset_invalidated
+                             ? protocol::quantization::RollError::reset_invalidated
+                             : protocol::quantization::RollError::unavailable;
+      status.control_roll_reference_unwrapped_raw =
+          static_cast<uint16_t>(error);
+      status.roll_deviation_unwrapped_raw = static_cast<uint16_t>(error);
+    }
+    if (status.control_roll_reference_unwrapped_raw ==
+        static_cast<uint16_t>(protocol::quantization::RollError::out_of_range))
+      status.control_roll_flags |=
+          protocol::ControlRollTelemetryV2::reference_out_of_range;
+    if (status.roll_deviation_unwrapped_raw ==
+        static_cast<uint16_t>(protocol::quantization::RollError::out_of_range))
+      status.control_roll_flags |=
+          protocol::ControlRollTelemetryV2::deviation_out_of_range;
     status.fin_rate_raw =
         fin_sample_valid
             ? protocol::quantization::encodeFinRate(
@@ -1653,7 +1713,7 @@ void airDataTask(void *) {
             const auto airspeed = sensors::computeSaintVenantAirspeed(
                 snapshot.static_pressure_pa, conditioned.pressure_pa,
                 data.temperature_celsius,
-                flight_config::kAirData.pitot_coefficient);
+                flight_config::kAirData.pitot_coefficient_assumed);
             if (airspeed.valid) {
               snapshot.airspeed_mps = airspeed.airspeed_mps;
               snapshot.airspeed_raw = protocol::quantization::encodeAirspeed(
@@ -1730,6 +1790,7 @@ void canTask(void *) {
   protocol::TelemetrySequences sequences;
   TickType_t last_status = xTaskGetTickCount();
   TickType_t last_fast = xTaskGetTickCount();
+  TickType_t last_control_roll = xTaskGetTickCount();
   TickType_t last_lps = xTaskGetTickCount();
   TickType_t last_time_request = xTaskGetTickCount();
   RuntimeStatus latest{};
@@ -1743,6 +1804,11 @@ void canTask(void *) {
   protocol::CommandResult pending_command_result{};
   bool command_result_pending = false;
   protocol::MissionState last_status_state = protocol::MissionState::unknown;
+  uint8_t last_control_roll_capture_event_sequence = 0;
+  uint32_t last_control_roll_status_signature =
+      protocol::controlRollStatusSignature(
+          latest.control_roll_reference_unwrapped_raw,
+          latest.roll_deviation_unwrapped_raw, latest.control_roll_flags);
   for (;;) {
     if (begin_result == ESP_OK) {
       CANCREATE::Frame frame{};
@@ -1940,6 +2006,34 @@ void canTask(void *) {
               sequences.next(protocol::CanId::lps_telemetry),
               latest.lps_pressure_raw, latest.lps_temperature_raw};
           (void)writeFrame(can, protocol::encode(lps));
+        }
+      }
+      const bool new_reference_capture =
+          latest.control_roll_reference_capture_event_sequence !=
+          last_control_roll_capture_event_sequence;
+      const uint32_t control_roll_status_signature =
+          protocol::controlRollStatusSignature(
+              latest.control_roll_reference_unwrapped_raw,
+              latest.roll_deviation_unwrapped_raw, latest.control_roll_flags);
+      const bool control_roll_status_changed =
+          control_roll_status_signature != last_control_roll_status_signature;
+      if (!recovery_only &&
+          (new_reference_capture || control_roll_status_changed ||
+           now - last_control_roll >= pdMS_TO_TICKS(100))) {
+        last_control_roll = now;
+        uint8_t flags = latest.control_roll_flags;
+        if (new_reference_capture)
+          flags |= protocol::ControlRollTelemetryV2::
+              reference_captured_since_previous_frame;
+        const protocol::ControlRollTelemetryV2 telemetry{
+            sequences.next(protocol::CanId::control_roll_telemetry_v2),
+            latest.control_roll_reference_unwrapped_raw,
+            latest.roll_deviation_unwrapped_raw, flags,
+            latest.control_roll_reference_capture_event_sequence};
+        if (writeFrame(can, protocol::encode(telemetry)) == ESP_OK) {
+          last_control_roll_capture_event_sequence =
+              latest.control_roll_reference_capture_event_sequence;
+          last_control_roll_status_signature = control_roll_status_signature;
         }
       }
       if (latest.state != last_status_state ||

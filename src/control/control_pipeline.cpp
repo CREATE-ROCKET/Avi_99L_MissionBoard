@@ -7,8 +7,7 @@ namespace control {
 namespace {
 
 constexpr double kPi = 3.14159265358979323846;
-constexpr double kTwoPi = 2.0 * kPi;
-constexpr double kRadiansPerRpm = kTwoPi / 60.0;
+constexpr double kRadiansPerRpm = 2.0 * kPi / 60.0;
 constexpr double kStopperAngleRad = 15.0 * kPi / 180.0;
 constexpr double kStaticStructuralTorqueNm = 7.10328;
 constexpr double kTotalGearRatio = 176.175;
@@ -21,51 +20,24 @@ double clampMagnitude(double value, double limit, bool &saturated) {
 }
 
 bool finiteState(const RollState &state) {
-  return std::isfinite(state.roll_rad) && std::isfinite(state.fin_rad) &&
+  return std::isfinite(state.roll_deviation_unwrapped_rad) &&
+         std::isfinite(state.fin_rad) &&
          std::isfinite(state.roll_rate_rad_s) &&
          std::isfinite(state.fin_rate_rad_s);
 }
 
 } // 無名名前空間
 
-bool ControlRollReference::capture(uint32_t flight_epoch, double roll_rad,
-                                   uint64_t sample_timestamp_us,
-                                   uint64_t control_tick_us) {
-  // Control中の再取得は目標角そのものを動かすため、明示invalidateまで一度だけ許可する。
-  if (valid_ || flight_epoch == 0 || !std::isfinite(roll_rad) ||
-      sample_timestamp_us > control_tick_us)
-    return false;
-  flight_epoch_ = flight_epoch;
-  reference_rad_ = roll_rad;
-  sample_timestamp_us_ = sample_timestamp_us;
-  capture_tick_us_ = control_tick_us;
-  valid_ = true;
-  return true;
-}
-
-void ControlRollReference::invalidate() { *this = {}; }
-
-bool ControlRollReference::validFor(uint32_t flight_epoch) const {
-  return valid_ && flight_epoch != 0 && flight_epoch_ == flight_epoch;
-}
-
-bool ControlRollReference::deviation(uint32_t flight_epoch,
-                                     double current_roll_rad,
-                                     double &deviation_rad) const {
-  if (!validFor(flight_epoch) || !std::isfinite(current_roll_rad))
-    return false;
-  const double candidate = current_roll_rad - reference_rad_;
-  if (!std::isfinite(candidate))
-    return false;
-  deviation_rad = candidate;
-  return true;
-}
-
 TorqueRequest RollController::compute(const RollState &state,
                                       double airspeed_mps,
-                                      double output_limit_nm) const {
+                                      RollControlAuthority authority,
+                                      const board::ControlAuthorityLimits &limits) const {
+  const double output_limit_nm =
+      authority == RollControlAuthority::gentle
+          ? limits.roll_control_gentle_limit_Nm
+          : limits.roll_control_high_authority_limit_Nm;
   if (!schedule_.configured || !finiteState(state) ||
-      !std::isfinite(airspeed_mps) || airspeed_mps <= 60.0 ||
+      !std::isfinite(airspeed_mps) ||
       !std::isfinite(output_limit_nm) || output_limit_nm <= 0.0)
     return {};
   constexpr std::array<double, 7> kRequiredSpeeds{60.0, 80.0, 100.0, 120.0,
@@ -74,7 +46,7 @@ TorqueRequest RollController::compute(const RollState &state,
     if (schedule_.points[index].airspeed_mps != kRequiredSpeeds[index])
       return {};
   }
-  const double limited_speed = std::min(180.0, airspeed_mps);
+  const double limited_speed = std::clamp(airspeed_mps, 60.0, 180.0);
   std::size_t high = 1;
   while (high < schedule_.points.size() &&
          schedule_.points[high].airspeed_mps < limited_speed)
@@ -94,7 +66,7 @@ TorqueRequest RollController::compute(const RollState &state,
   // Control遷移時に取得したunwrapped基準角との差を呼出側から受け取る。
   // ここで最短角へwrapすると、複数回転後に逆方向の目標へ化ける。
   const std::array<double, 4> values{
-      state.roll_rad, state.fin_rad, state.roll_rate_rad_s,
+      state.roll_deviation_unwrapped_rad, state.fin_rad, state.roll_rate_rad_s,
       state.fin_rate_rad_s};
   double torque{};
   for (std::size_t index = 0; index < values.size(); ++index) {
@@ -111,27 +83,19 @@ TorqueRequest RollController::compute(const RollState &state,
   return {torque, saturated, true};
 }
 
-double RollController::wrapRollError(double roll_rad) {
-  if (!std::isfinite(roll_rad))
-    return roll_rad;
-  // 診断・表示用に最短方向の角度差を返す。制御本体では使用しない。
-  double wrapped = std::fmod(-roll_rad + kPi, kTwoPi);
-  if (wrapped < 0.0)
-    wrapped += kTwoPi;
-  return wrapped - kPi;
-}
-
 TorqueRequest ZeroHoldController::compute(double angle_rad,
                                           double rate_rad_s) const {
   if (!std::isfinite(angle_rad) || !std::isfinite(rate_rad_s) ||
       !std::isfinite(config_.proportional_gain) ||
       !std::isfinite(config_.derivative_gain) ||
-      config_.torque_limit_nm <= 0.0)
+      config_.zero_hold_requested_torque_limit_Nm <= 0.0)
     return {};
   bool saturated = false;
   double torque = -config_.proportional_gain * angle_rad -
                   config_.derivative_gain * rate_rad_s;
-  torque = clampMagnitude(torque, config_.torque_limit_nm, saturated);
+  torque = clampMagnitude(torque,
+                          config_.zero_hold_requested_torque_limit_Nm,
+                          saturated);
   return {torque, saturated, true};
 }
 

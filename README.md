@@ -4,6 +4,8 @@ ESP32-S3-WROOM-1-N16R8を搭載した99L Mission Board firmwareです。Vault 00
 
 既定production buildは、未確定値へ`TODO(HW_TEST)`または`TODO(SIMULATION)`を残した暫定設定で`StartSequence`を受理し、ZeroHold/Roll制御からTB67H450 PWMまでの動翼経路と、STS3215の収納保持/Open/retry/電源遮断経路を実行します。これはbench/HILで一連の動作を検証するための実装であり、飛行認定済みfirmwareではありません。`StartSequence`後は実際にmotorとパラシュートサーボが動作し得ます。
 
+現在の99L source contractは[`docs/99l_source_contract.json`](docs/99l_source_contract.json)に固定しています。Control rollは離床相対の連続・unwrapped推定値からentry時に一度だけreferenceをcaptureし、full-turn差をそのまま制御・0x10A telemetryへ渡します。
+
 詳細な試験順序は[docs/bringup.md](docs/bringup.md)、実施結果は[docs/bringup_results.md](docs/bringup_results.md)を参照してください。
 
 2026-08-14にMission `/dev/ttyACM1`、ComBoard `/dev/ttyACM0`、Ground `/dev/ttyUSB0`を同時接続し、bring-upとproductionを実機確認しました。Mission productionはICM42688、AS5047D health gate/pipeline、CAN、AirData、Parachuteの各taskを起動し、panic/reset loopなしで動作しました。CommandReceive中のproduction CANは、修正後30秒で`0x100/0x109`を各3,000 frame、`0x108`を750 frame、`0x102`を301 frame、`0x103/0x107`を各300 frame、`0x012`を30 frame受信側で確認し、sequence gapとdecode errorは0でした。安全なGround commandとActuatorEmergencyのend-to-end結果も確認済みです。数値と判定は[docs/bringup_results.md](docs/bringup_results.md#br-012-3基板production-canと安全command-round-trip)に記録しています。
@@ -30,6 +32,7 @@ ICM42688のfreshnessは取得時の`host_timestamp_us`と`esp_timer_get_time()`�
 | motor極性 | 正torqueでIN1 PWM | `TODO(HW_TEST)`で回転方向を確認 |
 | motor抵抗 / torque定数 / 無負荷速度 | 3.48 Ω / 0.00855 N·m/A / 1120 rpm | `TODO(HW_TEST)`で個体同定 |
 | drivetrain効率 / motor電流 / 出力torque上限 | 0.60 / 2.0 A / 1.21208 N·m | `TODO(HW_TEST)`で効率・温度・機構負荷を確認 |
+| 用途別requested torque | HoldPosition 0.30 / ZeroHold 0.80 / Roll Gentle 1.21208 / High-authority comparator 3.0 N·m | generic limitとして共用せず、実機同定後に再評価 |
 | motor bus / PWM duty上限 | 9.0 V / 15% | `TODO(HW_TEST)`でADC実測と安全上限を確定 |
 | fin software limit | ±14° | `TODO(HW_TEST)`でstopper余裕を確認 |
 | fin zero | production起動後の最初の有効AS5047D角を0°とする | `TODO(HW_TEST)`で機械zero取得手順へ置換 |
@@ -37,12 +40,13 @@ ICM42688のfreshnessは取得時の`host_timestamp_us`と`esp_timer_get_time()`�
 | para速度 / 加速度 / torque | 180°/s / 360°/s² / 20% | `TODO(HW_TEST)`で開放時間とstall余裕を確認 |
 | para電源安定 / 初期化目安 / retry | 100 ms / 1.5 s / 20 ms | `TODO(HW_TEST)`で電源立上り分布を確認 |
 | 差圧zero / 平均窓 / 負圧許容 | 400 sample / 8 sample / 5 Pa | `TODO(SIMULATION)`と`TODO(HW_TEST)`でfilterと実測noiseを確認 |
-| Saint-Venant係数 | 0.92 | `TODO(SIMULATION)`で空力モデルと照合 |
+| Saint-Venant係数 | firmware assumed 0.92 / robustness true range 0.60〜1.20 | true/assumedを共用せず`TODO(SIMULATION/AERO_VALIDATION)`で照合 |
+| encoder pipeline | acquisition 1 kHz / consumer 1 kHzの暫定config | 1/2 kHzの最終選択はsystem ID後にconfig差替え |
 | Roll gain | 60〜180 m/sの全点で`{0.08, 2.32, 0.04, 0.296}` | `TODO(SIMULATION)`でSpica/HIL同定値へ置換 |
 
 `config_flags`はbit0=MotorProfile、bit1=fin zero取得、bit2=para設定、bit3=SSC zero取得を示します。bit7は暫定値を含みflight qualification未完了であることを常時示します。SSC zeroはCommandReceive中の400 sampleを自動取得する暫定実装です。`StartSequence`自体はbit3未取得でも受理されますが、そのflightではControl gateを通過できないため、bench/HILではbit3を確認してから開始します。再度CommandReceiveへ戻った場合は前flightのzeroを破棄して取り直します。
 
-Control遷移時には、同じtickで最新かつ未来時刻ではないunwrapped roll角を一度だけ基準角として取得します。角度偏差は最短角へwrapしません。Controlを離れた場合、flight epochが変わった場合、reset/recoveryで無効化された場合は基準角も破棄します。
+Control遷移時には、同じtickで最新かつ未来時刻ではないunwrapped roll角を一度だけ基準角として取得します。角度偏差は最短角へwrapしません。flight epoch更新、CancelSequence、DisableFinControl、LiftoffDetectionEmergencyStop、reset/recovery rollbackで基準角を無効化します。Control input喪失後の再entryは禁止し、保持した基準角を再取得しません。
 
 ## 安全上の注意
 

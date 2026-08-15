@@ -31,13 +31,19 @@ struct ParachuteConfig {
 };
 
 struct AirDataConfig {
-  double pitot_coefficient{};
+  // Firmwareが変換に使うsource nominal。plant truthと共用しない。
+  double pitot_coefficient_assumed{};
+  // 飛行中に同定せず、robustness診断の範囲として保持する。
+  double pitot_coefficient_true_min{};
+  double pitot_coefficient_true_max{};
   double negative_pressure_tolerance_pa{};
   uint16_t zero_calibration_samples{};
   uint8_t moving_average_samples{};
 
   [[nodiscard]] constexpr bool ready() const {
-    return pitot_coefficient > 0.0 &&
+    return pitot_coefficient_true_min > 0.0 &&
+           pitot_coefficient_assumed >= pitot_coefficient_true_min &&
+           pitot_coefficient_assumed <= pitot_coefficient_true_max &&
            negative_pressure_tolerance_pa >= 0.0 &&
            zero_calibration_samples > 0 && moving_average_samples > 0;
   }
@@ -47,8 +53,15 @@ struct AirDataConfig {
 inline constexpr ParachuteConfig kParachute{
     0.0F, 90.0F, 2.0F, 180.0F, 360.0F, 20.0F, 100, 1'500, 20};
 
-// TODO(SIMULATION): Saint-Venant係数、負圧許容値、zero取得時間、平均窓を確定する。
-inline constexpr AirDataConfig kAirData{0.92, 5.0, 400, 8};
+// source nominalは0.92。true 0.60..1.20は飛行中同定用ではなく、
+// TODO(SIMULATION/AERO_VALIDATION): coefficient robustness診断用の暫定範囲。
+inline constexpr AirDataConfig kAirData{
+    board::kPitotCoefficientDiagnostics.pitot_coefficient_assumed,
+    board::kPitotCoefficientDiagnostics.pitot_coefficient_true_min,
+    board::kPitotCoefficientDiagnostics.pitot_coefficient_true_max,
+    5.0,
+    400,
+    8};
 
 // TODO(HW_TEST): ADCによる実測値へ置換し、電圧低下時の制御停止条件を決定する。
 inline constexpr double kMotorBusVoltageV = 9.0;
@@ -78,6 +91,8 @@ inline constexpr mission::SequenceConfiguration kSequenceConfiguration{
          board::kFinSoftwareLimits.minimum_rad <
              board::kFinSoftwareLimits.maximum_rad &&
          kParachute.ready() && kAirData.ready() &&
+         board::kControlAuthorityLimits.valid() &&
+         board::kEncoderPipeline.valid() &&
          kRollGainSchedule.configured && kSequenceConfiguration.ready() &&
          kMotorBusVoltageV > 0.0 && kProductionMotorMaximumDuty > 0.0 &&
          kProductionMotorMaximumDuty <= 1.0;

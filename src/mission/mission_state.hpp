@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 
 #include "protocol/can_protocol.hpp"
 
@@ -18,6 +19,10 @@ struct ControlAvailability {
   bool ssc_available{};
   bool gyro_bias_valid{};
   bool ssc_zero_valid{};
+  double roll_estimate_liftoff_relative_unwrapped_rad{
+      std::numeric_limits<double>::quiet_NaN()};
+  uint64_t roll_estimator_timestamp_us{};
+  bool attitude_fresh{};
 
   [[nodiscard]] bool ready() const;
 };
@@ -27,6 +32,7 @@ struct MissionTickInput {
   bool liftoff_detected{};
   bool deployment_pressure_condition{};
   ControlAvailability control{};
+  uint64_t control_tick{};
 };
 
 struct SafetyRequest {
@@ -46,6 +52,11 @@ struct MissionSnapshot {
   bool reset_invalidated{};
   bool deployment_started{};
   bool deployment_power_cutoff_latched{};
+  double control_roll_reference_unwrapped_rad{};
+  uint64_t control_roll_reference_capture_tick{};
+  uint64_t control_roll_reference_estimator_timestamp_us{};
+  uint8_t control_roll_reference_capture_event_sequence{};
+  bool control_roll_reference_valid{};
   FinDirective fin{FinDirective::brake};
   ParaDirective parachute{ParaDirective::hold};
 };
@@ -92,11 +103,15 @@ private:
   void enterDescent();
   void updateDirectives(uint64_t now_us);
   void invalidateLiftoff();
+  void invalidateControlRollReference();
+  [[nodiscard]] bool
+  captureControlRollReference(const MissionTickInput &input);
 
   MissionSnapshot snapshot_{};
   bool control_gate_evaluated_{};
   bool fin_control_available_{};
   uint64_t elapsed_offset_us_{};
+  uint8_t control_roll_reference_capture_event_sequence_{};
 };
 
 } // 名前空間 mission

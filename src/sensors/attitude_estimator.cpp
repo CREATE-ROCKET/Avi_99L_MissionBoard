@@ -128,7 +128,7 @@ bool AttitudeEstimator::accept(const GyroSample &sample) {
     invalidate(AttitudeInvalidReason::numeric_error);
     return false;
   }
-  state_.roll_rad += increment;
+  state_.roll_estimate_liftoff_relative_unwrapped_rad += increment;
   state_.roll_rate_rad_s = rate;
   state_.timestamp_us = sample.timestamp_us;
   previous_timestamp_us_ = sample.timestamp_us;

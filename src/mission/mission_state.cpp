@@ -1,5 +1,6 @@
 #include "mission/mission_state.hpp"
 
+#include <cmath>
 #include <limits>
 
 namespace mission {
@@ -21,7 +22,9 @@ uint32_t nextEpoch(uint32_t current) {
 bool ControlAvailability::ready() const {
   return fin_control_available && fin_zero_hold_valid && attitude_valid &&
          airspeed_above_60 && lps_available && ssc_available &&
-         gyro_bias_valid && ssc_zero_valid;
+         gyro_bias_valid && ssc_zero_valid && attitude_fresh &&
+         std::isfinite(roll_estimate_liftoff_relative_unwrapped_rad) &&
+         roll_estimator_timestamp_us != 0;
 }
 
 bool SequenceConfiguration::ready() const {
@@ -46,6 +49,7 @@ TransitionResult MissionStateMachine::startSequence(
   control_gate_evaluated_ = false;
   fin_control_available_ = configuration.fin_zero_configured;
   elapsed_offset_us_ = 0;
+  invalidateControlRollReference();
   invalidateLiftoff();
   updateDirectives(0);
   return TransitionResult::completed;
@@ -61,6 +65,7 @@ TransitionResult MissionStateMachine::cancelSequence() {
   control_gate_evaluated_ = false;
   fin_control_available_ = false;
   elapsed_offset_us_ = 0;
+  invalidateControlRollReference();
   invalidateLiftoff();
   updateDirectives(0);
   return TransitionResult::completed;
@@ -73,6 +78,7 @@ TransitionResult MissionStateMachine::disableFinControl() {
     return TransitionResult::invalid_state;
   snapshot_.fin_control_disabled = true;
   snapshot_.control_reentry_inhibited = true;
+  invalidateControlRollReference();
   if (snapshot_.state == protocol::MissionState::control)
     snapshot_.state = protocol::MissionState::engine_burn;
   updateDirectives(0);
@@ -88,6 +94,7 @@ TransitionResult MissionStateMachine::liftoffDetectionEmergencyStop() {
   snapshot_.deployment_started = false;
   control_gate_evaluated_ = false;
   elapsed_offset_us_ = 0;
+  invalidateControlRollReference();
   invalidateLiftoff();
   updateDirectives(0);
   return TransitionResult::completed;
@@ -114,6 +121,7 @@ TransitionResult MissionStateMachine::restoreAfterReset(
   snapshot_.elapsed_us = checkpoint.elapsed_us;
   snapshot_.control_reentry_inhibited = true;
   snapshot_.reset_invalidated = true;
+  invalidateControlRollReference();
   snapshot_.deployment_started = checkpoint.deployment_started;
   snapshot_.deployment_power_cutoff_latched = checkpoint.power_cutoff_latched;
   snapshot_.fin = FinDirective::brake;
@@ -173,9 +181,10 @@ void MissionStateMachine::tick(const MissionTickInput &input,
       !control_gate_evaluated_) {
     control_gate_evaluated_ = true;
     if (!snapshot_.fin_control_disabled &&
-        !snapshot_.control_reentry_inhibited && input.control.ready())
+        !snapshot_.control_reentry_inhibited && input.control.ready() &&
+        captureControlRollReference(input)) {
       snapshot_.state = protocol::MissionState::control;
-    else
+    } else
       snapshot_.control_reentry_inhibited = true;
   }
 
@@ -230,6 +239,34 @@ void MissionStateMachine::invalidateLiftoff() {
   snapshot_.liftoff_time_us = 0;
   snapshot_.elapsed_us = 0;
   elapsed_offset_us_ = 0;
+}
+
+void MissionStateMachine::invalidateControlRollReference() {
+  snapshot_.control_roll_reference_unwrapped_rad = 0.0;
+  snapshot_.control_roll_reference_capture_tick = 0;
+  snapshot_.control_roll_reference_estimator_timestamp_us = 0;
+  snapshot_.control_roll_reference_capture_event_sequence =
+      control_roll_reference_capture_event_sequence_;
+  snapshot_.control_roll_reference_valid = false;
+}
+
+bool MissionStateMachine::captureControlRollReference(
+    const MissionTickInput &input) {
+  if (snapshot_.control_roll_reference_valid)
+    return true;
+  if (input.control.roll_estimator_timestamp_us > input.monotonic_us ||
+      input.monotonic_us - input.control.roll_estimator_timestamp_us > 3'000)
+    return false;
+  ++control_roll_reference_capture_event_sequence_;
+  snapshot_.control_roll_reference_unwrapped_rad =
+      input.control.roll_estimate_liftoff_relative_unwrapped_rad;
+  snapshot_.control_roll_reference_capture_tick = input.control_tick;
+  snapshot_.control_roll_reference_estimator_timestamp_us =
+      input.control.roll_estimator_timestamp_us;
+  snapshot_.control_roll_reference_capture_event_sequence =
+      control_roll_reference_capture_event_sequence_;
+  snapshot_.control_roll_reference_valid = true;
+  return true;
 }
 
 } // 名前空間 mission
