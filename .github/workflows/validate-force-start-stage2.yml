@@ -1,0 +1,73 @@
+name: Validate ForceStart Stage 2
+
+on:
+  push:
+    branches:
+      - chatgpt/99l-force-start-stage2
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Apply implementation transform
+        run: |
+          python3 tools/apply_force_start_stage2.py
+          python3 tools/apply_force_start_stage2_followup.py
+          python3 tools/apply_force_start_stage2_tests.py
+
+      - name: Check Stage 2 invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          ! grep -R -F 'open_close_exactly_half_turn' src host_test
+          ! grep -R -F 'ParachuteAction::cut_power' src host_test
+          ! grep -R -F 'sequence_configured' src host_test
+          ! grep -R -F 'new uint8_t' src host_test
+          grep -F 'force_start_sequence = 0x04' src/mission/command_executor.hpp
+          grep -F 'freezeFlightSnapshotForced' src/actuators/parachute_configuration.hpp
+          grep -F 'stop_retrying' src/actuators/safety_core.hpp
+          grep -F 'forced_start' src/runtime/recovery_boot.cpp
+          grep -F 'nonBypassFlightConfigurationReady' src/config/flight_config.hpp
+          grep -F '5秒deadlineは電源遮断要求ではない' host_test/mission_host_tests.cpp
+
+      - name: Build and run host tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S host_test -B build/host_test -DCMAKE_BUILD_TYPE=Debug
+          cmake --build build/host_test --parallel 2
+          ctest --test-dir build/host_test --output-on-failure
+
+      - name: Build production firmware with PlatformIO
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv .venv-platformio
+          .venv-platformio/bin/pip install --disable-pip-version-check platformio
+          .venv-platformio/bin/pio run -e avi_99l_missionboard
+
+      - name: Commit validated output to validation branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm tools/apply_force_start_stage2.py
+          rm tools/apply_force_start_stage2_followup.py
+          rm tools/apply_force_start_stage2_tests.py
+          rm .github/workflows/validate-force-start-stage2.yml
+          rm -rf build/host_test .venv-platformio .pio
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git diff --cached --check
+          git commit -m 'chore: materialize validated force-start stage 2'
+          git push origin HEAD:chatgpt/99l-force-start-stage2
