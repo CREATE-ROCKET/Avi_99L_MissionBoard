@@ -58,20 +58,34 @@ characterizationではtask affinityを次のように固定する。
 - Core 0: `char_runtime` priority 21、`char_vbus` priority 12、`char_console` priority 5
 - Core 1: `char_encoder` priority 23、`char_writer` priority 10
 
-`char_encoder`は同Coreのwriterより常に優先し、AS5047D captureをSD書込みより優先する。writer queue depthを増やして持続throughput不足を隠すことはしない。
+`char_encoder`は同Coreのwriterより常に優先し、AS5047D captureをSD書込みより優先する。
+
+PRECHECK7.9では1 kHzが10秒・10000 recordを`writer-queue-overflow=0`で完走し、queue high-waterは56だった。2 kHz raw captureもcompleteだったが、Core 1上で2 kHz encoder taskにpreemptされるwriterがqueue depth 128を使い切り、1615 record時点でoverflowした。SD/FATの瞬間stallをcharacterizationのRAM bufferで吸収することは許可するため、writer queue depthを512 recordsへ拡張する。
+
+queue拡張後も`queue-high-water`を必ず記録し、10秒run中に512へ単調に近づく場合は平均writer throughput不足として不合格とする。queue拡張は持続速度不足を合格扱いにするためには使用しない。
+
+SDMMC mountは`char_runtime`から行わず、Core 1へpinした`char_writer` task自身のstartupで実施する。これによりstorage driverの初期化・interrupt allocationをrealtime consumer側Core 0から分離する。mount成否はstartup semaphoreで`LogWriterV5::initialize()`へ返し、失敗時はcaptureを開始しない。
 
 rate-check終了時は`CHAR_WRITER_TIMING`を出力する。
 
 ```text
+queue-depth
 queue-high-water
 max-batch-records
+batch-count
 validate-max-us
+validate-total-us
+validate-avg-us
 encode-max-us
+encode-total-us
+encode-avg-us
 fwrite-max-us
+fwrite-total-us
+fwrite-avg-us
 records-written
 ```
 
-`queue-high-water`が継続的に増えて128へ到達する場合はwriterの持続処理速度不足とする。`fwrite-max-us`が支配的ならSD/FAT側、`validate-max-us`または`encode-max-us`が支配的ならCPU側として切り分ける。
+`fwrite-max-us`はSD/FATの瞬間stall、`fwrite-avg-us`とqueue high-waterの推移は持続throughputの判定に使用する。1000 Hz consumer record生成はencoder raw rateが2 kHzでも1 record/msのままである。
 
 ## 6. Characterization build最適化
 
