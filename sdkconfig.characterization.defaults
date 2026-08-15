@@ -1,8 +1,8 @@
 # Characterizationのepoch/sample clockはGPTimer ISRを使用する。
 CONFIG_GPTIMER_ISR_HANDLER_IN_IRAM=y
 
-# Characterizationは実機timing qualification用なので、ESP-IDF側もperformance最適化とLTOを有効にする。
-# PlatformIO側ではさらに-O3を明示する。-Ofast/fast-mathは安全判定の意味論を維持するため使用しない。
+# ESP-IDF frameworkは公式performance最適化(-O2)を使用する。
+# MissionBoard自前componentの-O3はsrc/CMakeLists.txtでcharacterization時だけ追加する。
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
-CONFIG_COMPILER_LTO_LINKTIME=y
-CONFIG_COMPILER_LTO_COMPILETIME=y
+# CONFIG_COMPILER_LTO_LINKTIME is not set
+# CONFIG_COMPILER_LTO_COMPILETIME is not set

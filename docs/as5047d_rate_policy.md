@@ -75,8 +75,14 @@ records-written
 
 ## 6. Characterization build最適化
 
-characterization firmwareはtiming qualification専用buildとして、ESP-IDF側の`CONFIG_COMPILER_OPTIMIZATION_PERF=y`を有効にし、PlatformIO compile flagで`-O3`を明示する。さらにESP-IDFのcompile-time/link-time LTOを有効にする。
+characterization firmwareはtiming qualification専用buildとして、ESP-IDF framework componentには公式の`CONFIG_COMPILER_OPTIMIZATION_PERF=y`を使用し、`-O2`のまま維持する。framework全体へPlatformIO `build_flags`で`-O3`を注入してはならない。
 
-`-Ofast`およびfast-math系optionは使用しない。`std::isfinite`、NaN/Inf、浮動小数点比較等の安全判定の意味論を維持するためである。
+MissionBoard自前の`src` componentだけは、characterization用CMake option `AVI_99L_CHARACTERIZATION_BUILD=ON`のとき`target_compile_options(... -O3)`を追加する。これにより`profile_runner`、`fixed_epoch_assembler`、`record_validation`、`log_writer_v5`、`encoder_sampler`等の自前処理を`-O3`で最適化しつつ、ESP-IDF UART/FreeRTOS/SDMMC等はEspressifが想定する`-O2`でbuildする。
 
-ESP-IDFの正式なperformance optimizationは`-O2`であり、`-O3`はcustom optimization levelである。このため最適化変更後のbinaryは別firmware SHAとして扱い、1/2 kHz rate-check、full 1 kHz、writer throughput、position guard、安全停止を再qualificationする。deadlineやacceptance基準は最適化のために緩和しない。
+ESP-IDF framework全体のcompile-time/link-time LTOは使用しない。LTOによるframework task stack使用量やdriverコード生成の変化をcharacterization timing qualificationへ混入させないためである。
+
+`-Ofast`およびfast-math系optionも使用しない。`std::isfinite`、NaN/Inf、浮動小数点比較等の安全判定の意味論を維持するためである。
+
+2026-08-16の全component `-O3`試行ではESP-IDF `esp_driver_uart/src/uart.c`がGCCの`-Warray-bounds`を発生させ、frameworkの`-Werror`でbuild停止した。このため以後はcomponent-local `-O3`を正式なcharacterization build方針とする。
+
+最適化変更後のbinaryは別firmware SHAとして扱い、1/2 kHz rate-check、full 1 kHz、writer throughput、position guard、安全停止を再qualificationする。deadlineやacceptance基準は最適化のために緩和しない。
