@@ -1857,6 +1857,8 @@ void missionRealtimeTask(void *) {
           fin_zero_reference_rad = unwrapped_fin_rad;
           fin_zero_available = true;
           fin_angle_rad = 0.0;
+          fin_rate_valid = false;
+          fin_velocity.reset();
           fin_zero_configured.store(true, std::memory_order_release);
           fin_zero_hold_valid.store(false, std::memory_order_release);
           zero_hold_controller.resetValidity();
@@ -2243,11 +2245,16 @@ void missionRealtimeTask(void *) {
           unwrapped_fin_rad += delta;
         }
         previous_wrapped_fin_rad = wrapped;
-        if (fin_zero_available)
+        if (fin_zero_available) {
           fin_angle_rad = unwrapped_fin_rad - fin_zero_reference_rad;
-        fin_rate_valid = fin_velocity.update(sample.host_timestamp_us,
-                                             fin_angle_rad,
-                                             fin_rate_rad_s);
+          fin_rate_valid = fin_velocity.update(sample.host_timestamp_us,
+                                               fin_angle_rad,
+                                               fin_rate_rad_s);
+        } else {
+          // zero設定前の仮の0 rad系列を速度推定historyへ混ぜない。
+          fin_rate_valid = false;
+          fin_velocity.reset();
+        }
         encoder_ready.store(true, std::memory_order_release);
       }
     } else {
@@ -3928,33 +3935,45 @@ void sdLogTask(void *) {
   }
 
   RecoveryDumpCursor sd_dump{};
+  struct StorageExportCompletion {
+    bool pending{};
+    uint8_t transaction_id{};
+    protocol::CommandReason reason{protocol::CommandReason::none};
+    uint32_t detail{};
+  } export_completion;
   for (;;) {
-    StorageExportRequest export_request{};
-    while (xQueueReceive(storage_export_queue, &export_request, 0) == pdTRUE) {
-      protocol::CommandReason reason = protocol::CommandReason::none;
-      esp_err_t export_result = ESP_ERR_INVALID_STATE;
-      if (!sd_flight_log.ready() || !internal_flash_log.ready()) {
-        reason = protocol::CommandReason::device_unavailable;
-      } else {
-        export_result =
-            sd_flight_log.exportRawFlashAndErase(internal_flash_log);
-        if (export_result != ESP_OK)
-          reason = protocol::CommandReason::persistence_error;
-      }
-      if (reason == protocol::CommandReason::none)
-        flash_log_ready.store(true, std::memory_order_release);
-      if (xSemaphoreTake(executor_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-        const auto result = command_executor.finish(
-            export_request.transaction_id,
-            reason == protocol::CommandReason::none
-                ? protocol::CommandPhase::completed
-                : protocol::CommandPhase::failed,
-            reason, static_cast<uint32_t>(export_result));
-        xSemaphoreGive(executor_mutex);
-        enqueueResult(result, false);
-      } else {
-        (void)xQueueSendToFront(storage_export_queue, &export_request, 0);
-        break;
+    if (export_completion.pending &&
+        xSemaphoreTake(executor_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+      const auto result = command_executor.finish(
+          export_completion.transaction_id,
+          export_completion.reason == protocol::CommandReason::none
+              ? protocol::CommandPhase::completed
+              : protocol::CommandPhase::failed,
+          export_completion.reason, export_completion.detail);
+      xSemaphoreGive(executor_mutex);
+      enqueueResult(result, false);
+      export_completion = {};
+    }
+
+    if (!export_completion.pending) {
+      StorageExportRequest export_request{};
+      if (xQueueReceive(storage_export_queue, &export_request, 0) == pdTRUE) {
+        protocol::CommandReason reason = protocol::CommandReason::none;
+        esp_err_t export_result = ESP_ERR_INVALID_STATE;
+        if (!sd_flight_log.ready() || !internal_flash_log.ready()) {
+          reason = protocol::CommandReason::device_unavailable;
+        } else {
+          export_result =
+              sd_flight_log.exportRawFlashAndErase(internal_flash_log);
+          if (export_result != ESP_OK)
+            reason = protocol::CommandReason::persistence_error;
+        }
+        if (reason == protocol::CommandReason::none)
+          flash_log_ready.store(true, std::memory_order_release);
+        // export/eraseは一度だけ実行し、result通知だけを必要ならretryする。
+        export_completion =
+            {true, export_request.transaction_id, reason,
+             static_cast<uint32_t>(export_result)};
       }
     }
 
