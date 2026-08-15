@@ -31,6 +31,7 @@ esp_err_t ProductionMotorDriver::initialize() {
   if (!bringup::safe_outputs::initialized())
     return ESP_ERR_INVALID_STATE;
 
+  coast_known_ = false;
   ledc_timer_config_t timer{};
   timer.speed_mode = kLedcMode;
   timer.duty_resolution = kDutyResolution;
@@ -101,8 +102,11 @@ esp_err_t ProductionMotorDriver::setChannelDuty(bool positive_in1,
     result = ledc_set_duty(kLedcMode, active, count);
   if (result == ESP_OK)
     result = ledc_update_duty(kLedcMode, active);
-  if (result != ESP_OK)
+  if (result == ESP_OK) {
+    coast_known_ = false;
+  } else {
     rememberFirst(coast(), result);
+  }
   return result;
 }
 
@@ -119,18 +123,30 @@ esp_err_t ProductionMotorDriver::brake() {
                            kMaximumDutyCount);
   if (result == ESP_OK)
     result = ledc_update_duty(kLedcMode, kIn2Channel);
-  if (result != ESP_OK)
+  if (result == ESP_OK) {
+    coast_known_ = false;
+  } else {
     rememberFirst(coast(), result);
+  }
   return result;
 }
 
 esp_err_t ProductionMotorDriver::coast() {
+#if defined(AVI_99L_CHARACTERIZATION) && AVI_99L_CHARACTERIZATION
+  // rate-checkは同じCoastを1 kHzで再要求する。initialize()または直前の
+  // coast()でHi-Z化に成功しており、その後Drive/Brakeしていない場合は
+  // LEDC stopを再発行しない。production flight buildの挙動は変更しない。
+  if (initialized_ && coast_known_)
+    return ESP_OK;
+#endif
+
   esp_err_t result = ESP_OK;
   if (timer_configured_ && in1_configured_)
     rememberFirst(ledc_stop(kLedcMode, kIn1Channel, 0), result);
   if (timer_configured_ && in2_configured_)
     rememberFirst(ledc_stop(kLedcMode, kIn2Channel, 0), result);
   rememberFirst(bringup::safe_outputs::motorCoast(), result);
+  coast_known_ = result == ESP_OK;
   return result;
 }
 

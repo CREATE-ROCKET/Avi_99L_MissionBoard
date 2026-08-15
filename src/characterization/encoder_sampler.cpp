@@ -123,7 +123,7 @@ void EncoderSampler::taskLoop() {
       continue;
     }
     bringup::EncoderSample captured{};
-    esp_err_t read_result = encoder_.readPipelined(captured);
+    const esp_err_t read_result = encoder_.readPipelined(captured);
 
     RawEncoderSample sample{};
     sample.generation = ++generation_;
@@ -138,8 +138,10 @@ void EncoderSampler::taskLoop() {
     AS5047D::Status status{};
     status.offset_compensation_finished =
         startup_status_.offset_compensation_finished;
+
     if (read_result != ESP_OK) {
-      // driverはEF処理時にERRFLを既にclearするため、保持済み証拠を読む。
+      // readPipelined自身が返したtransport/EF異常はそのsampleで即時fatalにする。
+      // driverはEF処理時にERRFLをclearするため、保持済みerror flagsも証拠化する。
       pipeline_running_ = false;
       ++statistics_.encoder_transport_errors;
       rememberFirst(read_result);
@@ -156,55 +158,11 @@ void EncoderSampler::taskLoop() {
         rememberFirst(ESP_ERR_INVALID_STATE);
       }
       running_.store(false);
-    } else if (samples_per_epoch_ != 0U &&
-               ideal_slot % samples_per_epoch_ ==
-                   samples_per_epoch_ - 1U) {
-      // 各1 ms epoch末に同じsampler ownerがsensor healthを確認する。
-      esp_err_t health_result = encoder_.stopPipelinedRead();
-      pipeline_running_ = false;
-      if (health_result != ESP_OK)
-        ++statistics_.encoder_transport_errors;
-
-      esp_err_t status_result = ESP_ERR_NOT_FINISHED;
-      esp_err_t flags_result = ESP_ERR_NOT_FINISHED;
-      if (health_result == ESP_OK) {
-        status_result = encoder_.getStatus(status);
-        if (status_result != ESP_OK) {
-          ++statistics_.encoder_transport_errors;
-          health_result = status_result;
-        }
-      }
-      if (status_result == ESP_OK &&
-          sensors::as5047d_health::statusFaulted(status)) {
-        ++statistics_.encoder_status_faults;
-        health_result = ESP_ERR_INVALID_STATE;
-      }
-      if (status_result == ESP_OK) {
-        flags_result = encoder_.readAndClearErrorFlags(errors);
-        if (flags_result != ESP_OK) {
-          ++statistics_.encoder_transport_errors;
-          health_result = flags_result;
-        } else if (hasErrorFlags(errors)) {
-          ++statistics_.encoder_transport_errors;
-          health_result = ESP_ERR_INVALID_RESPONSE;
-        }
-      }
-      if (health_result == ESP_OK) {
-        const esp_err_t restart_result = encoder_.startPipelinedRead();
-        if (restart_result == ESP_OK) {
-          pipeline_running_ = true;
-          startup_status_ = status;
-        } else {
-          ++statistics_.encoder_transport_errors;
-          health_result = restart_result;
-        }
-      }
-      if (health_result != ESP_OK) {
-        read_result = health_result;
-        rememberFirst(health_result);
-        running_.store(false);
-      }
     }
+
+    // Vault仕様どおり、capture中はdiagnostic目的でpipelineを定期停止しない。
+    // 5 kHzでは1 msごとのstop/status/ERRFL/restart自体が200 us sampleを
+    // coalesceさせ得るため、healthはbegin前とstop後で確認する。
     sample.read_result_code = read_result;
     sample.valid = read_result == ESP_OK && captured.valid;
     sample.diagnostic_flags = statusFlags(status, errors);
@@ -257,9 +215,7 @@ esp_err_t EncoderSampler::begin(EncoderRate rate,
   AS5047D::ErrorFlags startup_errors{};
   if (result == ESP_OK)
     result = encoder_.readAndClearErrorFlags(startup_errors);
-  if (result == ESP_OK &&
-      (startup_errors.parity_error || startup_errors.invalid_command ||
-       startup_errors.framing_error))
+  if (result == ESP_OK && hasErrorFlags(startup_errors))
     result = ESP_ERR_INVALID_RESPONSE;
   if (result == ESP_OK)
     result = encoder_.startPipelinedRead();
@@ -342,6 +298,7 @@ esp_err_t EncoderSampler::stop() {
     pipeline_running_ = false;
   }
   if (encoder_.initialized()) {
+    // capture中はpipelineを止めない代わりに、終了後のhealthを必ず取得する。
     AS5047D::Status final_status{};
     const esp_err_t status_result = encoder_.getStatus(final_status);
     rememberOperation(status_result, diagnostic_error);

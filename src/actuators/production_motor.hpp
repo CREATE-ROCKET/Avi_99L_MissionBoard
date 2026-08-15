@@ -20,6 +20,10 @@ private:
   bool timer_configured_{};
   bool in1_configured_{};
   bool in2_configured_{};
+  // Characterizationの1 kHz rate-checkではCoastを毎epoch要求する。
+  // 既にHi-Zであることがdriver自身により確認済みなら、同じLEDC停止操作を
+  // 繰り返してrealtime deadlineを消費しない。
+  bool coast_known_{};
 };
 
 } // 名前空間 actuators
