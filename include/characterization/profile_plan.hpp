@@ -26,6 +26,12 @@ public:
   static constexpr std::int16_t kBroadbandCommandPermille = 250;
   static constexpr std::int16_t kPolarityCheckCommandPermille = 200;
 
+  static_assert(kInitialMotionCommandPermille <= kMaximumCommandPermille);
+  static_assert(kBroadbandCommandPermille <= kMaximumCommandPermille);
+  static_assert(kPolarityCheckCommandPermille <= kMaximumCommandPermille);
+  static_assert(kInitialMotionCommandPermille > kBroadbandCommandPermille);
+  static_assert(kBroadbandCommandPermille >= kPolarityCheckCommandPermille);
+
   ProfilePlan(AssemblyStage stage, EncoderRate rate,
               std::uint32_t fixed_seed) noexcept;
 
