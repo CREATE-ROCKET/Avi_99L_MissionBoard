@@ -71,8 +71,11 @@ rate-check終了時は`CHAR_WRITER_TIMING`を出力する。
 ```text
 queue-depth
 queue-high-water
+batch-capacity
 max-batch-records
 batch-count
+preallocate-us
+planned-bytes
 validate-max-us
 validate-total-us
 validate-avg-us
@@ -86,6 +89,26 @@ records-written
 ```
 
 `fwrite-max-us`はSD/FATの瞬間stall、`fwrite-avg-us`とqueue high-waterの推移は持続throughputの判定に使用する。1000 Hz consumer record生成はencoder raw rateが2 kHzでも1 record/msのままである。
+
+### 5.3. PRECHECK8後のSD書込み契約
+
+PRECHECK8ではqueue depth 512でも、1 kHzで`fwrite-max-us=951768`、2 kHzで`fwrite-max-us=532719`の長時間stallが観測された。1 kHzは9328 record、2 kHzは535 recordでqueue high-waterが512へ到達し、いずれもwriter queue overflowで停止した。raw encoder側は停止まで`repeated=0`、`skipped=0`、`steady-incomplete=0`であったため、queueをさらに拡大してstorage throughput不足を隠す方針は採らない。
+
+writer queue depthは512 recordsのまま維持し、1回のwriter batch上限を16 recordsから64 recordsへ拡大する。queueにbacklogがある場合は最大20 KiB級の連続V5 recordを一度の`fwrite`へまとめ、FAT/VFS/SDへの小write回数を減らす。
+
+各runではmotor、AS5047D sampler、consumer GPTimerを開始する前に、planned file sizeを
+
+```text
+V5 header + expected_epochs * V5 record + V5 footer
+```
+
+として`ftruncate()`で事前確保し、`fsync()`まで完了させる。ESP-IDF FatFs VFSのfile拡張は不足領域を実際にzero writeしてclusterを確保するため、motor run中のFAT cluster allocationをrun開始前へ移す。preallocation完了後に新しい`epoch_zero`を決め、characterizationでは1.5 sのstart leadを確保する。
+
+runがabortしてplanned record数に達しなかった場合もzero tailをV5 logとして残さない。footerを書き終えた実file positionへ終了時に`ftruncate()`し、`fsync()`してからcloseする。したがってstrict decoderが見るfile layoutは従来どおり`header + actual records + footer`である。
+
+V5 CRC32はpolynomial `0xEDB88320`、初期/final XOR、`previous_crc` chainingを変更せず、1 byteごとの8-bit loopから256-entry table lookupへ変更する。writerのfile CRCはrecord単位で関数を呼び直さず、同一batchの連結bytesを1回のchained CRCへ渡す。既存Python golden fixtureのCRC固定値とencode/decode byte一致を互換条件とし、V5 schema、record size、Spica importerを変更しない。
+
+preallocation、batch拡張、CRC高速化によっても100 us command/release deadline、half-open epoch/slot境界、queue overflow時のfail-safeを緩和しない。次のrate-checkでwriter overflowを解消した後もdeadline missが残る場合に限り、GPTimer interrupt priority/affinityを別変更として評価する。
 
 ## 6. Characterization build最適化
 
