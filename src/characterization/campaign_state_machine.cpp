@@ -138,11 +138,10 @@ CampaignStatus CampaignStateMachine::finishRun(
 }
 
 bool CampaignStateMachine::allRateChecksResolved() const noexcept {
-  for (const RateResult result : rate_results_) {
-    if (result == RateResult::Pending)
-      return false;
-  }
-  return true;
+  // AS5047Dの新規acquisitionは1 kHz / 2 kHzだけを対象とする。
+  // index 2の5 kHz slotはV5の旧campaign互換のため保持するが、Stage完了条件には使わない。
+  return rate_results_[0] != RateResult::Pending &&
+         rate_results_[1] != RateResult::Pending;
 }
 
 CampaignStatus CampaignStateMachine::completeStage() noexcept {

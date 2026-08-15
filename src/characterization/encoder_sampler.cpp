@@ -26,10 +26,6 @@ static_assert(1'000'000U /
                   static_cast<std::uint32_t>(EncoderRate::Hz2000) /
                   2U ==
               250U);
-static_assert(1'000'000U /
-                  static_cast<std::uint32_t>(EncoderRate::Hz5000) /
-                  2U ==
-              100U);
 
 void rememberOperation(esp_err_t operation, esp_err_t &first) noexcept {
   if (first == ESP_OK && operation != ESP_OK)
@@ -245,8 +241,8 @@ void EncoderSampler::taskLoop() {
     }
 
     // Vault仕様どおり、capture中はdiagnostic目的でpipelineを定期停止しない。
-    // 5 kHzでは1 msごとのstop/status/ERRFL/restart自体が200 us sampleを
-    // coalesceさせ得るため、healthはbegin前とstop後で確認する。
+    // 2 kHzでも1 msごとのstop/status/ERRFL/restartはsampleを乱し得るため、
+    // healthはbegin前とstop後で確認する。
     sample.read_result_code = read_result;
     sample.valid = read_result == ESP_OK && captured.valid;
     sample.diagnostic_flags = statusFlags(status, errors);
@@ -264,9 +260,14 @@ void EncoderSampler::taskLoop() {
 
 esp_err_t EncoderSampler::begin(EncoderRate rate,
                                 std::uint64_t epoch_zero_us) {
+  // AS5047Dの仕様上の最大更新レート2.5 kHzに対して余裕を取り、
+  // 99Lでは1 kHz / 2 kHzのみを新規acquisitionとして許可する。
+  if (running_.load() ||
+      (rate != EncoderRate::Hz1000 && rate != EncoderRate::Hz2000))
+    return ESP_ERR_INVALID_ARG;
+
   const std::uint32_t period = periodUs(rate);
-  if (running_.load() || !isSupportedEncoderRate(rate) ||
-      epoch_zero_us < period ||
+  if (epoch_zero_us < period ||
       epoch_zero_us >
           std::numeric_limits<std::uint64_t>::max() - period / 2U)
     return ESP_ERR_INVALID_ARG;
