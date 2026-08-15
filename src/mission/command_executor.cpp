@@ -77,8 +77,7 @@ bool argumentsValid(const GenericCommandRequest &request, CommandCode code) {
   }
   case CommandCode::set_para_open:
   case CommandCode::set_para_close:
-    return (request.arguments[0] == 1 || request.arguments[0] == 0xFF) &&
-           allZero(request, 1);
+    return allZero(request, 0);
   case CommandCode::select_motor_profile:
     return request.arguments[0] != 0 && allZero(request, 1);
   default:
@@ -146,6 +145,13 @@ CommandDecision CommandExecutor::begin(const GenericCommandRequest &request,
     rejection = CommandReason::invalid_argument;
   else if (!stateValid(code, context.state))
     rejection = CommandReason::invalid_state;
+  else if (code == CommandCode::start_sequence &&
+           (busy(CommandDomain::parachute) || busy(CommandDomain::fin) ||
+            busy(CommandDomain::calibration) || context.motor_test_busy))
+    rejection = CommandReason::busy;
+  else if (domain == CommandDomain::parachute &&
+           busy(CommandDomain::sequence))
+    rejection = CommandReason::busy;
   else if (code == CommandCode::start_sequence &&
            (!context.sequence_configured || !context.resources_preallocated))
     rejection = CommandReason::not_configured;

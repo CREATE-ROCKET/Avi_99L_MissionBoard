@@ -29,6 +29,26 @@ struct FlightCheckpointRecord {
 
 RTC_DATA_ATTR FlightCheckpointRecord flight_checkpoint{};
 
+constexpr uint32_t kParachuteCheckpointMagic = 0x39395043;
+
+struct ParachuteCheckpointRecord {
+  uint32_t magic{};
+  uint16_t open_count{};
+  uint16_t close_count{};
+  uint16_t checksum{};
+};
+
+RTC_DATA_ATTR ParachuteCheckpointRecord parachute_checkpoint{};
+
+uint16_t parachuteCheckpointChecksum(
+    const ParachuteCheckpointRecord &record) {
+  uint32_t value = record.magic ^
+                   (static_cast<uint32_t>(record.open_count) << 16U) ^
+                   record.close_count;
+  value ^= value >> 16U;
+  return static_cast<uint16_t>(value);
+}
+
 uint16_t checkpointChecksum(const FlightCheckpointRecord &record) {
   uint64_t value = record.magic ^
                    (static_cast<uint32_t>(record.version) << 16U) ^
@@ -126,6 +146,36 @@ void storeFlightCheckpoint(const mission::MissionSnapshot &snapshot) {
 }
 
 void clearFlightCheckpoint() { flight_checkpoint = {}; }
+
+bool loadFlightParachuteConfiguration(
+    actuators::FlightParachuteConfiguration &configuration) {
+  if (!resetPreservesRtcMemory() ||
+      parachute_checkpoint.magic != kParachuteCheckpointMagic ||
+      parachute_checkpoint.checksum !=
+          parachuteCheckpointChecksum(parachute_checkpoint))
+    return false;
+  const auto open = actuators::AbsoluteParachuteAngle::fromCount(
+      parachute_checkpoint.open_count);
+  const auto close = actuators::AbsoluteParachuteAngle::fromCount(
+      parachute_checkpoint.close_count);
+  if (!open.has_value() || !close.has_value() ||
+      !actuators::shortestParachuteDisplacement(*close, *open).valid())
+    return false;
+  configuration = {*open, *close};
+  return true;
+}
+
+void storeFlightParachuteConfiguration(
+    const actuators::FlightParachuteConfiguration &configuration) {
+  ParachuteCheckpointRecord record{};
+  record.magic = kParachuteCheckpointMagic;
+  record.open_count = configuration.open.count();
+  record.close_count = configuration.close.count();
+  record.checksum = parachuteCheckpointChecksum(record);
+  parachute_checkpoint = record;
+}
+
+void clearFlightParachuteConfiguration() { parachute_checkpoint = {}; }
 
 [[noreturn]] void enterPeriodicDeepSleep() {
   prepareMarker();

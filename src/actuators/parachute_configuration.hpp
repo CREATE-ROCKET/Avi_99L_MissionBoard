@@ -139,7 +139,12 @@ public:
   // 起動時load済みの有効endpointだけを渡す。破損endpointはnulloptとする。
   void replaceLoadedConfiguration(const ParachuteConfiguration &loaded) {
     active_ = loaded;
-    discardFlightSnapshot();
+  }
+
+  // RTC checkpointから復元した飛行用snapshotだけを戻す。
+  void restoreFlightSnapshot(const FlightParachuteConfiguration &snapshot) {
+    flight_snapshot_ = snapshot;
+    flight_snapshot_valid_ = true;
   }
 
   [[nodiscard]] FlightParachutePreparationResult

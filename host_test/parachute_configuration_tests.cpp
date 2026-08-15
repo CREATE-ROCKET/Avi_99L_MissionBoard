@@ -250,6 +250,15 @@ void testFlightSnapshot() {
   state.discardFlightSnapshot();
   require(!state.flightSnapshotValid() && state.active().open->count() == 700,
           "Cancel must discard only the snapshot");
+
+  state.restoreFlightSnapshot({angle(300), angle(100)});
+  ParachuteConfiguration reloaded{};
+  reloaded.open = angle(900);
+  reloaded.close = angle(800);
+  state.replaceLoadedConfiguration(reloaded);
+  require(state.flightSnapshot()->open.count() == 300 &&
+              state.active().open->count() == 900,
+          "startup active load must not replace a restored flight snapshot");
 }
 
 } // 無名名前空間

@@ -5,13 +5,10 @@
 
 #include "config/board_config.hpp"
 #include "control/control_pipeline.hpp"
-#include "mission/mission_state.hpp"
 
 namespace flight_config {
 
-struct ParachuteConfig {
-  float close_position_deg{};
-  float open_position_deg{};
+struct ParachuteMotionConfig {
   float target_tolerance_deg{};
   float speed_deg_s{};
   float acceleration_deg_s2{};
@@ -21,8 +18,7 @@ struct ParachuteConfig {
   uint32_t retry_interval_ms{};
 
   [[nodiscard]] constexpr bool ready() const {
-    return open_position_deg != close_position_deg &&
-           target_tolerance_deg > 0.0F && speed_deg_s > 0.0F &&
+    return target_tolerance_deg > 0.0F && speed_deg_s > 0.0F &&
            acceleration_deg_s2 > 0.0F && torque_limit_percent > 0.0F &&
            torque_limit_percent <= 100.0F &&
            initialization_deadline_ms > power_stabilization_ms &&
@@ -52,8 +48,8 @@ struct AirDataConfig {
 };
 
 // TODO(HW_TEST): 実機の収納位置、開放位置、速度、加速度、保持torqueを確定する。
-inline constexpr ParachuteConfig kParachute{
-    0.0F, 90.0F, 2.0F, 180.0F, 360.0F, 20.0F, 100, 1'500, 20};
+inline constexpr ParachuteMotionConfig kParachute{
+    2.0F, 180.0F, 360.0F, 20.0F, 100, 1'500, 20};
 
 // source nominalは0.92。true 0.60..1.20は飛行中同定用ではなく、
 // TODO(SIMULATION/AERO_VALIDATION): coefficient robustness診断用の暫定範囲。
@@ -89,9 +85,6 @@ inline constexpr control::RollGainSchedule kRollGainSchedule{
       {180.0, {0.08, 2.32, 0.04, 0.296}}}},
     true};
 
-inline constexpr mission::SequenceConfiguration kSequenceConfiguration{
-    true, true, true, true};
-
 [[nodiscard]] inline bool productionFlightConfigurationReady() {
   return board::kFlightMotorA.parameters_valid &&
          board::kFlightMotorA.polarity !=
@@ -102,7 +95,7 @@ inline constexpr mission::SequenceConfiguration kSequenceConfiguration{
          kParachute.ready() && kAirData.ready() &&
          board::kControlAuthorityLimits.valid() &&
          board::kEncoderPipeline.valid() &&
-         kRollGainSchedule.configured && kSequenceConfiguration.ready() &&
+         kRollGainSchedule.configured &&
          kMotorBusVoltageV > 0.0 && kProductionMotorMaximumDuty > 0.0 &&
          kProductionMotorMaximumDuty <= 1.0;
 }

@@ -599,6 +599,53 @@ void testCommandExecutor() {
   para_limit.arguments[1] = 0x07;
   assert(executor.begin(para_limit, context).result.reason ==
          CommandReason::invalid_argument);
+
+  CommandExecutor parachute_arguments;
+  auto set_open =
+      command(20, static_cast<uint8_t>(CommandCode::set_para_open));
+  assert(parachute_arguments.begin(set_open, context).execute);
+  (void)parachute_arguments.finish(20, CommandPhase::completed);
+  set_open = command(21, static_cast<uint8_t>(CommandCode::set_para_open));
+  set_open.arguments[0] = 1;
+  assert(parachute_arguments.begin(set_open, context).result.reason ==
+         CommandReason::invalid_argument);
+  auto negative_relative =
+      command(22, static_cast<uint8_t>(CommandCode::para_move_relative));
+  negative_relative.arguments[0] = 0xFF;
+  negative_relative.arguments[1] = 0xFF;
+  assert(parachute_arguments.begin(negative_relative, context).execute);
+
+  CommandExecutor start_busy;
+  assert(start_busy
+             .begin(command(23,
+                            static_cast<uint8_t>(CommandCode::para_hold)),
+                    context)
+             .execute);
+  CommandContext not_configured = context;
+  not_configured.sequence_configured = false;
+  assert(start_busy
+             .begin(command(24,
+                            static_cast<uint8_t>(CommandCode::start_sequence)),
+                    not_configured)
+             .result.reason == CommandReason::busy);
+
+  CommandExecutor parachute_busy;
+  assert(parachute_busy
+             .begin(command(25,
+                            static_cast<uint8_t>(CommandCode::start_sequence)),
+                    context)
+             .execute);
+  assert(parachute_busy
+             .begin(command(26,
+                            static_cast<uint8_t>(CommandCode::para_free)),
+                    context)
+             .result.reason == CommandReason::busy);
+  assert(parachute_busy
+             .begin(command(27,
+                            static_cast<uint8_t>(CommandCode::set_para_close)),
+                    wrong_state)
+             .result.reason == CommandReason::invalid_state);
+
   assert(executor.begin(
              command(11, static_cast<uint8_t>(
                              CommandCode::run_preflight_calibration)),
@@ -971,6 +1018,21 @@ void testParachuteAndRecovery() {
   assert(parachute.tick({6'000'000, false, 0, false}) ==
          ParachuteAction::cut_power);
   assert(parachute.status().state == ParachuteOpenState::retry_exhausted);
+
+  ParachuteController positive_wrap;
+  assert(positive_wrap.startOpen(0, 4095) ==
+         ParachuteAction::command_open);
+  assert(positive_wrap.tick({500'000, true, 30, false}) ==
+         ParachuteAction::none);
+  ParachuteController negative_wrap;
+  assert(negative_wrap.startOpen(0, 0) == ParachuteAction::command_open);
+  assert(negative_wrap.tick({500'000, true, 4060, false}) ==
+         ParachuteAction::none);
+  ParachuteController half_turn_progress;
+  assert(half_turn_progress.startOpen(0, 0) ==
+         ParachuteAction::command_open);
+  assert(half_turn_progress.tick({500'000, true, 2048, false}) ==
+         ParachuteAction::retry_open);
 
   ParachuteController confirmed;
   assert(confirmed.startOpen(0, 0) == ParachuteAction::command_open);

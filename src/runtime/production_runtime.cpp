@@ -28,6 +28,9 @@
 #include "mission/command_executor.hpp"
 #include "mission/mission_state.hpp"
 #include "mission/recovery.hpp"
+#include "nvs.h"
+#include "nvs_flash.h"
+#include "actuators/parachute_configuration.hpp"
 #include "actuators/production_motor.hpp"
 #include "actuators/safety_core.hpp"
 #include "control/control_pipeline.hpp"
@@ -123,9 +126,46 @@ struct EmergencyEnvelope {
 };
 
 struct ParaRequest {
-  enum class Kind : uint8_t { hold, open, free, power_off } kind{Kind::hold};
+  enum class Kind : uint8_t {
+    open,
+    free,
+    power_off,
+    discard_snapshot,
+  } kind{Kind::power_off};
   uint32_t flight_epoch{};
   bool safety_authorized{};
+};
+
+struct ParachuteCommandRequest {
+  enum class Kind : uint8_t { generic, start_preparation } kind{Kind::generic};
+  protocol::GenericCommandRequest command{};
+};
+
+struct ParachuteStartResponse {
+  uint8_t transaction_id{};
+  protocol::CommandReason reason{protocol::CommandReason::none};
+  uint32_t detail{};
+};
+
+struct ParachutePersistenceRequest {
+  uint8_t transaction_id{};
+  actuators::ParachuteEndpoint endpoint{actuators::ParachuteEndpoint::open};
+  uint16_t count{};
+  bool previous_valid{};
+  uint16_t previous_count{};
+};
+
+struct ParachutePersistenceResponse {
+  enum class Kind : uint8_t { load, save } kind{Kind::load};
+  uint8_t transaction_id{};
+  actuators::ParachuteEndpoint endpoint{actuators::ParachuteEndpoint::open};
+  bool success{};
+  bool persistence_ready{};
+  bool corruption_detected{};
+  bool open_valid{};
+  uint16_t open_count{};
+  bool close_valid{};
+  uint16_t close_count{};
 };
 
 struct RecoveryRequest {
@@ -159,6 +199,10 @@ StaticQueue_t transition_queue_storage;
 StaticQueue_t emergency_queue_storage;
 StaticQueue_t result_queue_storage;
 StaticQueue_t para_queue_storage;
+StaticQueue_t parachute_command_queue_storage;
+StaticQueue_t parachute_start_response_queue_storage;
+StaticQueue_t parachute_persistence_request_queue_storage;
+StaticQueue_t parachute_persistence_response_queue_storage;
 StaticQueue_t air_data_queue_storage;
 StaticQueue_t recovery_queue_storage;
 StaticQueue_t recovery_status_queue_storage;
@@ -174,6 +218,14 @@ std::array<uint8_t, sizeof(EmergencyEnvelope) * 16> emergency_queue_buffer{};
 std::array<uint8_t, sizeof(protocol::CommandResult) * 32>
     result_queue_buffer{};
 std::array<uint8_t, sizeof(ParaRequest) * 4> para_queue_buffer{};
+std::array<uint8_t, sizeof(ParachuteCommandRequest) * 8>
+    parachute_command_queue_buffer{};
+std::array<uint8_t, sizeof(ParachuteStartResponse) * 2>
+    parachute_start_response_queue_buffer{};
+std::array<uint8_t, sizeof(ParachutePersistenceRequest) * 4>
+    parachute_persistence_request_queue_buffer{};
+std::array<uint8_t, sizeof(ParachutePersistenceResponse) * 4>
+    parachute_persistence_response_queue_buffer{};
 std::array<uint8_t, sizeof(AirDataSnapshot)> air_data_queue_buffer{};
 std::array<uint8_t, sizeof(RecoveryRequest) * 4> recovery_queue_buffer{};
 std::array<uint8_t, sizeof(protocol::RecoveryStatusMessage) * 4>
@@ -187,6 +239,10 @@ QueueHandle_t transition_queue{};
 QueueHandle_t emergency_queue{};
 QueueHandle_t result_queue{};
 QueueHandle_t para_queue{};
+QueueHandle_t parachute_command_queue{};
+QueueHandle_t parachute_start_response_queue{};
+QueueHandle_t parachute_persistence_request_queue{};
+QueueHandle_t parachute_persistence_response_queue{};
 QueueHandle_t air_data_queue{};
 QueueHandle_t recovery_queue{};
 QueueHandle_t recovery_status_queue{};
@@ -203,6 +259,10 @@ std::atomic<bool> fin_zero_configured{false};
 std::atomic<bool> lps_ready{false};
 std::atomic<bool> ssc_ready{false};
 std::atomic<bool> sts_ready{false};
+std::atomic<bool> parachute_config_load_complete{false};
+std::atomic<bool> parachute_persistence_ready{false};
+std::atomic<bool> parachute_open_configured{false};
+std::atomic<bool> parachute_close_configured{false};
 std::atomic<protocol::ParaMode> para_mode_actual{
     protocol::ParaMode::powered_off};
 std::atomic<bool> can_healthy{false};
@@ -438,18 +498,62 @@ void parachuteTask(void *) {
   STSCREATE bus;
   STS3215 servo;
   actuators::ParachuteController controller;
+  actuators::ParachuteConfigurationState configuration;
+  bool mission_state_known = false;
+  bool restored_flight = false;
+  if (xSemaphoreTake(state_mutex, pdMS_TO_TICKS(2)) == pdTRUE) {
+    mission_state_known = true;
+    const auto state = state_machine.snapshot().state;
+    restored_flight = state == protocol::MissionState::engine_burn ||
+                      state == protocol::MissionState::control ||
+                      state == protocol::MissionState::descent;
+    xSemaphoreGive(state_mutex);
+  }
+  if (restored_flight) {
+    actuators::FlightParachuteConfiguration restored{
+        *actuators::AbsoluteParachuteAngle::fromCount(0),
+        *actuators::AbsoluteParachuteAngle::fromCount(0)};
+    if (recovery_boot::loadFlightParachuteConfiguration(restored))
+      configuration.restoreFlightSnapshot(restored);
+  } else if (mission_state_known) {
+    recovery_boot::clearFlightParachuteConfiguration();
+  }
 
-  enum class DesiredState : uint8_t { powered_off, close_and_hold, open };
+  enum class DesiredState : uint8_t { powered_off, holding, open };
   DesiredState desired = DesiredState::powered_off;
+  enum class OperationStage : uint8_t {
+    initialize,
+    moving,
+    waiting_persistence,
+    finishing,
+  };
+  struct PendingOperation {
+    bool active{};
+    bool interrupted{};
+    ParachuteCommandRequest request{};
+    OperationStage stage{OperationStage::initialize};
+    uint64_t started_at_us{};
+    protocol::CommandReason result{protocol::CommandReason::none};
+    uint32_t detail{};
+    std::optional<actuators::AbsoluteParachuteAngle> target{};
+    actuators::ParachuteConfiguration candidate{};
+  } pending;
   uint32_t active_epoch = 0;
   uint64_t power_enabled_at_us = 0;
   uint64_t next_initialization_attempt_us = 0;
   uint64_t open_requested_at_us = 0;
   bool power_enabled = false;
   bool mode_prepared = false;
-  bool close_command_sent = false;
-  bool close_hold_confirmed = false;
   bool controller_started = false;
+  esp_err_t last_initialization_error = ESP_ERR_INVALID_STATE;
+
+  constexpr uint32_t kDetailExactHalfTurn = 1;
+  constexpr uint32_t kDetailInvalidPosition = 2;
+  constexpr uint32_t kDetailConfigurationLoad = 3;
+  constexpr uint32_t kDetailQueueUnavailable = 4;
+  const int16_t target_tolerance_count = static_cast<int16_t>(std::ceil(
+      flight_config::kParachute.target_tolerance_deg /
+      actuators::kParachuteDegreesPerCount));
 
   auto queuePower = [](const PowerRequest &request) {
     if (xQueueSend(power_queue, &request, 0) == pdTRUE)
@@ -483,9 +587,8 @@ void parachuteTask(void *) {
     open_requested_at_us = 0;
     power_enabled = false;
     mode_prepared = false;
-    close_command_sent = false;
-    close_hold_confirmed = false;
     controller_started = false;
+    last_initialization_error = ESP_ERR_INVALID_STATE;
   };
 
   auto requestPower = [&](uint64_t now_us) {
@@ -529,28 +632,39 @@ void parachuteTask(void *) {
           avi::Timeout::milliseconds(board::kParaTxTimeoutMs);
       config.response_timeout =
           avi::Timeout::milliseconds(board::kParaResponseTimeoutMs);
-      if (bus.begin(config) != ESP_OK)
+      last_initialization_error = bus.begin(config);
+      if (last_initialization_error != ESP_OK)
         return false;
     }
-    if (!servo.initialized() &&
-        servo.begin(bus, board::kParaServoId) != ESP_OK)
-      return false;
+    if (!servo.initialized()) {
+      last_initialization_error = servo.begin(bus, board::kParaServoId);
+      if (last_initialization_error != ESP_OK)
+        return false;
+    }
     if (!servo.configurationValid()) {
       // 不完全な初期化状態を保持せず、次回retryでbeginからやり直す。
       (void)servo.end();
+      last_initialization_error = ESP_ERR_INVALID_RESPONSE;
       return false;
     }
     if (!mode_prepared) {
-      if (servo.verifyOperatingMode(STS3215::OperatingMode::position) !=
-              ESP_OK &&
-          servo.setOperatingMode(
-              STS3215::OperatingMode::position,
-              STS3215::Persistence::volatile_only) != ESP_OK)
+      last_initialization_error =
+          servo.verifyOperatingMode(STS3215::OperatingMode::step);
+      if (last_initialization_error != ESP_OK)
+        last_initialization_error = servo.configureStepMode(
+            STS3215::Persistence::volatile_only);
+      if (last_initialization_error == ESP_OK)
+        last_initialization_error = servo.setFeedbackMode(
+            STS3215::FeedbackMode::single_turn,
+            STS3215::Persistence::volatile_only);
+      if (last_initialization_error != ESP_OK)
         return false;
       mode_prepared =
-          servo.verifyOperatingMode(STS3215::OperatingMode::position) ==
+          servo.verifyOperatingMode(STS3215::OperatingMode::step) ==
           ESP_OK;
     }
+    last_initialization_error =
+        mode_prepared ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
     sts_ready.store(mode_prepared, std::memory_order_release);
     return mode_prepared;
   };
@@ -565,15 +679,133 @@ void parachuteTask(void *) {
     return result;
   };
 
+  auto updateConfigurationMirrors = [&]() {
+    parachute_open_configured.store(configuration.active().openConfigured(),
+                                    std::memory_order_release);
+    parachute_close_configured.store(configuration.active().closeConfigured(),
+                                     std::memory_order_release);
+  };
+
+  auto commandReasonForSts = [](esp_err_t result) {
+    return result == ESP_ERR_TIMEOUT ? protocol::CommandReason::timeout
+                                     : protocol::CommandReason::device_unavailable;
+  };
+
+  auto readCurrent = [&](actuators::AbsoluteParachuteAngle &angle,
+                         bool &moving) {
+    STS3215::RawData data{};
+    const esp_err_t result = servo.readRaw(data);
+    if (result != ESP_OK)
+      return result;
+    const auto current =
+        actuators::AbsoluteParachuteAngle::fromCount(data.position);
+    if (!current.has_value())
+      return ESP_ERR_INVALID_RESPONSE;
+    angle = *current;
+    moving = data.moving;
+    return ESP_OK;
+  };
+
+  auto moveToAbsolute = [&](actuators::AbsoluteParachuteAngle current,
+                            actuators::AbsoluteParachuteAngle target) {
+    const auto displacement =
+        actuators::shortestParachuteDisplacement(current, target);
+    if (!displacement.valid())
+      return ESP_ERR_INVALID_ARG;
+    return servo.moveRelativeDegrees(
+        static_cast<float>(displacement.degrees()), motion());
+  };
+
+  auto requestFinish = [&](protocol::CommandReason reason,
+                           uint32_t detail = 0) {
+    if (reason != protocol::CommandReason::none &&
+        desired == DesiredState::powered_off && power_enabled)
+      powerOff(false, true, protocol::ParaMode::powered_off);
+    pending.result = reason;
+    pending.detail = detail;
+    pending.stage = OperationStage::finishing;
+  };
+
+  auto finishPending = [&]() {
+    if (!pending.active || pending.stage != OperationStage::finishing)
+      return;
+    if (pending.request.kind ==
+        ParachuteCommandRequest::Kind::start_preparation) {
+      const ParachuteStartResponse response{
+          pending.request.command.transaction_id, pending.result,
+          pending.detail};
+      if (xQueueSend(parachute_start_response_queue, &response, 0) == pdTRUE)
+        pending = {};
+      return;
+    }
+    if (pending.interrupted) {
+      pending = {};
+      return;
+    }
+    if (xSemaphoreTake(executor_mutex, 0) != pdTRUE)
+      return;
+    const auto result = command_executor.finish(
+        pending.request.command.transaction_id,
+        pending.result == protocol::CommandReason::none
+            ? protocol::CommandPhase::completed
+            : protocol::CommandPhase::failed,
+        pending.result, pending.detail);
+    xSemaphoreGive(executor_mutex);
+    // Emergencyが先にtransactionを終端した場合は二重resultを送らない。
+    if (result.command != 0)
+      enqueueResult(result, false);
+    pending = {};
+  };
+
   for (;;) {
     if (recovery_requested.load(std::memory_order_acquire) &&
         desired != DesiredState::powered_off)
       powerOff(false, false, protocol::ParaMode::powered_off);
 
+    ParachutePersistenceResponse persistence_response{};
+    while (xQueueReceive(parachute_persistence_response_queue,
+                         &persistence_response, 0) == pdTRUE) {
+      if (persistence_response.kind ==
+          ParachutePersistenceResponse::Kind::load) {
+        actuators::ParachuteConfiguration loaded{};
+        if (persistence_response.open_valid)
+          loaded.open = actuators::AbsoluteParachuteAngle::fromCount(
+              persistence_response.open_count);
+        if (persistence_response.close_valid)
+          loaded.close = actuators::AbsoluteParachuteAngle::fromCount(
+              persistence_response.close_count);
+        configuration.replaceLoadedConfiguration(loaded);
+        updateConfigurationMirrors();
+        parachute_persistence_ready.store(
+            persistence_response.persistence_ready,
+            std::memory_order_release);
+        parachute_config_load_complete.store(true, std::memory_order_release);
+        continue;
+      }
+      if (!pending.active ||
+          pending.stage != OperationStage::waiting_persistence ||
+          pending.request.command.transaction_id !=
+              persistence_response.transaction_id)
+        continue;
+      if (persistence_response.success) {
+        // Emergency後でもcommit済みならRAMをNVSへ合わせ、Completedは送らない。
+        configuration.activatePersistedCandidate(pending.candidate);
+        updateConfigurationMirrors();
+        if (!pending.interrupted)
+          powerOff(false, true, protocol::ParaMode::powered_off);
+        requestFinish(protocol::CommandReason::none);
+      } else {
+        if (!pending.interrupted)
+          powerOff(false, true, protocol::ParaMode::powered_off);
+        requestFinish(protocol::CommandReason::persistence_error);
+      }
+    }
+
     ParaRequest request{};
     while (xQueueReceive(para_queue, &request, 0) == pdTRUE) {
       if (request.kind == ParaRequest::Kind::free ||
-          request.kind == ParaRequest::Kind::power_off) {
+          request.kind == ParaRequest::Kind::power_off ||
+          request.kind == ParaRequest::Kind::discard_snapshot) {
         bool current_request = request.safety_authorized ||
                                request.flight_epoch == 0;
         if (!current_request && xSemaphoreTake(state_mutex, 0) == pdTRUE) {
@@ -585,12 +817,28 @@ void parachuteTask(void *) {
           break;
         }
         if (current_request) {
+          if (request.kind == ParaRequest::Kind::discard_snapshot) {
+            configuration.discardFlightSnapshot();
+            recovery_boot::clearFlightParachuteConfiguration();
+          }
           const bool free_requested = request.kind == ParaRequest::Kind::free;
           const bool absolute_cutoff =
-              !free_requested && request.safety_authorized;
+              request.kind == ParaRequest::Kind::power_off &&
+              request.safety_authorized;
           const bool preserve_auxiliary_5v =
               !absolute_cutoff &&
               !recovery_requested.load(std::memory_order_acquire);
+          if (free_requested && pending.active) {
+            if (pending.request.kind ==
+                ParachuteCommandRequest::Kind::start_preparation) {
+              requestFinish(
+                  protocol::CommandReason::interrupted_by_emergency);
+            } else {
+              pending.interrupted = true;
+              if (pending.stage != OperationStage::waiting_persistence)
+                pending = {};
+            }
+          }
           powerOff(absolute_cutoff, preserve_auxiliary_5v,
                    free_requested ? protocol::ParaMode::free
                                   : protocol::ParaMode::powered_off);
@@ -616,129 +864,329 @@ void parachuteTask(void *) {
 
       const uint64_t now_us = static_cast<uint64_t>(esp_timer_get_time());
       const bool same_epoch = active_epoch == request.flight_epoch;
-      // 同一flightでOpenへ進んだ後は、遅延したHold要求で収納方向へ戻さない。
-      // SafetyTaskとFSMからの重複Openも無視し、最初の5秒deadlineを延長しない。
+      // SafetyTaskとFSMからの重複Openでは最初の5秒deadlineを延長しない。
       if (same_epoch && desired == DesiredState::open)
         continue;
-      if (same_epoch && desired == DesiredState::close_and_hold &&
-          request.kind == ParaRequest::Kind::hold)
+      if (!configuration.flightSnapshotValid()) {
+        std::printf("parachute open rejected: flight snapshot unavailable\n");
+        powerOff(false, true, protocol::ParaMode::powered_off);
         continue;
-
-      active_epoch = request.flight_epoch;
-      if (request.kind == ParaRequest::Kind::hold) {
-        desired = DesiredState::close_and_hold;
-        close_command_sent = false;
-        close_hold_confirmed = false;
-        controller_started = false;
-      } else {
-        desired = DesiredState::open;
-        open_requested_at_us = now_us;
-        controller = actuators::ParachuteController{};
-        controller_started = false;
       }
+      active_epoch = request.flight_epoch;
+      desired = DesiredState::open;
+      open_requested_at_us = now_us;
+      controller = actuators::ParachuteController{};
+      controller_started = false;
       if (requestPower(now_us)) {
-        para_mode_actual.store(
-            desired == DesiredState::open
-                ? protocol::ParaMode::opening_or_retrying
-                : protocol::ParaMode::closing,
-            std::memory_order_release);
+        para_mode_actual.store(protocol::ParaMode::opening_or_retrying,
+                               std::memory_order_release);
       } else {
         para_mode_actual.store(protocol::ParaMode::powered_off,
                                std::memory_order_release);
       }
     }
 
+    if (!pending.active) {
+      ParachuteCommandRequest command_request{};
+      if (xQueueReceive(parachute_command_queue, &command_request, 0) ==
+          pdTRUE) {
+        pending.active = true;
+        pending.request = command_request;
+        pending.started_at_us =
+            static_cast<uint64_t>(esp_timer_get_time());
+        const auto code = static_cast<mission::CommandCode>(
+            command_request.command.command);
+        if (command_request.kind == ParachuteCommandRequest::Kind::generic &&
+            code == mission::CommandCode::para_free) {
+          powerOff(false, true, protocol::ParaMode::free);
+          requestFinish(protocol::CommandReason::none);
+        } else if (command_request.kind ==
+                       ParachuteCommandRequest::Kind::generic &&
+                   (code == mission::CommandCode::para_open ||
+                    code == mission::CommandCode::para_close) &&
+                   !parachute_config_load_complete.load(
+                       std::memory_order_acquire)) {
+          requestFinish(protocol::CommandReason::busy,
+                        kDetailConfigurationLoad);
+        } else if (command_request.kind ==
+                       ParachuteCommandRequest::Kind::generic &&
+                   (code == mission::CommandCode::para_open ||
+                    code == mission::CommandCode::para_close) &&
+                   !parachute_persistence_ready.load(
+                       std::memory_order_acquire)) {
+          requestFinish(protocol::CommandReason::persistence_error,
+                        kDetailConfigurationLoad);
+        } else if (command_request.kind ==
+                       ParachuteCommandRequest::Kind::generic &&
+                   code == mission::CommandCode::para_open &&
+                   !configuration.active().openConfigured()) {
+          requestFinish(protocol::CommandReason::not_configured);
+        } else if (command_request.kind ==
+                       ParachuteCommandRequest::Kind::generic &&
+                   code == mission::CommandCode::para_close &&
+                   !configuration.active().closeConfigured()) {
+          requestFinish(protocol::CommandReason::not_configured);
+        } else if (!requestPower(pending.started_at_us)) {
+          requestFinish(protocol::CommandReason::busy,
+                        kDetailQueueUnavailable);
+        }
+      }
+    }
+
     const uint64_t now_us = static_cast<uint64_t>(esp_timer_get_time());
-    if (desired != DesiredState::powered_off) {
+    if (pending.active && pending.stage == OperationStage::initialize) {
+      if (initializeServo(now_us)) {
+        auto current = *actuators::AbsoluteParachuteAngle::fromCount(0);
+        bool moving = false;
+        const esp_err_t read = readCurrent(current, moving);
+        sts_ready.store(read == ESP_OK, std::memory_order_release);
+        if (read != ESP_OK) {
+          requestFinish(commandReasonForSts(read), kDetailInvalidPosition);
+        } else if (pending.request.kind ==
+                   ParachuteCommandRequest::Kind::start_preparation) {
+          const esp_err_t hold = servo.holdCurrentPosition(
+              {STS3215::TorqueLimit::percent(
+                  flight_config::kParachute.torque_limit_percent)});
+          sts_ready.store(hold == ESP_OK, std::memory_order_release);
+          if (hold != ESP_OK) {
+            requestFinish(commandReasonForSts(hold));
+          } else {
+            desired = DesiredState::holding;
+            para_mode_actual.store(protocol::ParaMode::hold,
+                                   std::memory_order_release);
+          }
+          if (hold == ESP_OK &&
+              !parachute_config_load_complete.load(
+                         std::memory_order_acquire)) {
+            requestFinish(protocol::CommandReason::busy,
+                          kDetailConfigurationLoad);
+          } else if (hold == ESP_OK &&
+                     !parachute_persistence_ready.load(
+                         std::memory_order_acquire)) {
+            requestFinish(protocol::CommandReason::persistence_error,
+                          kDetailConfigurationLoad);
+          } else if (hold == ESP_OK) {
+            const auto prepared = configuration.freezeFlightSnapshot(current);
+            if (!prepared.ready()) {
+              requestFinish(protocol::CommandReason::not_configured,
+                            static_cast<uint32_t>(prepared.error));
+            } else {
+              recovery_boot::storeFlightParachuteConfiguration(
+                  *configuration.flightSnapshot());
+              requestFinish(protocol::CommandReason::none);
+            }
+          }
+        } else {
+          const auto code = static_cast<mission::CommandCode>(
+              pending.request.command.command);
+          if (code == mission::CommandCode::para_hold) {
+            const esp_err_t hold = servo.holdCurrentPosition(
+                {STS3215::TorqueLimit::percent(
+                    flight_config::kParachute.torque_limit_percent)});
+            sts_ready.store(hold == ESP_OK, std::memory_order_release);
+            if (hold == ESP_OK) {
+              desired = DesiredState::holding;
+              para_mode_actual.store(protocol::ParaMode::hold,
+                                     std::memory_order_release);
+            }
+            requestFinish(hold == ESP_OK ? protocol::CommandReason::none
+                                         : commandReasonForSts(hold));
+          } else if (code == mission::CommandCode::set_para_open ||
+                     code == mission::CommandCode::set_para_close) {
+            if (!parachute_config_load_complete.load(
+                    std::memory_order_acquire)) {
+              requestFinish(protocol::CommandReason::busy,
+                            kDetailConfigurationLoad);
+            } else if (!parachute_persistence_ready.load(
+                           std::memory_order_acquire)) {
+              requestFinish(protocol::CommandReason::persistence_error,
+                            kDetailConfigurationLoad);
+            } else {
+              const auto endpoint =
+                  code == mission::CommandCode::set_para_open
+                      ? actuators::ParachuteEndpoint::open
+                      : actuators::ParachuteEndpoint::close;
+              pending.candidate = configuration.candidateWith(endpoint, current);
+              const auto previous = endpoint == actuators::ParachuteEndpoint::open
+                                        ? configuration.active().open
+                                        : configuration.active().close;
+              const ParachutePersistenceRequest save{
+                  pending.request.command.transaction_id, endpoint,
+                  current.count(), previous.has_value(),
+                  previous.has_value() ? previous->count() : uint16_t{0}};
+              if (xQueueSend(parachute_persistence_request_queue, &save, 0) ==
+                  pdTRUE) {
+                pending.stage = OperationStage::waiting_persistence;
+              } else {
+                requestFinish(protocol::CommandReason::busy,
+                              kDetailQueueUnavailable);
+              }
+            }
+          } else if (code == mission::CommandCode::para_open ||
+                     code == mission::CommandCode::para_close) {
+            pending.target = code == mission::CommandCode::para_open
+                                 ? configuration.active().open
+                                 : configuration.active().close;
+            if (!pending.target.has_value()) {
+              requestFinish(protocol::CommandReason::not_configured);
+            } else {
+              const auto displacement =
+                  actuators::shortestParachuteDisplacement(current,
+                                                           *pending.target);
+              if (!displacement.valid()) {
+                requestFinish(protocol::CommandReason::safety_interlock,
+                              kDetailExactHalfTurn);
+              } else {
+                const esp_err_t move = moveToAbsolute(current, *pending.target);
+                sts_ready.store(move == ESP_OK, std::memory_order_release);
+                if (move == ESP_OK) {
+                  pending.stage = OperationStage::moving;
+                  para_mode_actual.store(
+                      code == mission::CommandCode::para_open
+                          ? protocol::ParaMode::opening_or_retrying
+                          : protocol::ParaMode::closing,
+                      std::memory_order_release);
+                } else {
+                  requestFinish(commandReasonForSts(move));
+                }
+              }
+            }
+          } else if (code == mission::CommandCode::para_move_relative) {
+            const uint16_t raw =
+                static_cast<uint16_t>(pending.request.command.arguments[0]) |
+                static_cast<uint16_t>(pending.request.command.arguments[1])
+                    << 8U;
+            const int16_t tenths = static_cast<int16_t>(raw);
+            const esp_err_t move = servo.moveRelativeDegrees(
+                static_cast<float>(tenths) * 0.1F, motion());
+            sts_ready.store(move == ESP_OK, std::memory_order_release);
+            if (move == ESP_OK) {
+              pending.stage = OperationStage::moving;
+              para_mode_actual.store(protocol::ParaMode::relative_move,
+                                     std::memory_order_release);
+            } else {
+              requestFinish(commandReasonForSts(move));
+            }
+          } else {
+            requestFinish(protocol::CommandReason::not_supported);
+          }
+        }
+      } else if (now_us >= pending.started_at_us &&
+                 now_us - pending.started_at_us >=
+                     static_cast<uint64_t>(
+                         flight_config::kParachute.initialization_deadline_ms) *
+                         1'000ULL) {
+        requestFinish(commandReasonForSts(last_initialization_error));
+      }
+    }
+
+    if (pending.active && pending.stage == OperationStage::moving) {
+      auto current = *actuators::AbsoluteParachuteAngle::fromCount(0);
+      bool moving = false;
+      const esp_err_t read = readCurrent(current, moving);
+      sts_ready.store(read == ESP_OK, std::memory_order_release);
+      if (read != ESP_OK) {
+        requestFinish(commandReasonForSts(read), kDetailInvalidPosition);
+      } else {
+        bool reached = !moving;
+        if (pending.target.has_value()) {
+          const auto displacement = actuators::shortestParachuteDisplacement(
+              current, *pending.target);
+          if (!displacement.valid()) {
+            requestFinish(protocol::CommandReason::safety_interlock,
+                          kDetailExactHalfTurn);
+            reached = false;
+          } else {
+            reached = reached &&
+                      displacement.counts <= target_tolerance_count &&
+                      displacement.counts >= -target_tolerance_count;
+          }
+        }
+        if (reached) {
+          const esp_err_t hold = servo.holdCurrentPosition(
+              {STS3215::TorqueLimit::percent(
+                  flight_config::kParachute.torque_limit_percent)});
+          sts_ready.store(hold == ESP_OK, std::memory_order_release);
+          if (hold == ESP_OK) {
+            desired = DesiredState::holding;
+            para_mode_actual.store(protocol::ParaMode::hold,
+                                   std::memory_order_release);
+          }
+          requestFinish(hold == ESP_OK ? protocol::CommandReason::none
+                                       : commandReasonForSts(hold));
+        } else if (pending.stage == OperationStage::moving &&
+                   now_us >= pending.started_at_us &&
+                   now_us - pending.started_at_us >= 5'000'000) {
+          requestFinish(protocol::CommandReason::timeout);
+        }
+      }
+    }
+
+    if (desired == DesiredState::open && !pending.active) {
       if (!requestPower(now_us)) {
         sts_ready.store(false, std::memory_order_release);
       } else if (initializeServo(now_us)) {
-        para_mode_actual.store(
-            desired == DesiredState::open
-                ? protocol::ParaMode::opening_or_retrying
-                : (close_hold_confirmed ? protocol::ParaMode::hold
-                                        : protocol::ParaMode::closing),
-            std::memory_order_release);
-        if (desired == DesiredState::close_and_hold) {
-          if (!close_command_sent) {
-            const esp_err_t result = servo.moveAbsoluteDegrees(
-                flight_config::kParachute.close_position_deg, motion());
-            close_command_sent = result == ESP_OK;
-            sts_ready.store(result == ESP_OK, std::memory_order_release);
-          }
-          if (close_command_sent && !close_hold_confirmed) {
-            STS3215::Data data{};
-            const esp_err_t read = servo.read(data);
-            sts_ready.store(read == ESP_OK, std::memory_order_release);
-            const bool reached =
-                read == ESP_OK && !data.moving &&
-                std::abs(data.position_deg -
-                         flight_config::kParachute.close_position_deg) <=
-                    flight_config::kParachute.target_tolerance_deg;
-            if (reached) {
-              const esp_err_t hold = servo.holdCurrentPosition(
-                  {STS3215::TorqueLimit::percent(
-                      flight_config::kParachute.torque_limit_percent)});
-              close_hold_confirmed = hold == ESP_OK;
-              sts_ready.store(hold == ESP_OK, std::memory_order_release);
-              if (close_hold_confirmed)
-                para_mode_actual.store(protocol::ParaMode::hold,
-                                       std::memory_order_release);
-            }
-          }
-        } else if (desired == DesiredState::open) {
-          STS3215::Data data{};
-          const esp_err_t read = servo.read(data);
-          sts_ready.store(read == ESP_OK, std::memory_order_release);
-          if (!controller_started && read == ESP_OK) {
+        auto current = *actuators::AbsoluteParachuteAngle::fromCount(0);
+        bool moving = false;
+        const esp_err_t read = readCurrent(current, moving);
+        sts_ready.store(read == ESP_OK, std::memory_order_release);
+        const auto *snapshot = configuration.flightSnapshot();
+        if (snapshot == nullptr) {
+          std::printf("parachute open failed: flight snapshot unavailable\n");
+          powerOff(false, true, protocol::ParaMode::powered_off);
+        } else if (!controller_started && read == ESP_OK) {
+          const auto displacement = actuators::shortestParachuteDisplacement(
+              current, snapshot->open);
+          if (!displacement.valid()) {
+            std::printf("parachute open failed: exact half turn\n");
+            powerOff(false, true, protocol::ParaMode::powered_off);
+          } else {
             controller_started =
-                controller.startOpen(now_us, data.position_deg) ==
+                controller.startOpen(open_requested_at_us, current.count()) ==
                 actuators::ParachuteAction::command_open;
             if (controller_started &&
-                servo.moveAbsoluteDegrees(
-                    flight_config::kParachute.open_position_deg,
-                    motion()) != ESP_OK)
+                moveToAbsolute(current, snapshot->open) != ESP_OK)
               sts_ready.store(false, std::memory_order_release);
           }
-          if (controller_started) {
-            const bool reached =
-                read == ESP_OK && !data.moving &&
-                std::abs(data.position_deg -
-                         flight_config::kParachute.open_position_deg) <=
-                    flight_config::kParachute.target_tolerance_deg;
-            const auto action = controller.tick(
-                {now_us, read == ESP_OK, data.position_deg, reached});
-            if (action == actuators::ParachuteAction::retry_open) {
-              if (servo.moveAbsoluteDegrees(
-                      flight_config::kParachute.open_position_deg,
-                      motion()) != ESP_OK)
-                sts_ready.store(false, std::memory_order_release);
-            } else if (action == actuators::ParachuteAction::cut_power) {
-              // Open試行の5秒deadlineではPara電源だけを切る。
-              // GPIO40/44の絶対cutoff latchは離床+25秒のSafetyTaskだけが行う。
+        }
+        if (controller_started) {
+          bool reached = false;
+          if (read == ESP_OK) {
+            const auto displacement =
+                actuators::shortestParachuteDisplacement(current,
+                                                         snapshot->open);
+            reached = displacement.valid() && !moving &&
+                      displacement.counts <= target_tolerance_count &&
+                      displacement.counts >= -target_tolerance_count;
+          }
+          const auto action = controller.tick(
+              {now_us, read == ESP_OK, current.count(), reached});
+          if (action == actuators::ParachuteAction::retry_open &&
+              read == ESP_OK) {
+            const auto displacement =
+                actuators::shortestParachuteDisplacement(current,
+                                                         snapshot->open);
+            if (!displacement.valid()) {
+              std::printf("parachute retry failed: exact half turn\n");
               powerOff(false, true, protocol::ParaMode::powered_off);
+            } else if (moveToAbsolute(current, snapshot->open) != ESP_OK) {
+              sts_ready.store(false, std::memory_order_release);
             }
+          } else if (action == actuators::ParachuteAction::cut_power) {
+            // Open試行の5秒deadlineではPara電源だけを切る。
+            // GPIO40/44の絶対cutoff latchは離床+25秒のSafetyTaskだけが行う。
+            powerOff(false, true, protocol::ParaMode::powered_off);
           }
         }
       }
-
-      // Controller開始前に通信が成立しない場合も5秒で電源を遮断する。
+      // Controller開始前の初期化失敗も最初のOpen要求から5秒で打ち切る。
       if (desired == DesiredState::open && open_requested_at_us != 0 &&
           now_us >= open_requested_at_us &&
           now_us - open_requested_at_us >= 5'000'000)
         powerOff(false, true, protocol::ParaMode::powered_off);
-
-      // TODO(HW_TEST): 1.5秒以内に初期化できない個体を故障扱いにするか、
-      // Openの5秒deadlineまでretryするかを実機電源条件で確定する。
-      if (desired == DesiredState::close_and_hold && power_enabled_at_us != 0 &&
-          now_us >= power_enabled_at_us &&
-          now_us - power_enabled_at_us >=
-              static_cast<uint64_t>(
-                  flight_config::kParachute.initialization_deadline_ms) *
-                  1'000ULL &&
-          !servo.initialized())
-        sts_ready.store(false, std::memory_order_release);
     }
+
+    finishPending();
 
     if (!servo.initialized())
       sts_ready.store(false, std::memory_order_release);
@@ -800,6 +1248,8 @@ void missionRealtimeTask(void *) {
   double fin_rate_rad_s = 0.0;
   bool fin_rate_valid = false;
   uint64_t control_tick = 0;
+  MissionCommandEnvelope pending_start{};
+  bool start_preparation_pending = false;
   std::printf("MissionRealtimeTask spi begin start\n");
   const esp_err_t spi_result = spi.begin();
   std::printf("MissionRealtimeTask spi begin result=%s\n",
@@ -919,6 +1369,57 @@ void missionRealtimeTask(void *) {
       (void)motor_driver.coast();
     }
 
+    ParachuteStartResponse start_response{};
+    while (xQueueReceive(parachute_start_response_queue, &start_response, 0) ==
+           pdTRUE) {
+      if (!start_preparation_pending ||
+          start_response.transaction_id !=
+              pending_start.request.transaction_id)
+        continue;
+      if (xSemaphoreTake(executor_mutex, 0) != pdTRUE) {
+        (void)xQueueSendToFront(parachute_start_response_queue,
+                                &start_response, 0);
+        break;
+      }
+      if (xSemaphoreTake(state_mutex, 0) != pdTRUE) {
+        xSemaphoreGive(executor_mutex);
+        (void)xQueueSendToFront(parachute_start_response_queue,
+                                &start_response, 0);
+        break;
+      }
+      protocol::CommandReason reason = start_response.reason;
+      if (reason == protocol::CommandReason::none) {
+        const mission::SequenceConfiguration configuration{
+            fin_zero_configured.load(std::memory_order_acquire),
+            parachute_open_configured.load(std::memory_order_acquire),
+            parachute_close_configured.load(std::memory_order_acquire), true};
+        const auto transition = state_machine.startSequence(
+            static_cast<uint64_t>(esp_timer_get_time()), configuration);
+        reason = transitionReason(transition);
+        if (transition == mission::TransitionResult::completed) {
+          actuator_output_inhibited.store(false, std::memory_order_release);
+        } else {
+          const ParaRequest discard{ParaRequest::Kind::discard_snapshot, 0,
+                                    false};
+          (void)xQueueSendToFront(para_queue, &discard, 0);
+        }
+      } else {
+        const ParaRequest discard{ParaRequest::Kind::discard_snapshot, 0,
+                                  false};
+        (void)xQueueSendToFront(para_queue, &discard, 0);
+      }
+      xSemaphoreGive(state_mutex);
+      const auto final = command_executor.finish(
+          pending_start.request.transaction_id,
+          reason == protocol::CommandReason::none
+              ? protocol::CommandPhase::completed
+              : protocol::CommandPhase::failed,
+          reason, start_response.detail);
+      xSemaphoreGive(executor_mutex);
+      enqueueResult(final, false);
+      start_preparation_pending = false;
+    }
+
     MissionCommandEnvelope command_envelope{};
     while (xQueueReceive(transition_queue, &command_envelope, 0) == pdTRUE) {
       if (xSemaphoreTake(executor_mutex, 0) != pdTRUE) {
@@ -941,42 +1442,44 @@ void missionRealtimeTask(void *) {
       const auto before_transition = state_machine.snapshot();
       ParaRequest post_transition_para{};
       bool post_transition_para_valid = false;
+      bool asynchronous_transition = false;
+      protocol::CommandReason direct_reason = protocol::CommandReason::none;
       if (code == mission::CommandCode::cancel_sequence) {
         transition = state_machine.cancelSequence();
         if (transition == mission::TransitionResult::completed) {
-          post_transition_para = {ParaRequest::Kind::power_off,
+          post_transition_para = {ParaRequest::Kind::discard_snapshot,
                                   before_transition.flight_epoch, false};
           post_transition_para_valid = true;
         }
       } else if (code == mission::CommandCode::disable_fin_control) {
         transition = state_machine.disableFinControl();
       } else if (code == mission::CommandCode::start_sequence) {
-        transition = state_machine.startSequence(
-            static_cast<uint64_t>(esp_timer_get_time()),
-            flight_config::kSequenceConfiguration);
-        if (transition == mission::TransitionResult::completed) {
-          const auto started = state_machine.snapshot();
-          post_transition_para = {ParaRequest::Kind::hold,
-                                  started.flight_epoch, false};
-          if (xQueueSend(para_queue, &post_transition_para, 0) != pdTRUE) {
-            // Para close/holdを開始できない状態でsequenceだけ進めない。
-            (void)state_machine.cancelSequence();
-            transition = mission::TransitionResult::not_configured;
-          } else {
-            post_transition_para_valid = false;
-            actuator_output_inhibited.store(false,
-                                             std::memory_order_release);
-          }
+        const ParachuteCommandRequest preparation{
+            ParachuteCommandRequest::Kind::start_preparation,
+            command_envelope.request};
+        if (!start_preparation_pending &&
+            xQueueSend(parachute_command_queue, &preparation, 0) == pdTRUE) {
+          pending_start = command_envelope;
+          start_preparation_pending = true;
+          asynchronous_transition = true;
+        } else {
+          direct_reason = protocol::CommandReason::busy;
         }
       }
       const auto transition_state = state_machine.snapshot().state;
       xSemaphoreGive(state_mutex);
+      if (asynchronous_transition) {
+        xSemaphoreGive(executor_mutex);
+        continue;
+      }
       if (post_transition_para_valid &&
           xQueueSendToFront(para_queue, &post_transition_para, 0) != pdTRUE) {
         // Cancel後の電源OFFはqueue飽和時も物理出力へ直接反映する。
         (void)bringup::safe_outputs::setParaPower(false);
       }
-      const auto reason = transitionReason(transition);
+      const auto reason = direct_reason == protocol::CommandReason::none
+                              ? transitionReason(transition)
+                              : direct_reason;
       const auto final = command_executor.finish(
           command_envelope.request.transaction_id,
           reason == protocol::CommandReason::none
@@ -1528,7 +2031,10 @@ void missionRealtimeTask(void *) {
         (board::kFlightMotorA.parameters_valid ? (1U << 0U) : 0U) |
         (fin_zero_configured.load(std::memory_order_acquire) ? (1U << 1U)
                                                              : 0U) |
-        (flight_config::kParachute.ready() ? (1U << 2U) : 0U) |
+        (parachute_open_configured.load(std::memory_order_acquire) &&
+                 parachute_close_configured.load(std::memory_order_acquire)
+             ? (1U << 2U)
+             : 0U) |
         (latest_air_data.ssc_zero_valid ? (1U << 3U) : 0U) |
         (1U << 7U);
     (void)xQueueOverwrite(status_queue, &status);
@@ -2131,7 +2637,8 @@ void commandWorkerTask(void *) {
           encoder_ready.load(std::memory_order_acquire) &&
           motor_ready.load(std::memory_order_acquire) &&
           fin_zero_configured.load(std::memory_order_acquire);
-      context.parachute_available = false;
+      // 入口ではSTS接続状態ではなく、owner taskへの経路だけを判定する。
+      context.parachute_available = parachute_command_queue != nullptr;
       context.fin_safe_commands_supported = false;
       if (xSemaphoreTake(executor_mutex, pdMS_TO_TICKS(2)) != pdTRUE) {
         const protocol::CommandResult busy{
@@ -2145,8 +2652,22 @@ void commandWorkerTask(void *) {
       envelope.decision = command_executor.begin(envelope.request, context);
       xSemaphoreGive(executor_mutex);
       enqueueResult(envelope.decision.result, false);
-      if (envelope.decision.execute &&
-          xQueueSend(transition_queue, &envelope, 0) != pdTRUE) {
+      QueueHandle_t destination = transition_queue;
+      ParachuteCommandRequest parachute_command{};
+      const bool parachute_domain =
+          envelope.decision.domain == mission::CommandDomain::parachute;
+      if (parachute_domain) {
+        parachute_command = {ParachuteCommandRequest::Kind::generic,
+                             envelope.request};
+        destination = parachute_command_queue;
+      }
+      const BaseType_t queued =
+          !envelope.decision.execute
+              ? pdTRUE
+              : (parachute_domain
+                     ? xQueueSend(destination, &parachute_command, 0)
+                     : xQueueSend(destination, &envelope, 0));
+      if (envelope.decision.execute && queued != pdTRUE) {
         if (xSemaphoreTake(executor_mutex, pdMS_TO_TICKS(2)) == pdTRUE) {
           const auto failed = command_executor.finish(
               envelope.request.transaction_id, protocol::CommandPhase::failed,
@@ -2169,8 +2690,166 @@ void housekeepingTask(void *) {
   }
 }
 
+constexpr char kParachuteNvsNamespace[] = "para_cfg";
+constexpr char kParachuteOpenNvsKey[] = "open_v1";
+constexpr char kParachuteCloseNvsKey[] = "close_v1";
+
+const char *parachuteNvsKey(actuators::ParachuteEndpoint endpoint) {
+  return endpoint == actuators::ParachuteEndpoint::open
+             ? kParachuteOpenNvsKey
+             : kParachuteCloseNvsKey;
+}
+
+esp_err_t loadParachuteEndpoint(nvs_handle_t handle,
+                                actuators::ParachuteEndpoint endpoint,
+                                bool &valid, uint16_t &count,
+                                bool &corrupted) {
+  valid = false;
+  corrupted = false;
+  std::size_t size = 0;
+  esp_err_t result =
+      nvs_get_blob(handle, parachuteNvsKey(endpoint), nullptr, &size);
+  if (result == ESP_ERR_NVS_NOT_FOUND)
+    return ESP_OK;
+  if (result != ESP_OK)
+    return result;
+  if (size != actuators::kParachuteEndpointBlobSize) {
+    corrupted = true;
+    return ESP_OK;
+  }
+  actuators::ParachuteEndpointBlob blob{};
+  result = nvs_get_blob(handle, parachuteNvsKey(endpoint), blob.data(), &size);
+  if (result != ESP_OK)
+    return result;
+  const auto decoded =
+      actuators::decodeParachuteEndpoint(blob.data(), size, endpoint);
+  if (!decoded.valid()) {
+    corrupted = true;
+    return ESP_OK;
+  }
+  valid = true;
+  count = decoded.angle->count();
+  return ESP_OK;
+}
+
+bool verifyParachuteEndpoint(nvs_handle_t handle,
+                             actuators::ParachuteEndpoint endpoint,
+                             uint16_t expected_count) {
+  bool valid = false;
+  bool corrupted = false;
+  uint16_t count = 0;
+  return loadParachuteEndpoint(handle, endpoint, valid, count, corrupted) ==
+             ESP_OK &&
+         valid && !corrupted && count == expected_count;
+}
+
+bool rollbackParachuteEndpoint(
+    nvs_handle_t handle, const ParachutePersistenceRequest &request) {
+  esp_err_t result = ESP_OK;
+  if (request.previous_valid) {
+    const auto previous =
+        actuators::AbsoluteParachuteAngle::fromCount(request.previous_count);
+    if (!previous.has_value())
+      return false;
+    const auto blob =
+        actuators::encodeParachuteEndpoint(request.endpoint, *previous);
+    result = nvs_set_blob(handle, parachuteNvsKey(request.endpoint),
+                          blob.data(), blob.size());
+    if (result == ESP_OK)
+      result = nvs_commit(handle);
+    return result == ESP_OK && verifyParachuteEndpoint(
+                                   handle, request.endpoint,
+                                   request.previous_count);
+  }
+
+  result = nvs_erase_key(handle, parachuteNvsKey(request.endpoint));
+  if (result != ESP_OK && result != ESP_ERR_NVS_NOT_FOUND)
+    return false;
+  if (nvs_commit(handle) != ESP_OK)
+    return false;
+  std::size_t size = 0;
+  return nvs_get_blob(handle, parachuteNvsKey(request.endpoint), nullptr,
+                      &size) == ESP_ERR_NVS_NOT_FOUND;
+}
+
+bool saveParachuteEndpoint(const ParachutePersistenceRequest &request,
+                           bool &rollback_failed) {
+  rollback_failed = false;
+  const auto angle =
+      actuators::AbsoluteParachuteAngle::fromCount(request.count);
+  if (!angle.has_value())
+    return false;
+  nvs_handle_t handle{};
+  if (nvs_open(kParachuteNvsNamespace, NVS_READWRITE, &handle) != ESP_OK)
+    return false;
+  const auto blob =
+      actuators::encodeParachuteEndpoint(request.endpoint, *angle);
+  esp_err_t result = nvs_set_blob(handle, parachuteNvsKey(request.endpoint),
+                                  blob.data(), blob.size());
+  bool candidate_may_be_committed = result == ESP_OK;
+  if (result == ESP_OK)
+    result = nvs_commit(handle);
+  if (result == ESP_OK &&
+      verifyParachuteEndpoint(handle, request.endpoint, request.count)) {
+    nvs_close(handle);
+    return true;
+  }
+  if (candidate_may_be_committed)
+    rollback_failed = !rollbackParachuteEndpoint(handle, request);
+  nvs_close(handle);
+  return false;
+}
+
 void internalFlashTask(void *) {
   addWatchdog();
+  ParachutePersistenceResponse load_response{};
+  load_response.kind = ParachutePersistenceResponse::Kind::load;
+  const esp_err_t nvs_result = nvs_flash_init();
+  load_response.persistence_ready = nvs_result == ESP_OK;
+  if (nvs_result == ESP_OK) {
+    nvs_handle_t handle{};
+    const esp_err_t open_result =
+        nvs_open(kParachuteNvsNamespace, NVS_READONLY, &handle);
+    if (open_result == ESP_OK) {
+      bool open_corrupted = false;
+      bool close_corrupted = false;
+      const esp_err_t open_load = loadParachuteEndpoint(
+          handle, actuators::ParachuteEndpoint::open,
+          load_response.open_valid, load_response.open_count,
+          open_corrupted);
+      const esp_err_t close_load = loadParachuteEndpoint(
+          handle, actuators::ParachuteEndpoint::close,
+          load_response.close_valid, load_response.close_count,
+          close_corrupted);
+      nvs_close(handle);
+      load_response.corruption_detected =
+          open_corrupted || close_corrupted;
+      if (open_corrupted)
+        std::printf("parachute NVS open_v1 corrupted\n");
+      if (close_corrupted)
+        std::printf("parachute NVS close_v1 corrupted\n");
+      if (open_load != ESP_OK)
+        std::printf("parachute NVS open_v1 load failed: %s\n",
+                    esp_err_to_name(open_load));
+      if (close_load != ESP_OK)
+        std::printf("parachute NVS close_v1 load failed: %s\n",
+                    esp_err_to_name(close_load));
+      load_response.persistence_ready =
+          open_load == ESP_OK && close_load == ESP_OK;
+    } else if (open_result != ESP_ERR_NVS_NOT_FOUND) {
+      load_response.persistence_ready = false;
+    }
+  }
+  load_response.success = load_response.persistence_ready;
+  if (!load_response.persistence_ready ||
+      load_response.corruption_detected) {
+    enqueueEvent(protocol::eventFlag(
+                     protocol::MissionEventFlag::persistence_error),
+                 protocol::MissionState::command_receive, 0,
+                 static_cast<uint16_t>(nvs_result));
+  }
+  (void)xQueueSend(parachute_persistence_response_queue, &load_response,
+                   pdMS_TO_TICKS(100));
   mission::RecoveryRuntime recovery;
   bool enter_waiting = false;
   protocol::RecoveryControl enter_request{};
@@ -2193,6 +2872,26 @@ void internalFlashTask(void *) {
         static_cast<uint64_t>(esp_timer_get_time()) + 2'000'000;
   }
   for (;;) {
+    ParachutePersistenceRequest persistence_request{};
+    while (xQueueReceive(parachute_persistence_request_queue,
+                         &persistence_request, 0) == pdTRUE) {
+      bool rollback_failed = false;
+      const bool saved = load_response.persistence_ready &&
+                         saveParachuteEndpoint(persistence_request,
+                                               rollback_failed);
+      const ParachutePersistenceResponse response{
+          ParachutePersistenceResponse::Kind::save,
+          persistence_request.transaction_id, persistence_request.endpoint,
+          saved, load_response.persistence_ready, false};
+      if (!saved) {
+        enqueueEvent(protocol::eventFlag(
+                         protocol::MissionEventFlag::persistence_error),
+                     protocol::MissionState::command_receive, 0,
+                     rollback_failed ? uint16_t{2} : uint16_t{1});
+      }
+      (void)xQueueSend(parachute_persistence_response_queue, &response,
+                       pdMS_TO_TICKS(100));
+    }
     RecoveryRequest request{};
     while (xQueueReceive(recovery_queue, &request, 0) == pdTRUE) {
       protocol::RecoveryStatusCode status =
@@ -2325,6 +3024,22 @@ esp_err_t ProductionRuntime::start() {
   para_queue = xQueueCreateStatic(4, sizeof(ParaRequest),
                                   para_queue_buffer.data(),
                                   &para_queue_storage);
+  parachute_command_queue = xQueueCreateStatic(
+      8, sizeof(ParachuteCommandRequest),
+      parachute_command_queue_buffer.data(),
+      &parachute_command_queue_storage);
+  parachute_start_response_queue = xQueueCreateStatic(
+      2, sizeof(ParachuteStartResponse),
+      parachute_start_response_queue_buffer.data(),
+      &parachute_start_response_queue_storage);
+  parachute_persistence_request_queue = xQueueCreateStatic(
+      4, sizeof(ParachutePersistenceRequest),
+      parachute_persistence_request_queue_buffer.data(),
+      &parachute_persistence_request_queue_storage);
+  parachute_persistence_response_queue = xQueueCreateStatic(
+      4, sizeof(ParachutePersistenceResponse),
+      parachute_persistence_response_queue_buffer.data(),
+      &parachute_persistence_response_queue_storage);
   air_data_queue = xQueueCreateStatic(1, sizeof(AirDataSnapshot),
                                       air_data_queue_buffer.data(),
                                       &air_data_queue_storage);
@@ -2346,7 +3061,11 @@ esp_err_t ProductionRuntime::start() {
   if (status_queue == nullptr || power_queue == nullptr ||
       command_queue == nullptr || emergency_queue == nullptr ||
       transition_queue == nullptr || result_queue == nullptr ||
-      para_queue == nullptr || air_data_queue == nullptr ||
+      para_queue == nullptr || parachute_command_queue == nullptr ||
+      parachute_start_response_queue == nullptr ||
+      parachute_persistence_request_queue == nullptr ||
+      parachute_persistence_response_queue == nullptr ||
+      air_data_queue == nullptr ||
       recovery_queue == nullptr || recovery_status_queue == nullptr ||
       event_queue == nullptr || persistence_queue == nullptr ||
       state_mutex == nullptr || executor_mutex == nullptr ||
