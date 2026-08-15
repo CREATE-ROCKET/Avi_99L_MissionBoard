@@ -4,6 +4,7 @@ if env.IsIntegrationDump():
     Return()
 
 from pathlib import Path
+import os
 import re
 import subprocess
 
@@ -45,6 +46,16 @@ def _require_clean(path: Path, label: str) -> None:
         )
 
 
+def _hardware_approval() -> int:
+    value = os.environ.get("AVI_99L_CHARACTERIZATION_HARDWARE_APPROVED", "0")
+    if value not in ("0", "1"):
+        raise RuntimeError(
+            "characterization provenance: "
+            "AVI_99L_CHARACTERIZATION_HARDWARE_APPROVED must be 0 or 1"
+        )
+    return int(value)
+
+
 project = Path(env.subst("$PROJECT_DIR")).resolve()
 avi_libs = project / "lib" / "Avi_ESP_Libs"
 if not avi_libs.is_dir():
@@ -63,15 +74,18 @@ if expected_avi_sha != avi_sha:
         "characterization provenance: Avi_ESP_Libs checkout does not match "
         f"the MissionBoard gitlink (expected {expected_avi_sha}, actual {avi_sha})"
     )
+approval = _hardware_approval()
 
 env.Append(
     CPPDEFINES=[
         ("AVI_FIRMWARE_GIT_SHA", env.StringifyMacro(firmware_sha)),
         ("AVI_ESP_LIBS_GIT_SHA", env.StringifyMacro(avi_sha)),
+        ("AVI_99L_CHARACTERIZATION_HARDWARE_APPROVED", approval),
     ]
 )
 
 print(
     "characterization provenance: "
-    f"MissionBoard={firmware_sha} Avi_ESP_Libs={avi_sha}"
+    f"MissionBoard={firmware_sha} Avi_ESP_Libs={avi_sha} "
+    f"hardware_approved={approval}"
 )
