@@ -31,7 +31,8 @@ bool finiteState(const RollState &state) {
 TorqueRequest RollController::compute(const RollState &state,
                                       double airspeed_mps,
                                       RollControlAuthority authority,
-                                      const board::ControlAuthorityLimits &limits) const {
+                                      const board::ControlAuthorityLimits &limits,
+                                      RollVerificationMode verification_mode) const {
   const double output_limit_nm =
       authority == RollControlAuthority::gentle
           ? limits.roll_control_gentle_limit_Nm
@@ -78,6 +79,11 @@ TorqueRequest RollController::compute(const RollState &state,
   }
   if (!std::isfinite(torque))
     return {};
+  // The matched Control-OFF path deliberately runs the same state, schedule,
+  // lookup and finite-value validation above.  Its only changed condition is
+  // the final requested torque.
+  if (verification_mode == RollVerificationMode::matched_control_off)
+    return {0.0, false, true};
   bool saturated = false;
   torque = clampMagnitude(torque, output_limit_nm, saturated);
   return {torque, saturated, true};

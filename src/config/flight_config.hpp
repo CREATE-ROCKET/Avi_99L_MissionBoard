@@ -31,7 +31,9 @@ struct ParachuteConfig {
 };
 
 struct AirDataConfig {
-  // Firmwareが変換に使うsource nominal。plant truthと共用しない。
+  // Firmwareが変換に使うsource nominal pressure correction coefficient。
+  // Saint-Venantの圧力比ではK^2*q_c/P_sとして適用し、速度へ後掛けしない。
+  // Simulation plant truthとは共用しない。
   double pitot_coefficient_assumed{};
   // 飛行中に同定せず、robustness診断の範囲として保持する。
   double pitot_coefficient_true_min{};

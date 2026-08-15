@@ -25,7 +25,7 @@ struct AirspeedComputation {
 computeSaintVenantAirspeed(double static_pressure_pa,
                           double differential_pressure_pa,
                           double temperature_celsius,
-                          double pitot_coefficient);
+                          double pitot_pressure_correction_coefficient);
 
 struct ConditionedDifferentialPressure {
   double pressure_pa{};

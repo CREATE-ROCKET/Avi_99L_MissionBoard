@@ -391,6 +391,11 @@ void testMissionStateMachine() {
   control.tick({9'002'000, false, false, unavailable});
   assert(control.snapshot().state == MissionState::engine_burn);
   assert(control.snapshot().control_reentry_inhibited);
+  assert(control.snapshot().fin == FinDirective::zero_hold);
+  auto fin_unavailable = unavailable;
+  fin_unavailable.fin_control_available = false;
+  control.tick({9'003'000, false, false, fin_unavailable});
+  assert(control.snapshot().fin == FinDirective::brake);
   control.tick({10'000'000, false, false, readyControl()});
   assert(control.snapshot().state == MissionState::engine_burn);
   assert(control.snapshot().control_roll_reference_capture_event_sequence ==
@@ -407,6 +412,23 @@ void testMissionStateMachine() {
   gate_failure.tick({9'100'000, false, false, readyControl()});
   assert(gate_failure.snapshot().state == MissionState::engine_burn);
   assert(!gate_failure.snapshot().control_roll_reference_valid);
+
+  for (int loss_case = 0; loss_case < 2; ++loss_case) {
+    MissionStateMachine loss;
+    assert(loss.startSequence(0, ready) == TransitionResult::completed);
+    loss.tick({2'000'000, true, false, readyControl()});
+    loss.tick({9'000'000, false, false, readyControl(), 9'000});
+    auto lost_input = readyControl();
+    if (loss_case == 0)
+      lost_input.lps_available = false;
+    else
+      lost_input.attitude_fresh = false;
+    loss.tick({9'001'000, false, false, lost_input, 9'001});
+    assert(loss.snapshot().state == MissionState::engine_burn);
+    assert(loss.snapshot().control_reentry_inhibited);
+    loss.tick({9'100'000, false, false, readyControl(), 9'100});
+    assert(loss.snapshot().state == MissionState::engine_burn);
+  }
 
   MissionStateMachine stale_reference;
   assert(stale_reference.startSequence(0, ready) ==
@@ -609,6 +631,9 @@ void testSensors() {
          AvailabilityReason::available);
   assert(sample.availability(30'001, 20'000) ==
          AvailabilityReason::stale);
+  sample.publish(1.0, 40'000);
+  assert(sample.availability(39'999, 20'000) ==
+         AvailabilityReason::stale);
   sample.setPowered(false);
   assert(sample.availability(20'000, 20'000) ==
          AvailabilityReason::powered_off);
@@ -621,6 +646,10 @@ void testSensors() {
     assert(gate.update(true, 60.0));
   assert(!gate.update(true, 60.0));
   assert(!gate.update(false, 100.0));
+  for (int index = 0; index < 49; ++index)
+    assert(!gate.update(true, 61.0));
+  assert(!gate.update(true, NAN));
+  assert(!gate.aboveThreshold());
 
   sensors::ImuLiftoffDetector imu_liftoff;
   for (int index = 0; index < 68; ++index)
@@ -653,6 +682,18 @@ void testSensors() {
   conditioned = conditioner.update(7.0);
   assert(conditioned.valid &&
          std::abs(conditioned.pressure_pa - 3.0) < 1.0e-12);
+  const auto pressure_domain_filtered_speed =
+      sensors::computeSaintVenantAirspeed(101325.0, conditioned.pressure_pa,
+                                          20.0, 0.92);
+  const auto speed_at_2_pa =
+      sensors::computeSaintVenantAirspeed(101325.0, 2.0, 20.0, 0.92);
+  const auto speed_at_4_pa =
+      sensors::computeSaintVenantAirspeed(101325.0, 4.0, 20.0, 0.92);
+  assert(pressure_domain_filtered_speed.valid && speed_at_2_pa.valid &&
+         speed_at_4_pa.valid);
+  assert(std::abs(pressure_domain_filtered_speed.airspeed_mps -
+                  (speed_at_2_pa.airspeed_mps + speed_at_4_pa.airspeed_mps) /
+                      2.0) > 1.0e-6);
   conditioned = conditioner.update(1.5);
   assert(conditioned.negative_beyond_tolerance && !conditioned.valid);
 
@@ -663,6 +704,20 @@ void testSensors() {
       101325.0, 100.0, 20.0, 0.92);
   assert(positive_speed.valid && positive_speed.airspeed_mps > 10.0 &&
          positive_speed.airspeed_mps < 20.0);
+  constexpr double gamma = 1.4;
+  constexpr double gas_constant = 287.05;
+  const double temperature_kelvin = 20.0 + 273.15;
+  const double expected_pressure_corrected_speed =
+      std::sqrt(2.0 * gamma / (gamma - 1.0) * gas_constant *
+                temperature_kelvin *
+                std::expm1((gamma - 1.0) / gamma *
+                           std::log1p(0.92 * 0.92 * 100.0 / 101325.0)));
+  assert(std::abs(positive_speed.airspeed_mps -
+                  expected_pressure_corrected_speed) < 1.0e-12);
+  const auto unit_coefficient_speed = sensors::computeSaintVenantAirspeed(
+      101325.0, 100.0, 20.0, 1.0);
+  assert(unit_coefficient_speed.valid &&
+         unit_coefficient_speed.airspeed_mps > positive_speed.airspeed_mps);
   assert(!sensors::computeSaintVenantAirspeed(
               0.0, 100.0, 20.0, 0.92)
               .valid);
@@ -761,6 +816,30 @@ void testControlPipeline() {
   assert(std::abs(request.output_torque_nm + 0.2) < 1.0e-12);
   assert(roll.compute({0, 0, 0, 0}, 60.0,
                       RollControlAuthority::gentle).valid);
+  const RollState lookup_probe{0.1, 0.0, 0.0, 0.0};
+  const auto at_60 = roll.compute(lookup_probe, 60.0,
+                                  RollControlAuthority::high_authority);
+  const auto at_180 = roll.compute(lookup_probe, 180.0,
+                                   RollControlAuthority::high_authority);
+  for (const double speed : {59.9, 60.0})
+    assert(roll.compute(lookup_probe, speed,
+                        RollControlAuthority::high_authority)
+               .output_torque_nm == at_60.output_torque_nm);
+  for (const double speed : {180.0, 180.1, 200.0, 220.0})
+    assert(roll.compute(lookup_probe, speed,
+                        RollControlAuthority::high_authority)
+               .output_torque_nm == at_180.output_torque_nm);
+  assert(roll.compute(lookup_probe, 60.1,
+                      RollControlAuthority::high_authority)
+             .output_torque_nm < at_60.output_torque_nm);
+  assert(roll.compute(lookup_probe, 179.9,
+                      RollControlAuthority::high_authority)
+             .output_torque_nm > at_180.output_torque_nm);
+  const auto control_off = roll.compute(
+      lookup_probe, 220.0, RollControlAuthority::high_authority,
+      board::kControlAuthorityLimits, RollVerificationMode::matched_control_off);
+  assert(control_off.valid && !control_off.saturated &&
+         control_off.output_torque_nm == 0.0);
   const double radians380 = 380.0 * kPi / 180.0;
   const double reference720 = 720.0 * kPi / 180.0;
   const double current1100 = 1100.0 * kPi / 180.0;

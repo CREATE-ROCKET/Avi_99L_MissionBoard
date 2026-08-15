@@ -32,6 +32,9 @@ struct TorqueRequest {
 };
 
 enum class RollControlAuthority : uint8_t { gentle, high_authority };
+// Verification hook only. Production keeps the closed_loop default; this does
+// not make an unselected controller candidate flight-selectable.
+enum class RollVerificationMode : uint8_t { closed_loop, matched_control_off };
 
 class RollController {
 public:
@@ -40,7 +43,9 @@ public:
   [[nodiscard]] TorqueRequest compute(const RollState &state,
                                       double airspeed_mps,
                                       RollControlAuthority authority,
-                                      const board::ControlAuthorityLimits &limits = {}) const;
+                                      const board::ControlAuthorityLimits &limits = {},
+                                      RollVerificationMode verification_mode =
+                                          RollVerificationMode::closed_loop) const;
 
 private:
   RollGainSchedule schedule_{};

@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "vault_repository": "Natsu-B/Vault",
-  "vault_commit": "f789fdef395c7b066d838a8f566ea4984231ab34",
+  "vault_commit": "2a6fa974a9b7a50a9b9d574174262068e2e5b8bf",
   "source_contract": {
     "roll_estimate": "roll_estimate_liftoff_relative_unwrapped_rad",
     "control_reference": "control_roll_reference_unwrapped_rad",
@@ -30,7 +30,16 @@
     }
   },
   "authority_limits_Nm": {"hold_position": 0.3, "zero_hold": 0.8, "roll_control_gentle": 1.21208, "roll_control_high_authority": 3.0},
-  "pitot_coefficient": {"assumed_nominal": 0.92, "diagnostic_true_range": [0.6, 1.2]},
+  "pitot_coefficient": {
+    "definition": "pressure_correction_coefficient_K_squared_multiplies_differential_pressure_inside_Saint_Venant_ratio",
+    "filter_order": "SSC_differential_pressure_mean_then_airspeed_conversion",
+    "ssc_moving_average_samples": 8,
+    "ssc_startup_window": "partial_mean_from_first_post_zero_sample_then_full_rolling_window",
+    "lps_internal_pressure_average_samples": 8,
+    "lps_internal_temperature_average_samples": 8,
+    "assumed_nominal": 0.92,
+    "diagnostic_true_range": [0.6, 1.2]
+  },
   "encoder_pipeline": {
     "current_acquisition_hz": 1000,
     "current_consumer_hz": 1000,
