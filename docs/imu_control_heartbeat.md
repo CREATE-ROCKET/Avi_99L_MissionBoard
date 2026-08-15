@@ -72,6 +72,12 @@ characterizationではAS5047D raw sampleを1 ms epochの境界ではなく各slo
 5 kHz: 100, 300, 500, 700, 900 us
 ```
 
+Characterizationのsample clockとconsumer clockはESP-IDF 6.0.1のGPTimerを1 MHzで使用する。GPTimerを起動した後にraw counterを`esp_timer_get_time()`へ同期し、最初のalarm countをslot中心またはepoch終端の絶対時刻へ設定する。その後はhardware auto-reloadで周期を維持する。
+
+この構成では、相対`esp_timer_start_periodic()`を呼び出せた時刻のscheduler jitterをsampling phaseへ含めない。ESP-IDF 6.0.1には`esp_timer_start_periodic_at()`が存在しないため、将来版のAPIを前提にせず6.0.1の公開GPTimer APIのみを使用する。
+
+GPTimer ISRは固定lifetimeのtaskへ`vTaskNotifyGiveFromISR()`相当の通知を行うだけで、SPI、SD I/O、motor操作、heap allocationを行わない。AS5047D SPI readは従来どおりpriority 23のsampler taskで実施する。
+
 これにより高priority encoder taskと1 kHz consumer releaseをepoch終端で同時起床させない。固定1 ms epoch、capture timestampによる半開区間割当、future sampleを借りない規則、startup/steady incompleteの分離は変更しない。
 
 ## 6. 検証
@@ -89,6 +95,8 @@ trigger-coalesced=0
 ```
 
 1000 Hzは必須。2/5 kHzは取得結果に基づきaccepted/unsupportedを判断する。
+
+GPTimerと`esp_timer_get_time()`の同期に25 usを超えるoffsetが残る場合、capture開始前に`ESP_ERR_TIMEOUT`として失敗させる。測定中にtimestampを補正・捏造してdatasetを成立させることはしない。
 
 ### Production
 
