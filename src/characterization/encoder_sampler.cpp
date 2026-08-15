@@ -16,11 +16,6 @@
 #error "characterization requires ESP timer ISR dispatch support"
 #endif
 
-#if !defined(CONFIG_ESP_TIMER_ISR_AFFINITY_CPU1) ||                           \
-    !CONFIG_ESP_TIMER_ISR_AFFINITY_CPU1
-#error "characterization esp_timer ISR must be pinned to CPU1"
-#endif
-
 namespace avi::characterization {
 namespace {
 
