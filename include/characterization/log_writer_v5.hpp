@@ -87,7 +87,8 @@ private:
   StaticTask_t task_tcb_{};
   StackType_t task_stack_[4096]{};
   TaskHandle_t task_{nullptr};
-  std::array<ImmutableLogRecord, kBatchRecords> batch_{};
+  // queueから1件ずつstrict validation/encodeし、wire batchだけを保持する。
+  // ImmutableLogRecordの64件二重bufferはDRAMを浪費するため持たない。
   std::array<std::uint8_t,
              wire_v5::kRecordBytes * kBatchRecords>
       encoded_batch_{};

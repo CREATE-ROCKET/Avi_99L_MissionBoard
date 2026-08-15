@@ -179,20 +179,17 @@ void LogWriterV5::cleanupPreparedFile(bool remove_file) noexcept {
   prepared_ = false;
 }
 
-void LogWriterV5::processRecordBatch(ImmutableLogRecord first_record) {
-  batch_[0] = first_record;
-  std::size_t count = 1U;
-  while (count < batch_.size() &&
-         xQueueReceive(queue_, &batch_[count], 0U) == pdTRUE)
-    ++count;
-  updateAtomicMaximum(max_batch_records_, static_cast<std::uint32_t>(count));
-
+void LogWriterV5::processRecordBatch(ImmutableLogRecord current_record) {
+  std::size_t count = 0U;
+  std::uint64_t batch_first_sequence = 0U;
+  std::uint64_t batch_last_sequence = 0U;
   bool encoded = true;
-  for (std::size_t index = 0U; index < count; ++index) {
-    // full record validationはwriter taskだけで行う。char_runtime側はmotor safety、
-    // epoch成立、queue失敗を直接監視し、重いwire整合性確認を1 kHz pathへ置かない。
+
+  for (;;) {
+    // queueから取り出した1件をその場でstrict validation/encodeする。
+    // ImmutableLogRecordのbatch copyを保持せず、wire batchだけをDRAMに残す。
     const std::int64_t validate_started_us = esp_timer_get_time();
-    const bool record_valid = !hasError(validateRecordStrict(batch_[index]));
+    const bool record_valid = !hasError(validateRecordStrict(current_record));
     const std::uint32_t validate_elapsed_us = elapsedUs(validate_started_us);
     updateAtomicMaximum(max_validate_us_, validate_elapsed_us);
     addAtomicTotal(total_validate_us_, validate_elapsed_us);
@@ -204,7 +201,7 @@ void LogWriterV5::processRecordBatch(ImmutableLogRecord first_record) {
 
     wire_v5::RecordBytes bytes{};
     const std::int64_t encode_started_us = esp_timer_get_time();
-    const bool record_encoded = wire_v5::encodeRecord(batch_[index], bytes);
+    const bool record_encoded = wire_v5::encodeRecord(current_record, bytes);
     const std::uint32_t encode_elapsed_us = elapsedUs(encode_started_us);
     updateAtomicMaximum(max_encode_us_, encode_elapsed_us);
     addAtomicTotal(total_encode_us_, encode_elapsed_us);
@@ -213,11 +210,24 @@ void LogWriterV5::processRecordBatch(ImmutableLogRecord first_record) {
       rememberFirst(ESP_ERR_INVALID_RESPONSE);
       break;
     }
-    std::memcpy(encoded_batch_.data() + index * wire_v5::kRecordBytes,
+
+    std::memcpy(encoded_batch_.data() + count * wire_v5::kRecordBytes,
                 bytes.data(), bytes.size());
+    if (count == 0U)
+      batch_first_sequence = current_record.sequence;
+    batch_last_sequence = current_record.sequence;
+    ++count;
+
+    if (count >= kBatchRecords ||
+        xQueueReceive(queue_, &current_record, 0U) != pdTRUE)
+      break;
   }
 
-  if (encoded && file_ != nullptr) {
+  updateAtomicMaximum(max_batch_records_, static_cast<std::uint32_t>(count));
+  if (!encoded)
+    return;
+
+  if (file_ != nullptr) {
     const std::size_t byte_count = count * wire_v5::kRecordBytes;
     const std::int64_t fwrite_started_us = esp_timer_get_time();
     const std::size_t written =
@@ -234,10 +244,10 @@ void LogWriterV5::processRecordBatch(ImmutableLogRecord first_record) {
                                    file_crc32_);
       const std::uint64_t before = records_written_.fetch_add(count);
       if (before == 0U)
-        first_sequence_.store(batch_[0].sequence);
-      last_sequence_.store(batch_[count - 1U].sequence);
+        first_sequence_.store(batch_first_sequence);
+      last_sequence_.store(batch_last_sequence);
     }
-  } else if (file_ == nullptr) {
+  } else {
     rememberFirst(ESP_ERR_INVALID_STATE);
   }
 }
