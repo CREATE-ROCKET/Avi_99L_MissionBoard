@@ -113,6 +113,9 @@ struct PowerRequest {
   bool auxiliary_5v{};
   bool parachute_power{};
   bool cutoff{};
+  // 各taskが所有していない電源railを意図せず上書きしないための更新mask。
+  bool update_auxiliary_5v{true};
+  bool update_parachute_power{true};
 };
 
 struct MissionCommandEnvelope {
@@ -275,6 +278,9 @@ std::atomic<bool> fin_zero_configured{false};
 std::atomic<bool> lps_ready{false};
 std::atomic<bool> ssc_ready{false};
 std::atomic<bool> sts_ready{false};
+// SafetyTaskがGPIO44へ最後に正常適用したPara電源状態。
+// queue投入完了と物理GPIO適用完了を同一視しない。
+std::atomic<bool> parachute_power_applied{false};
 std::atomic<bool> parachute_config_load_complete{false};
 std::atomic<bool> parachute_persistence_ready{false};
 std::atomic<bool> parachute_persistence_corrupt{false};
@@ -324,10 +330,18 @@ void addWatchdog() {
 
 void resetWatchdog() { (void)esp_task_wdt_reset(); }
 
+esp_err_t setTrackedParaPower(bool enabled) {
+  const esp_err_t result = bringup::safe_outputs::setParaPower(enabled);
+  // OFF失敗時もUART ownerは安全側に倒して「給電済み」と扱わない。
+  parachute_power_applied.store(result == ESP_OK && enabled,
+                                std::memory_order_release);
+  return result;
+}
+
 void failSafeOutputs() {
   (void)bringup::safe_outputs::motorCoast();
   (void)bringup::safe_outputs::setAux5v(false);
-  (void)bringup::safe_outputs::setParaPower(false);
+  (void)setTrackedParaPower(false);
 }
 
 void latchPhysicalEmergency(uint8_t transaction_id, bool liftoff) {
@@ -437,7 +451,7 @@ void safetyTask(void *) {
                                                 std::memory_order_acq_rel)) {
       // Emergency latchはqueue容量と無関係にSafetyTaskからpowerを落とす。
       (void)bringup::safe_outputs::setAux5v(false);
-      (void)bringup::safe_outputs::setParaPower(false);
+      (void)setTrackedParaPower(false);
       sts_ready.store(false, std::memory_order_release);
       para_mode_actual.store(protocol::ParaMode::powered_off,
                              std::memory_order_release);
@@ -445,7 +459,7 @@ void safetyTask(void *) {
     if (recovery_requested.load(std::memory_order_acquire)) {
       const bool aux_safe = bringup::safe_outputs::setAux5v(false) == ESP_OK;
       const bool para_safe =
-          bringup::safe_outputs::setParaPower(false) == ESP_OK;
+          setTrackedParaPower(false) == ESP_OK;
       recovery_power_safe.store(aux_safe && para_safe,
                                 std::memory_order_release);
       if (para_safe) {
@@ -459,13 +473,15 @@ void safetyTask(void *) {
       cutoff_latched = cutoff_latched || request.cutoff;
       if (cutoff_latched) {
         (void)bringup::safe_outputs::setAux5v(false);
-        (void)bringup::safe_outputs::setParaPower(false);
+        (void)setTrackedParaPower(false);
         sts_ready.store(false, std::memory_order_release);
         para_mode_actual.store(protocol::ParaMode::powered_off,
                                std::memory_order_release);
       } else {
-        (void)bringup::safe_outputs::setAux5v(request.auxiliary_5v);
-        (void)bringup::safe_outputs::setParaPower(request.parachute_power);
+        if (request.update_auxiliary_5v)
+          (void)bringup::safe_outputs::setAux5v(request.auxiliary_5v);
+        if (request.update_parachute_power)
+          (void)setTrackedParaPower(request.parachute_power);
       }
     }
     if (xSemaphoreTake(state_mutex, 0) == pdTRUE) {
@@ -511,7 +527,7 @@ void safetyTask(void *) {
         elapsed_us >= 25'000'000) {
       cutoff_latched = true;
       (void)bringup::safe_outputs::setAux5v(false);
-      (void)bringup::safe_outputs::setParaPower(false);
+      (void)setTrackedParaPower(false);
       sts_ready.store(false, std::memory_order_release);
       para_mode_actual.store(protocol::ParaMode::powered_off,
                              std::memory_order_release);
@@ -579,6 +595,7 @@ void parachuteTask(void *) {
   uint32_t active_epoch = 0;
   uint64_t power_enabled_at_us = 0;
   uint64_t next_initialization_attempt_us = 0;
+  uint64_t next_power_request_us = 0;
   uint64_t open_requested_at_us = 0;
   bool power_enabled = false;
   bool mode_prepared = false;
@@ -600,7 +617,7 @@ void parachuteTask(void *) {
       return true;
     // queue飽和時も電源OFF要求だけはGPIOへ直接反映する。
     if (request.cutoff || !request.parachute_power)
-      (void)bringup::safe_outputs::setParaPower(false);
+      (void)setTrackedParaPower(false);
     if (request.cutoff || !request.auxiliary_5v)
       (void)bringup::safe_outputs::setAux5v(false);
     return false;
@@ -617,6 +634,8 @@ void parachuteTask(void *) {
     const PowerRequest power{preserve_auxiliary_5v && !latch_cutoff, false,
                              latch_cutoff};
     (void)queuePower(power);
+    // OFF要求を出した時点からUART ownerは給電済みと仮定しない。
+    parachute_power_applied.store(false, std::memory_order_release);
     controller.notifyPowerCutoff();
     sts_ready.store(false, std::memory_order_release);
     para_mode_actual.store(final_mode, std::memory_order_release);
@@ -624,6 +643,7 @@ void parachuteTask(void *) {
     active_epoch = 0;
     power_enabled_at_us = 0;
     next_initialization_attempt_us = 0;
+    next_power_request_us = 0;
     open_requested_at_us = 0;
     power_enabled = false;
     mode_prepared = false;
@@ -632,23 +652,70 @@ void parachuteTask(void *) {
     last_initialization_error = ESP_ERR_INVALID_STATE;
   };
 
+  auto reconnectIntervalMs = [&]() {
+    protocol::MissionState state = protocol::MissionState::unknown;
+    if (xSemaphoreTake(state_mutex, 0) == pdTRUE) {
+      state = state_machine.snapshot().state;
+      xSemaphoreGive(state_mutex);
+    }
+    return state == protocol::MissionState::command_receive
+               ? flight_config::kParachuteCommandReceiveReconnectMs
+               : flight_config::kParachute.retry_interval_ms;
+  };
+
+  auto resetServoTransport = [&]() {
+    if (servo.initialized())
+      (void)servo.end();
+    if (bus.initialized())
+      (void)bus.end();
+    mode_prepared = false;
+    controller_started = false;
+    hold_established = false;
+    sts_ready.store(false, std::memory_order_release);
+    last_initialization_error = ESP_ERR_INVALID_STATE;
+  };
+
   auto requestPower = [&](uint64_t now_us) {
-    if (power_enabled)
+    if (parachute_power_applied.load(std::memory_order_acquire)) {
+      if (!power_enabled) {
+        // SafetyTaskのGPIO44適用成功を観測してから安定待ちを開始する。
+        power_enabled = true;
+        power_enabled_at_us = now_us;
+        next_initialization_attempt_us =
+            now_us + static_cast<uint64_t>(
+                         flight_config::kParachute.power_stabilization_ms) *
+                         1'000ULL;
+      }
+      next_power_request_us = 0;
       return true;
+    }
+
+    if (power_enabled) {
+      // 別ownerによるOFFまたはGPIO再設定を検出したらstale transportを破棄する。
+      resetServoTransport();
+      power_enabled = false;
+      power_enabled_at_us = 0;
+      next_initialization_attempt_us = 0;
+    }
+
+    if (now_us < next_power_request_us)
+      return true;
+
+    const uint64_t retry_us =
+        static_cast<uint64_t>(reconnectIntervalMs()) * 1'000ULL;
     const PowerRequest power{true, true, false};
-    if (!queuePower(power))
+    if (!queuePower(power)) {
+      next_power_request_us = now_us + retry_us;
       return false;
-    power_enabled = true;
-    power_enabled_at_us = now_us;
-    next_initialization_attempt_us =
-        now_us + static_cast<uint64_t>(
-                     flight_config::kParachute.power_stabilization_ms) *
-                     1'000ULL;
+    }
+    // queue投入だけでは給電済みにしない。SafetyTaskの適用結果を待つ。
+    next_power_request_us = now_us + retry_us;
     return true;
   };
 
   auto initializeServo = [&](uint64_t now_us) {
-    if (!power_enabled ||
+    if (!parachute_power_applied.load(std::memory_order_acquire) ||
+        !power_enabled ||
         now_us < power_enabled_at_us +
                      static_cast<uint64_t>(
                          flight_config::kParachute.power_stabilization_ms) *
@@ -656,9 +723,7 @@ void parachuteTask(void *) {
         now_us < next_initialization_attempt_us)
       return false;
     next_initialization_attempt_us =
-        now_us + static_cast<uint64_t>(
-                     flight_config::kParachute.retry_interval_ms) *
-                     1'000ULL;
+        now_us + static_cast<uint64_t>(reconnectIntervalMs()) * 1'000ULL;
 
     if (!bus.initialized()) {
       STSCREATE::Config config{};
@@ -893,6 +958,15 @@ void parachuteTask(void *) {
           powerOff(absolute_cutoff, preserve_auxiliary_5v,
                    free_requested ? protocol::ParaMode::free
                                   : protocol::ParaMode::powered_off);
+          if (free_requested) {
+            // Emergency後もrequested modeはFreeのまま維持し、1秒後に再接続する。
+            desired = DesiredState::free;
+            next_power_request_us =
+                static_cast<uint64_t>(esp_timer_get_time()) +
+                static_cast<uint64_t>(
+                    flight_config::kParachuteCommandReceiveReconnectMs) *
+                    1'000ULL;
+          }
         }
         continue;
       }
@@ -1020,7 +1094,10 @@ void parachuteTask(void *) {
 
     const uint64_t now_us = static_cast<uint64_t>(esp_timer_get_time());
     if (pending.active && pending.stage == OperationStage::initialize) {
-      if (initializeServo(now_us)) {
+      const bool power_request_ok = requestPower(now_us);
+      if (!power_request_ok) {
+        requestFinish(protocol::CommandReason::busy, kDetailQueueUnavailable);
+      } else if (initializeServo(now_us)) {
         auto current = *actuators::AbsoluteParachuteAngle::fromCount(0);
         bool moving = false;
         const esp_err_t read = readCurrent(current, moving);
@@ -1106,7 +1183,8 @@ void parachuteTask(void *) {
                 {STS3215::TorqueLimit::percent(
                     flight_config::kParachute.torque_limit_percent)});
             sts_ready.store(hold == ESP_OK, std::memory_order_release);
-            if (hold == ESP_OK) {
+            hold_established = hold == ESP_OK;
+            if (hold_established) {
               desired = DesiredState::holding;
               para_mode_actual.store(protocol::ParaMode::hold,
                                      std::memory_order_release);
@@ -1787,7 +1865,7 @@ void missionRealtimeTask(void *) {
       if (post_transition_para_valid &&
           xQueueSendToFront(para_queue, &post_transition_para, 0) != pdTRUE) {
         // Cancel後の電源OFFはqueue飽和時も物理出力へ直接反映する。
-        (void)bringup::safe_outputs::setParaPower(false);
+        (void)setTrackedParaPower(false);
       }
       const auto reason = direct_reason == protocol::CommandReason::none
                               ? transitionReason(transition)
@@ -2451,7 +2529,8 @@ void missionRealtimeTask(void *) {
 
 void airDataTask(void *) {
   addWatchdog();
-  PowerRequest power{true, false, false};
+  // AirDataTaskはGPIO40だけを所有し、Para railの要求状態を上書きしない。
+  PowerRequest power{true, false, false, true, false};
   (void)xQueueSend(power_queue, &power, 0);
   vTaskDelay(pdMS_TO_TICKS(100));
 

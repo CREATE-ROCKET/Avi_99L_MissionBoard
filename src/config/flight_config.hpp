@@ -50,6 +50,9 @@ struct AirDataConfig {
 // TODO(HW_TEST): 実機の収納位置、開放位置、速度、加速度、保持torqueを確定する。
 inline constexpr ParachuteMotionConfig kParachute{
     2.0F, 180.0F, 360.0F, 20.0F, 100, 1'500, 20};
+// Vault 01: CommandReceiveの未接続STSは1秒周期で再接続する。
+// 飛行中の初期化retryは従来のkParachute.retry_interval_msを維持する。
+inline constexpr uint32_t kParachuteCommandReceiveReconnectMs = 1'000;
 
 // source nominalは0.92。true 0.60..1.20は飛行中同定用ではなく、
 // TODO(SIMULATION/AERO_VALIDATION): coefficient robustness診断用の暫定範囲。

@@ -40,7 +40,7 @@ ICM42688のfreshnessは取得時の`host_timestamp_us`と`esp_timer_get_time()`�
 | fin zero | production起動後の最初の有効AS5047D角を0°とする | `TODO(HW_TEST)`で機械zero取得手順へ置換 |
 | para Open / Close / 許容差 | NVSに保存するoptionalな1回転絶対角 / ±2° | Open/Closeは`SetParaOpen` / `SetParaClose`で実機位置を設定し、許容差は`TODO(HW_TEST)`で確定 |
 | para速度 / 加速度 / torque | 180°/s / 360°/s² / 20% | `TODO(HW_TEST)`で開放時間とstall余裕を確認 |
-| para電源安定 / 初期化目安 / retry | 100 ms / 1.5 s / 20 ms | `TODO(HW_TEST)`で電源立上り分布を確認 |
+| para電源安定 / 初期化目安 / retry | 100 ms / 1.5 s / 飛行中20 ms・CommandReceive再接続1 s | `TODO(HW_TEST)`で電源立上り分布を確認 |
 | 差圧zero / 平均窓 / 負圧許容 | 400 sample / 8 sample / 5 Pa | `TODO(SIMULATION)`と`TODO(HW_TEST)`でfilterと実測noiseを確認 |
 | Saint-Venant係数 | firmware assumed 0.92 / robustness true range 0.60〜1.20 | true/assumedを共用せず`TODO(SIMULATION/AERO_VALIDATION)`で照合 |
 | encoder pipeline | acquisition 1 kHz / consumer 1 kHzの暫定config | 1/2 kHzの最終選択はsystem ID後にconfig差替え |
@@ -56,7 +56,7 @@ Control遷移時には、同じtickで最新かつ未来時刻ではないunwrap
 - **production buildでは`StartSequence`によりactuatorが動作します。** 機体へ接続する前に、motor電源とpara電源を独立して物理遮断できるfixture上で確認してください。暫定値のまま飛行へ使用してはいけません。
 - bring-up buildのactuator試験は自動実行しません。USB consoleから対応commandを明示的に入力した場合だけ実行します。
 - production motorはcommand_receive、reset/recovery無効化、ActuatorEmergency、sensor/config不正時にcoastまたはbrakeへ移ります。±14°のsoftware limitでstopper方向またはzero torqueが要求された場合は、back-EMF補償PWMを残さず明示brakeとし、中心方向のtorqueだけを許可します。ActuatorEmergencyではmotorをcoast、Paraをtorque OFFかつGPIO44 OFFのFreeへ移し、差圧系GPIO40は維持します。driver APIが失敗した場合はmotor unavailableをlatchし、coastへ退避します。
-- production paraは通常`StartSequence`でfreshな現在位置をHoldし、Close位置へは移動しません。Open/Closeを検証して成功時にflight RAM snapshotへfreezeし、Descent/OpenとretryはそのsnapshotのOpenだけを使用します。0.5秒間隔のretryを含む5秒の全体deadlineは延長せず、成功・通信不能のどちらでもOpen試行終了時にGPIO44のPara電源だけを遮断します。SafetyTaskは離床+25秒でGPIO40/44の両方をUART taskと独立に遮断し、再投入不能にラッチします。
+- production paraはCommandReceive起動後に現在位置Holdを要求し、SafetyTaskがGPIO44へのON適用に成功したことをParachuteTaskが観測してから100 msの電源安定待ちを開始します。AirDataTaskのGPIO40要求はPara railを上書きしません。CommandReceiveでSTSが未接続なら1秒周期で再接続し、明示`ParaHold`成功時はHold成立状態を保持します。ActuatorEmergency後はGPIO44をOFFへ安全化したうえでrequested modeをFreeのまま維持し、再接続後も自動Holdへ戻しません。通常`StartSequence`ではfreshな現在位置をHoldし、Close位置へは移動しません。Open/Closeを検証して成功時にflight RAM snapshotへfreezeし、Descent/OpenとretryはそのsnapshotのOpenだけを使用します。5秒のOpen試行deadline後も+25秒の絶対cutoffまではHold要求を維持し、SafetyTaskが離床+25秒でGPIO40/44の両方をUART taskと独立に遮断して再投入不能にラッチします。
 - bring-up motor PWMは`motor-arm`後だけ許可されます。arm状態はRAMだけに保持され、resetで必ず解除されます。試験中でも`motor-disarm`を受理し、通常は即時、出力lock競合時も5 ms以内に安全停止を再試行します。production経路はbring-upのarm状態を使用せず、Mission FSMと安全gateで出力を管理します。
 - bring-upでmotor単体を接続する場合は動翼・stopperが無いため、飛行用software limitを使いません。bring-up専用上限はduty 15%、速度100 rad/s、command時間45秒です。速度上限は実測前の暫定値で、`combined-motor-imu-test`の実行時間は41秒です。
 - bring-upのSTS UART1はshell初期化時、Para電源OFFのまま一度だけopenし、shell lifetime中は保持します。`sts-*` command時だけPara電源をONにして100 ms待機し、起動中のtimeoutだけを1.5秒のdeadline内で再PINGしてからSTS3215を初期化します。終了時はtorqueを無効化してPara電源をOFFにしますが、UARTはcloseしません。最初の移動は`sts-small-move`で絶対値3度以下に限定します。
