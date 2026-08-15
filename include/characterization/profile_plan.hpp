@@ -20,8 +20,11 @@ struct ProfileEpisode {
 class ProfilePlan {
 public:
   static constexpr std::size_t kCommonEpisodeCount = 16U;
-  // TODO(HW_TEST): 低出力極性試験後にepisode別上限を確定する。
-  static constexpr std::int16_t kInitialMotionCommandPermille = 30;
+  // 既存30 kHz motor-only実測のsustained thresholdが約20--22%であるため、
+  // full-fin再同定では30%を標準励振上限とする。35%のglobal contract上限には達しない。
+  static constexpr std::int16_t kInitialMotionCommandPermille = 300;
+  static constexpr std::int16_t kBroadbandCommandPermille = 250;
+  static constexpr std::int16_t kPolarityCheckCommandPermille = 200;
 
   ProfilePlan(AssemblyStage stage, EncoderRate rate,
               std::uint32_t fixed_seed) noexcept;

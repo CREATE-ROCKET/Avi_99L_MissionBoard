@@ -17,6 +17,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 
 namespace avi::characterization {
 

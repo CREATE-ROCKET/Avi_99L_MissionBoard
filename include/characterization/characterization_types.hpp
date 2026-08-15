@@ -25,7 +25,9 @@ constexpr std::int32_t kHardAbortMilliDeg = 10'000;
 constexpr float kBacklashFullWidthDeg = 0.344F;
 constexpr std::int32_t kApproachStepMilliDeg = 100;
 constexpr std::uint16_t kRawDiagnosticMask = 0x007FU;
-constexpr std::int16_t kMaximumCommandPermille = 150;
+// 実profileは300 permille以下。35%は今後の低出力再試験用の契約上限であり、
+// profileから自動的に35%を印加する意味ではない。
+constexpr std::int16_t kMaximumCommandPermille = 350;
 
 using SessionId = std::array<char, kSessionIdBytes>;
 

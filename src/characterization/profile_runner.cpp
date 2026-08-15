@@ -15,6 +15,7 @@
 #include "freertos/task.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -32,9 +33,19 @@ namespace avi::characterization {
 namespace {
 
 constexpr std::uint64_t kRunStartLeadUs = 250'000U;
-// TODO(HW_TEST): 低出力試験でapproach commandとsettle条件を確定する。
-constexpr std::int16_t kApproachCommandPermille = 20;
 constexpr std::uint32_t kZeroCaptureTimeoutMs = 1'000U;
+
+// 動作確認済みZeroHold（1024 scaleでKp=500, Kd=25）をpermilleへ概算移植する。
+// 20 kHzで得たgainそのものを30 kHz flight値とはみなさず、zero approach/recenter専用に使う。
+constexpr std::int32_t kApproachKpPermillePerDeg = 500;
+constexpr std::int32_t kApproachKdPermillePerDegPerS = 25;
+// 30 kHz motor-only実測breakawayが約15%なので、微小0.1 deg stepは短い16% pulseで歯面を動かす。
+constexpr std::int16_t kApproachMinimumActivePermille = 160;
+constexpr std::int16_t kApproachMaximumPermille = 300;
+constexpr std::int32_t kApproachPulseRegionMilliDeg = 250;
+constexpr std::uint32_t kApproachPulsePeriodEpochs = 20U;
+constexpr std::uint32_t kApproachPulseOnEpochs = 8U;
+constexpr std::int32_t kApproachDeadbandMilliDeg = 20;
 
 std::uint64_t nowUs() noexcept {
   return static_cast<std::uint64_t>(
@@ -129,6 +140,50 @@ MotorCommandRequest driveCommand(std::int16_t command) noexcept {
   if (command < 0)
     return {command, MotorMode::DriveIn1};
   return {0, MotorMode::Coast};
+}
+
+MotorCommandRequest finDirectionCommand(std::int32_t fin_direction,
+                                        std::int16_t magnitude) noexcept {
+  if (magnitude <= 0 || (fin_direction != -1 && fin_direction != 1))
+    return {0, MotorMode::Coast};
+  const std::int16_t command =
+      commandForFinError(fin_direction, magnitude, kCommandToFinSign);
+  return driveCommand(command);
+}
+
+MotorCommandRequest positionApproachCommand(
+    std::int32_t error_millideg, std::int32_t fin_rate_millideg_s,
+    std::uint32_t local_epoch, std::int16_t requested_limit) noexcept {
+  const std::int64_t absolute_error =
+      std::llabs(static_cast<long long>(error_millideg));
+  if (absolute_error <= kApproachDeadbandMilliDeg)
+    return {0, MotorMode::Coast};
+
+  const std::int32_t direction = error_millideg > 0 ? 1 : -1;
+  const std::int64_t rate_toward_target =
+      static_cast<std::int64_t>(direction) * fin_rate_millideg_s;
+  const std::int64_t proportional =
+      absolute_error * kApproachKpPermillePerDeg / 1'000;
+  const std::int64_t damping =
+      rate_toward_target > 0
+          ? rate_toward_target * kApproachKdPermillePerDegPerS / 1'000
+          : 0;
+  if (damping >= proportional && rate_toward_target > 0)
+    return {0, MotorMode::Coast};
+
+  const std::int16_t limit = static_cast<std::int16_t>(std::clamp<int>(
+      requested_limit, kApproachMinimumActivePermille,
+      kApproachMaximumPermille));
+  const std::int64_t undamped = std::max<std::int64_t>(1, proportional - damping);
+  const std::int16_t magnitude = static_cast<std::int16_t>(
+      std::clamp<std::int64_t>(undamped, kApproachMinimumActivePermille,
+                               limit));
+
+  // 0.1 deg刻み付近で連続16%以上を入れて通り過ぎないよう、近傍だけpulse化する。
+  if (absolute_error <= kApproachPulseRegionMilliDeg &&
+      (local_epoch % kApproachPulsePeriodEpochs) >= kApproachPulseOnEpochs)
+    return {0, MotorMode::Coast};
+  return finDirectionCommand(direction, magnitude);
 }
 
 } // 無名名前空間
@@ -348,7 +403,7 @@ LogHeaderV5 ProfileRunner::makeHeader(
               header.avi_esp_libs_sha.size());
   (void)std::snprintf(
       header.board_build_id.data(), header.board_build_id.size(),
-      "avi99l-char-espidf-hw-approved=%u-sign=%+d",
+      "avi99l-char-excite2-hw-approved=%u-sign=%+d",
       kHardwareDriveApproved ? 1U : 0U,
       static_cast<int>(kCommandToFinSign));
   return header;
@@ -363,36 +418,98 @@ MotorCommandRequest ProfileRunner::commandForEpisode(
   const std::int16_t limit = episode.command_limit_permille;
   switch (episode.phase) {
   case ProfilePhase::StationaryBaseline:
-  case ProfilePhase::Coast:
     return {0, MotorMode::Coast};
-  case ProfilePhase::ShortBrake:
-    return {0, MotorMode::Brake};
   case ProfilePhase::PolarityCheck:
     if (local_epoch < 100U)
-      return drive(10);
-    if (local_epoch < 200U)
+      return drive(limit);
+    if (local_epoch < 400U)
       return {0, MotorMode::Coast};
-    if (local_epoch < 300U)
-      return drive(-10);
+    if (local_epoch < 500U)
+      return drive(static_cast<std::int16_t>(-limit));
     return {0, MotorMode::Coast};
   case ProfilePhase::BreakawaySweep: {
-    const std::int16_t magnitude = static_cast<std::int16_t>(
-        std::min<std::uint32_t>(5U + (local_epoch / 100U) * 5U,
-                                static_cast<std::uint32_t>(limit)));
-    return drive(((local_epoch / 100U) & 1U) == 0U ? magnitude
-                                                   : -magnitude);
+    constexpr std::array<std::int16_t, 9> levels{
+        100, 125, 150, 175, 200, 225, 250, 275, 300};
+    const std::size_t index = local_epoch / 400U;
+    if (index >= levels.size())
+      return {0, MotorMode::Coast};
+    const std::int16_t magnitude = std::min(levels[index], limit);
+    const std::uint32_t phase = local_epoch % 400U;
+    if (phase < 80U)
+      return drive(magnitude);
+    if (phase < 200U)
+      return {0, MotorMode::Coast};
+    if (phase < 280U)
+      return drive(static_cast<std::int16_t>(-magnitude));
+    return {0, MotorMode::Coast};
   }
-  case ProfilePhase::SustainedMotionSweep:
-    return drive(((local_epoch / 300U) & 1U) == 0U ? limit : -limit);
+  case ProfilePhase::SustainedMotionSweep: {
+    constexpr std::array<std::int16_t, 9> levels{
+        300, 275, 250, 225, 200, 175, 150, 125, 100};
+    const std::size_t index = local_epoch / 320U;
+    if (index >= levels.size())
+      return {0, MotorMode::Coast};
+    const std::int16_t test = std::min(levels[index], limit);
+    const std::uint32_t phase = local_epoch % 320U;
+    if (phase < 60U)
+      return drive(limit);
+    if (phase < 140U)
+      return drive(test);
+    if (phase < 160U)
+      return {0, MotorMode::Coast};
+    if (phase < 220U)
+      return drive(static_cast<std::int16_t>(-limit));
+    if (phase < 300U)
+      return drive(static_cast<std::int16_t>(-test));
+    return {0, MotorMode::Coast};
+  }
   case ProfilePhase::BoundedPulseGrid: {
-    constexpr std::array<std::int16_t, 8> pattern{
-        10, 0, -10, 0, 20, 0, -20, 0};
-    return drive(pattern[(local_epoch / 100U) % pattern.size()]);
+    constexpr std::array<std::int16_t, 5> levels{100, 150, 200, 250, 300};
+    const std::size_t level_index = local_epoch / 800U;
+    if (level_index >= levels.size())
+      return {0, MotorMode::Coast};
+    const std::int16_t magnitude = std::min(levels[level_index], limit);
+    const std::uint32_t phase = local_epoch % 400U;
+    if (phase < 60U)
+      return drive(magnitude);
+    if (phase < 200U)
+      return {0, MotorMode::Coast};
+    if (phase < 260U)
+      return drive(static_cast<std::int16_t>(-magnitude));
+    return {0, MotorMode::Coast};
   }
+  case ProfilePhase::Coast:
+    if (local_epoch < 100U)
+      return drive(limit);
+    if (local_epoch < 1'100U)
+      return {0, MotorMode::Coast};
+    if (local_epoch < 1'200U)
+      return drive(static_cast<std::int16_t>(-limit));
+    return {0, MotorMode::Coast};
+  case ProfilePhase::ShortBrake:
+    if (local_epoch < 100U)
+      return drive(limit);
+    if (local_epoch < 350U)
+      return {0, MotorMode::Brake};
+    if (local_epoch < 1'000U)
+      return {0, MotorMode::Coast};
+    if (local_epoch < 1'100U)
+      return drive(static_cast<std::int16_t>(-limit));
+    if (local_epoch < 1'350U)
+      return {0, MotorMode::Brake};
+    return {0, MotorMode::Coast};
   case ProfilePhase::PositiveToNegative:
-    return drive(local_epoch < episode.duration_epochs / 2U ? limit : -limit);
+    if (local_epoch < 100U)
+      return drive(limit);
+    if (local_epoch < 200U)
+      return drive(static_cast<std::int16_t>(-limit));
+    return {0, MotorMode::Coast};
   case ProfilePhase::NegativeToPositive:
-    return drive(local_epoch < episode.duration_epochs / 2U ? -limit : limit);
+    if (local_epoch < 100U)
+      return drive(static_cast<std::int16_t>(-limit));
+    if (local_epoch < 200U)
+      return drive(limit);
+    return {0, MotorMode::Coast};
   case ProfilePhase::BoundedPrbs:
     if (local_epoch % 20U == 0U)
       pseudo_random_state_ =
@@ -400,12 +517,16 @@ MotorCommandRequest ProfileRunner::commandForEpisode(
           (0x80200003U &
            (0U - (pseudo_random_state_ & 1U)));
     return drive((pseudo_random_state_ & 1U) != 0U ? limit : -limit);
-  case ProfilePhase::BandLimitedNoise:
+  case ProfilePhase::BandLimitedNoise: {
     if (local_epoch % 50U == 0U)
       pseudo_random_state_ =
           pseudo_random_state_ * 1'664'525U + 1'013'904'223U;
-    return drive(static_cast<std::int16_t>(
-        static_cast<std::int32_t>(pseudo_random_state_ % 41U) - 20));
+    const std::uint32_t span =
+        static_cast<std::uint32_t>(2 * static_cast<int>(limit) + 1);
+    const std::int32_t value =
+        static_cast<std::int32_t>(pseudo_random_state_ % span) - limit;
+    return drive(static_cast<std::int16_t>(value));
+  }
   case ProfilePhase::Chirp: {
     const std::uint32_t half_period =
         std::max<std::uint32_t>(
@@ -413,11 +534,8 @@ MotorCommandRequest ProfileRunner::commandForEpisode(
     return drive(((local_epoch / half_period) & 1U) == 0U ? limit : -limit);
   }
   case ProfilePhase::Recenter:
-    if (fin_angle_millideg > 20)
-      return drive(commandForFinError(-1, kApproachCommandPermille));
-    if (fin_angle_millideg < -20)
-      return drive(commandForFinError(1, kApproachCommandPermille));
-    return {0, MotorMode::Coast};
+    return positionApproachCommand(-fin_angle_millideg, 0, local_epoch,
+                                   limit);
   case ProfilePhase::ZeroApproach:
   case ProfilePhase::Idle:
     return {0, MotorMode::Coast};
@@ -666,11 +784,14 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
       if (!approach->complete()) {
         const std::int64_t error =
             static_cast<std::int64_t>(target_fin_angle) - fin_angle;
-        request = error > 20 || error < -20
-                      ? driveCommand(commandForFinError(
-                            error > 0 ? 1 : -1,
-                            kApproachCommandPermille))
-                      : MotorCommandRequest{0, MotorMode::Coast};
+        if (error > std::numeric_limits<std::int32_t>::max() ||
+            error < std::numeric_limits<std::int32_t>::min()) {
+          request = {0, MotorMode::Coast};
+        } else {
+          request = positionApproachCommand(
+              static_cast<std::int32_t>(error), fin_rate, local_epoch,
+              episode.command_limit_permille);
+        }
       }
     }
 
@@ -720,6 +841,8 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
       ++runtime_deadline_misses;
       guard_state = GuardState::Abort;
     }
+    // command generation/requested/applied/mode/apply timestampは同じrealtime ownerで
+    // 一度だけ値copyし、writer taskはこのimmutable evidenceしか見ない。
     ImmutableCommandEvidence epoch_command =
         journal_.snapshot(std::max(nowUs(), apply_completed_us));
     if (preapply_error != ESP_OK)

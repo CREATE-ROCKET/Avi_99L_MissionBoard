@@ -63,7 +63,7 @@ private:
 class ZeroApproachController {
 public:
   explicit ZeroApproachController(
-      ApproachBranch branch, std::uint64_t timeout_us = 11'000'000U,
+      ApproachBranch branch, std::uint64_t timeout_us = 18'000'000U,
       std::int32_t tolerance_millideg = 20,
       std::int32_t rate_tolerance_millideg_s = 100,
       std::uint16_t dwell_samples = 50) noexcept
