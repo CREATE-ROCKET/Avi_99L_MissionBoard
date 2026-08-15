@@ -1,0 +1,52 @@
+name: verify-vault-storage-finzero
+
+on:
+  push:
+    branches:
+      - fix/vault-storage-finzero-20260816
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: Apply checked patch
+        run: python3 tools/apply_vault_storage_finzero.py
+      - name: Check no accidental 15 percent production clamp
+        run: |
+          grep -q 'kProductionMotorMaximumDuty = 1.0' src/config/flight_config.hpp
+          ! grep -q 'kProductionMotorMaximumDuty = 0.15' src/config/flight_config.hpp
+          grep -q "kMotorPwmFrequencyHz = 30'000" src/config/board_config.hpp
+      - name: Check FinZero and calibration ownership
+        run: |
+          ! grep -q '起動時の物理直進位置を0 degとみなす暫定zero' src/runtime/production_runtime.cpp
+          grep -q 'context.fin_safe_commands_supported = true' src/runtime/production_runtime.cpp
+          grep -q 'preflight_calibration_active' src/runtime/production_runtime.cpp
+          grep -q 'exportRawFlashAndErase' src/runtime/production_runtime.cpp
+      - name: Check whitespace
+        run: git diff --check
+      - name: Configure host tests
+        run: cmake -S host_test -B build/host -DCMAKE_BUILD_TYPE=Debug
+      - name: Build host tests
+        run: cmake --build build/host --parallel 2
+      - name: Run host tests
+        run: ctest --test-dir build/host --output-on-failure
+      - name: Install PlatformIO
+        run: python3 -m pip install platformio
+      - name: Build production firmware
+        run: AVI_99L_MOTOR_PROFILE_ID=1 pio run -e avi_99l_missionboard
+      - name: Commit verified change
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git rm tools/apply_vault_storage_finzero.py .github/workflows/verify-vault-storage-finzero.yml
+          git add src/config/board_config.hpp src/config/flight_config.hpp src/runtime/flight_storage.cpp src/runtime/flight_storage.hpp src/runtime/production_runtime.cpp
+          git commit -m "fix(mission): align storage and fin setup with Vault"
+          git push origin HEAD:fix/vault-storage-finzero-20260816
