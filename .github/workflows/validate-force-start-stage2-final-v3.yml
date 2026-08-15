@@ -1,0 +1,59 @@
+name: Validate ForceStart Stage 2 final v3
+
+on:
+  push:
+    branches:
+      - chatgpt/99l-force-start-stage2-final-v3
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: Apply persistence reason transform
+        run: python3 tools/apply_force_start_stage2_persistence_reason.py
+      - name: Check reason/status invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          grep -F 'parachuteCorruptionDetail' src/runtime/production_runtime.cpp
+          grep -F 'persistenceRuntimeDetail' src/runtime/production_runtime.cpp
+          grep -F 'open_v1 corrupted: reason=%u' src/runtime/production_runtime.cpp
+          grep -F 'uint16_t{1U << 4U}' src/runtime/production_runtime.cpp
+          ! grep -F '0x1F00U | failure' src/runtime/production_runtime.cpp
+          grep -F 'bit15=1はblob corruptionではなくpersistence runtime failure' src/runtime/production_runtime.cpp
+      - name: Build and run host tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S host_test -B build/host_test -DCMAKE_BUILD_TYPE=Debug
+          cmake --build build/host_test --parallel 2
+          ctest --test-dir build/host_test --output-on-failure
+      - name: Build production firmware with PlatformIO
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv .venv-platformio
+          .venv-platformio/bin/pip install --disable-pip-version-check platformio
+          .venv-platformio/bin/pio run -e avi_99l_missionboard
+      - name: Materialize validated output
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm tools/apply_force_start_stage2_persistence_reason.py
+          rm .github/workflows/validate-force-start-stage2-final-v3.yml
+          rm -rf build/host_test .venv-platformio .pio
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git diff --cached --check
+          git commit -m 'chore: materialize validated persistence reasons'
+          git push origin HEAD:chatgpt/99l-force-start-stage2-final-v3
