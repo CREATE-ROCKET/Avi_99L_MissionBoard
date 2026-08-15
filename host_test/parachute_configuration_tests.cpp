@@ -171,6 +171,12 @@ void testBlobValidation() {
 }
 
 void testTransactionAndRebootLoad() {
+  ParachuteConfigurationState missing_keys;
+  missing_keys.replaceLoadedConfiguration({});
+  require(!missing_keys.active().open.has_value() &&
+              !missing_keys.active().close.has_value(),
+          "missing keys must load as unconfigured endpoints");
+
   ParachuteConfigurationState state;
   ParachuteConfiguration loaded{};
   loaded.open = angle(100);
