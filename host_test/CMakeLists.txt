@@ -50,3 +50,15 @@ target_compile_options(mission_state_safety_regression_tests PRIVATE
 
 add_test(NAME mission_state_safety_regression_tests
          COMMAND mission_state_safety_regression_tests)
+
+add_executable(flight_log_tests
+  flight_log_tests.cpp
+  ../src/runtime/flight_log.cpp
+)
+target_include_directories(flight_log_tests PRIVATE ../src)
+target_compile_features(flight_log_tests PRIVATE cxx_std_17)
+target_compile_options(flight_log_tests PRIVATE
+  -Wall -Wextra -Wpedantic -Werror
+)
+
+add_test(NAME flight_log_tests COMMAND flight_log_tests)
