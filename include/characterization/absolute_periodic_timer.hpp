@@ -58,9 +58,10 @@ public:
 
   [[nodiscard]] esp_err_t start(std::uint64_t first_alarm_us,
                                 std::uint32_t period_us) noexcept {
-    if (timer_ == nullptr || !enabled_ || running_ || period_us == 0U ||
-        first_alarm_us <= period_us)
+    if (timer_ == nullptr || !enabled_ || running_)
       return ESP_ERR_INVALID_STATE;
+    if (period_us == 0U || first_alarm_us <= period_us)
+      return ESP_ERR_INVALID_ARG;
 
     const std::int64_t current = esp_timer_get_time();
     if (current < 0 || first_alarm_us <= static_cast<std::uint64_t>(current))
@@ -80,6 +81,12 @@ public:
     running_ = true;
 
     result = synchronizeToEspTimer();
+    if (result == ESP_OK) {
+      const std::int64_t synchronized_now = esp_timer_get_time();
+      if (synchronized_now < 0 ||
+          first_alarm_us <= static_cast<std::uint64_t>(synchronized_now))
+        result = ESP_ERR_TIMEOUT;
+    }
     if (result != ESP_OK) {
       const esp_err_t stop_result = gptimer_stop(timer_);
       running_ = false;
@@ -128,7 +135,7 @@ private:
       const std::int64_t after = esp_timer_get_time();
       if (result != ESP_OK)
         return result;
-      if (after < before || before < 0)
+      if (after < before)
         continue;
 
       const std::uint64_t bracket =
