@@ -36,6 +36,20 @@ esp_err_t CommandJournal::stopForError(esp_err_t cause,
   return cause;
 }
 
+bool CommandJournal::requestAlreadyApplied(
+    const MotorCommandRequest &request) const noexcept {
+  return current_.command_generation != 0U &&
+         current_.apply_result_code == ESP_OK &&
+         current_applied_.result_code == ESP_OK &&
+         current_.requested_command_permille == request.command_permille &&
+         current_.requested_motor_mode == request.mode &&
+         current_.applied_command_permille == request.command_permille &&
+         current_.applied_motor_mode == request.mode &&
+         current_applied_.applied_command_permille ==
+             request.command_permille &&
+         current_applied_.applied_mode == request.mode;
+}
+
 esp_err_t CommandJournal::apply(const MotorCommandRequest &request,
                                 std::uint64_t now_us) noexcept {
   const bool valid_request =
@@ -44,6 +58,13 @@ esp_err_t CommandJournal::apply(const MotorCommandRequest &request,
           kMaximumCommandPermille;
   const bool needs_arm =
       request.command_permille != 0 || request.mode == MotorMode::Brake;
+
+  if (valid_request && (!needs_arm || armed_) && callback_ != nullptr &&
+      requestAlreadyApplied(request)) {
+    // 物理出力が同じならhardwareへ再applyせず、実際の最終apply時刻と
+    // generationを保持する。logger snapshot時刻だけsnapshot()で更新する。
+    return ESP_OK;
+  }
 
   esp_err_t result = ESP_OK;
   if (!valid_request)
@@ -79,6 +100,34 @@ esp_err_t CommandJournal::apply(const MotorCommandRequest &request,
   current_.command_apply_timestamp_us =
       current_applied_.command_apply_timestamp_us;
   return requested_result;
+}
+
+esp_err_t CommandJournal::rejectAndCoast(
+    const MotorCommandRequest &request, esp_err_t cause,
+    std::uint64_t now_us) noexcept {
+  if (cause == ESP_OK ||
+      !motorModeMatchesCommand(request.command_permille, request.mode) ||
+      std::abs(static_cast<int>(request.command_permille)) >
+          kMaximumCommandPermille)
+    return ESP_ERR_INVALID_ARG;
+
+  current_ = {};
+  current_.command_generation = next_generation_++;
+  current_.requested_command_permille = request.command_permille;
+  current_.requested_motor_mode = request.mode;
+  current_.logger_snapshot_timestamp_us = now_us;
+
+  const esp_err_t coast_result = applyCoast(now_us);
+  armed_ = false;
+  current_.applied_command_permille =
+      current_applied_.applied_command_permille;
+  current_.applied_motor_mode = current_applied_.applied_mode;
+  current_.apply_result_code = cause;
+  current_.command_apply_timestamp_us =
+      current_applied_.command_apply_timestamp_us;
+  // 診断原因を返す。Coast失敗はcurrent_applied_.result_codeに残る。
+  (void)coast_result;
+  return cause;
 }
 
 ImmutableCommandEvidence CommandJournal::snapshot(

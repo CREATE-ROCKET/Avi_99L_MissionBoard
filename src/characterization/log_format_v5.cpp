@@ -175,9 +175,10 @@ bool shutdownPrefix(std::uint32_t mask) noexcept {
 
 bool fatalAcquisitionCountersAreZero(
     const SamplerStatistics &statistics) noexcept {
+  // startup epochのrepeated/skippedはstartup_incompleteで別管理し、
+  // steady_state_incomplete_epochsが0ならnormalを許可する。
   return statistics.trigger_coalesced_or_missed == 0U &&
          statistics.pre_epoch_samples == 0U &&
-         statistics.repeated_samples == 0U &&
          statistics.invalid_samples == 0U &&
          statistics.late_after_release == 0U &&
          statistics.steady_state_incomplete_epochs == 0U &&
@@ -514,15 +515,12 @@ DecodeError decodeRecord(const std::uint8_t *data, std::size_t size,
   record.command.requested_command_permille = getI16(data + 104U);
   record.command.applied_command_permille = getI16(data + 106U);
   record.power.motor_millivolts = getU16(data + 108U);
-  record.abort_reason =
-      static_cast<AbortReason>(getU16(data + 110U));
+  record.abort_reason = static_cast<AbortReason>(getU16(data + 110U));
   record.stage = static_cast<AssemblyStage>(data[112]);
   record.profile_phase = static_cast<ProfilePhase>(data[113]);
   record.approach_branch = static_cast<ApproachBranch>(data[114]);
-  record.command.requested_motor_mode =
-      static_cast<MotorMode>(data[115]);
-  record.command.applied_motor_mode =
-      static_cast<MotorMode>(data[116]);
+  record.command.requested_motor_mode = static_cast<MotorMode>(data[115]);
+  record.command.applied_motor_mode = static_cast<MotorMode>(data[116]);
   record.guard_state = static_cast<GuardState>(data[117]);
   if (data[118] > 1U)
     return DecodeError::Enum;
@@ -538,8 +536,7 @@ DecodeError decodeRecord(const std::uint8_t *data, std::size_t size,
       static_cast<std::uint8_t>(record.encoder.valid_sample_count +
                                 record.encoder.invalid_sample_count);
   record.encoder.flags = getU16(data + 126U);
-  record.zero_reference_kind =
-      static_cast<ZeroReferenceKind>(data[128]);
+  record.zero_reference_kind = static_cast<ZeroReferenceKind>(data[128]);
   record.run_kind = static_cast<RunKind>(data[129]);
   record.qualification = data[130];
   record.first_error = getI32(data + 132U);
@@ -595,8 +592,7 @@ DecodeError decodeRecord(const std::uint8_t *data, std::size_t size,
           static_cast<std::uint8_t>(GuardState::Abort) ||
       static_cast<std::uint16_t>(record.abort_reason) >
           static_cast<std::uint16_t>(AbortReason::StageError) ||
-      record.qualification > 2U ||
-      !knownRun(record.run_kind))
+      record.qualification > 2U || !knownRun(record.run_kind))
     return DecodeError::Enum;
   if (hasError(validateRecord(record)))
     return DecodeError::Invariant;
@@ -624,8 +620,7 @@ DecodeError decodeFooter(const std::uint8_t *data, std::size_t size,
   footer = {};
   footer.completion = static_cast<CompletionCode>(data[12]);
   footer.rate_supported = data[13] == 1U;
-  footer.unsupported_reason =
-      static_cast<UnsupportedReason>(data[14]);
+  footer.unsupported_reason = static_cast<UnsupportedReason>(data[14]);
   footer.total_records = getU64(data + 16U);
   footer.first_sequence = getU64(data + 24U);
   footer.last_sequence = getU64(data + 32U);
@@ -704,8 +699,7 @@ CaptureSummary validateCapture(const std::uint8_t *data,
     ImmutableLogRecord record{};
     const std::size_t offset =
         kHeaderBytes + static_cast<std::size_t>(index) * kRecordBytes;
-    summary.error =
-        decodeRecord(data + offset, kRecordBytes, record);
+    summary.error = decodeRecord(data + offset, kRecordBytes, record);
     if (summary.error != DecodeError::None)
       return summary;
     if (record.stage != header.stage ||
@@ -759,6 +753,16 @@ CaptureSummary validateCapture(const std::uint8_t *data,
         return summary;
       }
     }
+    if (index != 0U &&
+        record.command.command_generation >
+            previous_record.command.command_generation &&
+        (record.command.command_apply_timestamp_us <=
+             previous_record.command.command_apply_timestamp_us ||
+         record.command.command_apply_timestamp_us <
+             record.encoder.epoch_start_timestamp_us)) {
+      summary.error = DecodeError::Invariant;
+      return summary;
+    }
     for (std::size_t slot = 0U;
          slot < kMaximumEncoderSamplesPerEpoch; ++slot) {
       if (!record.encoder.sample_present[slot])
@@ -806,13 +810,11 @@ CaptureSummary validateCapture(const std::uint8_t *data,
     previous_epoch = record.encoder.epoch_index;
     previous_record = record;
   }
-  summary.last_sequence =
-      record_count == 0U ? 0U : previous_sequence;
+  summary.last_sequence = record_count == 0U ? 0U : previous_sequence;
 
   LogFooterV5 footer{};
   const std::size_t footer_offset = kHeaderBytes + payload_size;
-  summary.error =
-      decodeFooter(data + footer_offset, kFooterBytes, footer);
+  summary.error = decodeFooter(data + footer_offset, kFooterBytes, footer);
   if (summary.error != DecodeError::None)
     return summary;
   if (footer.total_records != record_count ||

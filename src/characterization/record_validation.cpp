@@ -58,9 +58,10 @@ validateRecord(const ImmutableLogRecord &record) noexcept {
     error = error | RecordValidationError::InvalidGeneration;
   if (record.command.command_generation == 0U)
     error = error | RecordValidationError::InvalidGeneration;
+
+  // command_apply_timestampは「現在のapplied stateへ最後に遷移した実時刻」。
+  // 同一commandが複数epoch継続する場合はepoch_startより前であることが正常。
   if (record.command.command_apply_timestamp_us == 0U ||
-      record.command.command_apply_timestamp_us <
-          record.encoder.epoch_start_timestamp_us ||
       record.command.command_apply_timestamp_us >
           record.encoder.release_timestamp_us ||
       record.encoder.release_timestamp_us >
@@ -69,10 +70,14 @@ validateRecord(const ImmutableLogRecord &record) noexcept {
           record.command.command_apply_timestamp_us)
     error = error | RecordValidationError::InvalidCommandTimestamp;
   const EncoderEpochBlock &block = record.encoder;
+  const bool command_applied_this_epoch =
+      record.command.command_apply_timestamp_us >=
+      record.encoder.epoch_start_timestamp_us;
   const bool command_apply_late =
+      command_applied_this_epoch &&
       record.command.command_apply_timestamp_us >
-      record.encoder.epoch_start_timestamp_us +
-          kConsumerDeadlineBudgetUs;
+          record.encoder.epoch_start_timestamp_us +
+              kConsumerDeadlineBudgetUs;
   if (command_apply_late && record.run_kind == RunKind::Full &&
       (record.first_error == 0 ||
        record.abort_reason != AbortReason::Deadline))

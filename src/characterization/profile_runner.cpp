@@ -113,8 +113,9 @@ UnsupportedReason unsupportedReason(
     const SamplerStatistics &statistics) noexcept {
   if (statistics.trigger_coalesced_or_missed != 0U)
     return UnsupportedReason::TriggerCoalesced;
+  // repeated/skippedがstartup epochだけに存在する場合はqualificationを落とさない。
+  // steady側の欠落はsteady_state_incomplete_epochsで必ず検出する。
   if (statistics.pre_epoch_samples != 0U ||
-      statistics.repeated_samples != 0U ||
       statistics.late_after_release != 0U ||
       statistics.steady_state_incomplete_epochs != 0U)
     return UnsupportedReason::IncompleteEpoch;
@@ -700,6 +701,21 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
     (void)campaign_.finishRun(RunOutcome::Failed);
     return first_error;
   }
+
+  // epoch zeroより十分前に安全なCoastを一度だけ実機へ確定する。
+  // 以後同じcommandはCommandJournalがdedupし、実際の最終apply時刻を保持する。
+  first_error = journal_.apply({0, MotorMode::Coast}, nowUs());
+  if (first_error != ESP_OK) {
+    (void)journal_.disarm(nowUs());
+    (void)sampler_.stop();
+    (void)power_sampler_.stop();
+    LogFooterV5 footer{};
+    footer.statistics.first_error = first_error;
+    (void)writer_.abortAndClose(footer);
+    (void)campaign_.finishRun(RunOutcome::Failed);
+    return first_error;
+  }
+
   FixedEpochAssembler assembler(rate, kConsumerDeadlineBudgetUs);
   assembler.reset(epoch_zero, zero_raw);
   PositionGuard guard(
@@ -721,6 +737,9 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
   ShutdownSequence shutdown{};
   bool qualification_stop = false;
   std::uint64_t runtime_deadline_misses = 0U;
+  std::uint64_t command_deadline_misses = 0U;
+  std::uint64_t release_deadline_misses = 0U;
+  std::uint64_t consumer_schedule_misses = 0U;
 
   const auto stopForFatal = [&](esp_err_t cause, AbortReason reason,
                                 std::uint64_t timestamp_us) noexcept {
@@ -863,25 +882,42 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
       }
     }
 
+    // 100 us deadlineは「このepochでhardware stateを変える必要がある場合」だけ
+    // 評価する。継続中のCoast/Drive/Brakeは過去の実apply時刻をそのまま保持する。
+    const bool command_change_required =
+        !journal_.requestAlreadyApplied(request);
+    const ImmutableCommandEvidence before_command = journal_.snapshot(nowUs());
     const std::uint64_t apply_started_us = nowUs();
-    bool apply_deadline_missed = apply_started_us > apply_deadline;
+    bool apply_deadline_missed =
+        command_change_required && apply_started_us > apply_deadline;
+    esp_err_t apply_result = ESP_OK;
     if (apply_deadline_missed) {
       ++runtime_deadline_misses;
-      request = {0, MotorMode::Coast};
+      ++command_deadline_misses;
       guard_state = GuardState::Abort;
+      // 遅れたDrive/Brakeを実機へ出さない。requestedは元指令のまま残し、
+      // applied=Coast/result=timeoutとして一つのgenerationへ記録する。
+      apply_result = journal_.rejectAndCoast(
+          request, ESP_ERR_TIMEOUT, apply_started_us);
+    } else {
+      apply_result = journal_.apply(request, apply_started_us);
     }
-    const esp_err_t apply_result = journal_.apply(request, apply_started_us);
+    ImmutableCommandEvidence epoch_command = journal_.snapshot(nowUs());
+    const bool command_generation_changed =
+        epoch_command.command_generation != before_command.command_generation;
     const std::uint64_t apply_completed_us =
-        journal_.currentApplied().command_apply_timestamp_us;
-    if (!apply_deadline_missed && apply_completed_us > apply_deadline) {
+        epoch_command.command_apply_timestamp_us;
+    if (!apply_deadline_missed && command_generation_changed &&
+        apply_completed_us > apply_deadline) {
       apply_deadline_missed = true;
       ++runtime_deadline_misses;
+      ++command_deadline_misses;
       guard_state = GuardState::Abort;
     }
     // command generation/requested/applied/mode/apply timestampは同じrealtime ownerで
     // 一度だけ値copyし、writer taskはこのimmutable evidenceしか見ない。
-    ImmutableCommandEvidence epoch_command =
-        journal_.snapshot(std::max(nowUs(), apply_completed_us));
+    epoch_command.logger_snapshot_timestamp_us =
+        std::max(nowUs(), apply_completed_us);
     if (preapply_error != ESP_OK)
       stopForFatal(preapply_error, preapply_abort, nowUs());
     if (apply_deadline_missed) {
@@ -915,9 +951,10 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
       break;
     const bool release_deadline_missed =
         release_us > epoch_end + kConsumerDeadlineBudgetUs;
-    if (release_deadline_missed && !apply_deadline_missed)
-      ++runtime_deadline_misses;
     if (release_deadline_missed) {
+      ++release_deadline_misses;
+      if (!apply_deadline_missed)
+        ++runtime_deadline_misses;
       if (full)
         stopForFatal(ESP_ERR_TIMEOUT, AbortReason::Deadline, release_us);
       else
@@ -928,7 +965,9 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
         (consumer_notifications != 1U || release_us < epoch_end ||
          release_us >= epoch_end + kEpochDurationUs);
     if (consumer_schedule_invalid) {
-      ++runtime_deadline_misses;
+      ++consumer_schedule_misses;
+      if (!apply_deadline_missed)
+        ++runtime_deadline_misses;
       if (full)
         stopForFatal(ESP_ERR_TIMEOUT, AbortReason::Deadline, release_us);
       else
@@ -1017,9 +1056,9 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
     } else if (full && first_error == ESP_OK &&
                !((block.flags & EpochStartup) != 0U &&
                  block.epoch_index == 0U &&
-                 block.repeated_sample_count == 0U &&
                  block.invalid_sample_count == 0U &&
                  (block.flags & EpochDeadline) == 0U)) {
+      // startup epochだけはrepeated/skippedを許容する。steady-state欠落は即停止。
       stopForFatal(ESP_ERR_INVALID_RESPONSE, AbortReason::EncoderInvalid,
                    nowUs());
     }
@@ -1149,11 +1188,9 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
   statistics.steady_state_incomplete_epochs =
       epoch_statistics.steady_state_incomplete_epochs;
   statistics.consumer_deadline_misses = runtime_deadline_misses;
-  statistics.writer_queue_overflows =
-      writer_.writerQueueOverflows();
+  statistics.writer_queue_overflows = writer_.writerQueueOverflows();
   statistics.vbus_invalid_samples = vbus_invalid;
-  const UnsupportedReason acquisition_reason =
-      unsupportedReason(statistics);
+  const UnsupportedReason acquisition_reason = unsupportedReason(statistics);
   if (power_diagnostic_result != ESP_OK && first_error == ESP_OK) {
     first_error = power_diagnostic_result;
     last_abort_reason_ = AbortReason::VbusInvalid;
@@ -1163,8 +1200,7 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
     first_error = sampler_diagnostic_result == ESP_OK
                       ? ESP_ERR_INVALID_RESPONSE
                       : sampler_diagnostic_result;
-    last_abort_reason_ =
-        abortReasonForAcquisition(acquisition_reason);
+    last_abort_reason_ = abortReasonForAcquisition(acquisition_reason);
   } else if (!full && acquisition_reason == UnsupportedReason::None &&
              sampler_diagnostic_result != ESP_OK && first_error == ESP_OK) {
     first_error = sampler_diagnostic_result;
@@ -1229,6 +1265,7 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
         "valid=%u total=%u trigger-coalesced=%llu pre-epoch=%llu "
         "repeated=%llu skipped=%llu invalid=%llu late=%llu "
         "startup-incomplete=%llu steady-incomplete=%llu deadline=%llu "
+        "command-deadline=%llu release-deadline=%llu schedule-miss=%llu "
         "raw-queue-overflow=%llu writer-queue-overflow=%llu "
         "encoder-transport=%llu encoder-status=%llu vbus-invalid=%llu "
         "first-error=%s\n",
@@ -1247,6 +1284,9 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
         static_cast<unsigned long long>(
             statistics.steady_state_incomplete_epochs),
         static_cast<unsigned long long>(statistics.consumer_deadline_misses),
+        static_cast<unsigned long long>(command_deadline_misses),
+        static_cast<unsigned long long>(release_deadline_misses),
+        static_cast<unsigned long long>(consumer_schedule_misses),
         static_cast<unsigned long long>(statistics.raw_queue_overflows),
         static_cast<unsigned long long>(statistics.writer_queue_overflows),
         static_cast<unsigned long long>(statistics.encoder_transport_errors),

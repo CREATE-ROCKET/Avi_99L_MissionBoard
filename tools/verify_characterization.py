@@ -302,7 +302,7 @@ def _decode_record(raw: bytes, header: dict[str, object], index: int) -> dict[st
     _need(epoch_start == expected_start and epoch_end == expected_start + 1000, f"record {index} fixed epoch boundary mismatch")
     _need(release >= epoch_end and lateness == min(release - epoch_end, 0x7FFF_FFFF), f"record {index} release/lateness mismatch")
     _need(
-        snapshot_us != 0 and epoch_start <= apply_us <= release <= snapshot_us,
+        snapshot_us != 0 and apply_us != 0 and apply_us <= release <= snapshot_us,
         f"record {index} command timestamps tear",
     )
     _need(generation != 0, f"record {index} command generation is zero")
@@ -332,7 +332,7 @@ def _decode_record(raw: bytes, header: dict[str, object], index: int) -> dict[st
     _need(bool(epoch_flags & EPOCH_REPEATED) == (repeated != 0), f"record {index} repeated flag tears")
     _need(bool(epoch_flags & EPOCH_SKIPPED) == (skipped != 0), f"record {index} skipped flag tears")
     _need(bool(epoch_flags & EPOCH_INVALID) == (invalid != 0), f"record {index} invalid flag tears")
-    command_apply_late = apply_us > epoch_start + 100
+    command_apply_late = apply_us >= epoch_start and apply_us > epoch_start + 100
     _need(
         bool(epoch_flags & EPOCH_DEADLINE)
         == (lateness > 100 or command_apply_late),
@@ -502,8 +502,10 @@ def verify_bytes(data: bytes, source: str = "<memory>") -> dict[str, object]:
             else:
                 _need(
                     int(right["command_apply_timestamp_us"])
-                    > int(left["command_apply_timestamp_us"]),
-                    "new command generation did not advance apply timestamp",
+                    > int(left["command_apply_timestamp_us"])
+                    and int(right["command_apply_timestamp_us"])
+                    >= int(right["epoch_start_timestamp_us"]),
+                    "new command generation has an invalid apply timestamp",
                 )
     else:
         _need(footer["first_sequence"] == 0 and footer["last_sequence"] == 0, "empty capture has nonzero sequence bounds")
@@ -587,7 +589,7 @@ def verify_bytes(data: bytes, source: str = "<memory>") -> dict[str, object]:
     fatal_counters = (
         footer["counters"]["trigger_coalesced_missed"],
         footer["counters"]["pre_epoch"],
-        footer["counters"]["repeated"],
+        # repeated/skippedがstartup epochだけならsteady_state_incompleteは増えない。
         footer["counters"]["invalid"],
         footer["counters"]["late_after_release"],
         footer["counters"]["raw_queue_overflow"],
@@ -845,7 +847,10 @@ def self_test() -> None:
     _need(decoded["epochs"][0]["skipped_raw_sample_count"] == 1, "4-sample epoch was not preserved")
     _need(decoded["epochs"][1]["valid_raw_sample_count"] == 5, "next epoch borrowed/lost a sample")
 
+    first_record = HEADER_SIZE
     second_record = HEADER_SIZE + RECORD_SIZE
+    first_apply = struct.unpack_from("<Q", valid, first_record + 44)[0]
+    first_generation = struct.unpack_from("<Q", valid, first_record + 68)[0]
     second_epoch_start = struct.unpack_from("<Q", valid, second_record + 20)[0]
     apply_at_budget = bytearray(valid)
     struct.pack_into("<Q", apply_at_budget, second_record + 44, second_epoch_start + 100)
@@ -855,9 +860,23 @@ def self_test() -> None:
         "100 us command-apply budget boundary failed",
     )
 
+    # 同じgeneration/stateが継続する場合、apply時刻は現在epochより前でよい。
+    stable_command = bytearray(valid)
+    struct.pack_into("<Q", stable_command, second_record + 44, first_apply)
+    struct.pack_into("<Q", stable_command, second_record + 68, first_generation)
+    stable_decoded = verify_bytes(refresh_mutation(stable_command, 1))
+    _need(
+        stable_decoded["epochs"][1]["command_apply_timestamp_us"] == first_apply,
+        "stable command did not preserve its original apply timestamp",
+    )
+
+    # 新generationなのに現在epochより前のapply時刻は不正。
     apply_before_epoch = bytearray(valid)
     struct.pack_into("<Q", apply_before_epoch, second_record + 44, second_epoch_start - 1)
-    expect_rejected(refresh_mutation(apply_before_epoch, 1), "command timestamps")
+    expect_rejected(
+        refresh_mutation(apply_before_epoch, 1),
+        "new command generation has an invalid apply timestamp",
+    )
 
     unflagged_late_apply = bytearray(valid)
     struct.pack_into("<Q", unflagged_late_apply, second_record + 44, second_epoch_start + 101)

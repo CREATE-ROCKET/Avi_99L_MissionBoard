@@ -28,8 +28,17 @@ public:
                                        std::uint64_t now_us) noexcept;
   [[nodiscard]] bool armed() const noexcept { return armed_; }
 
+  // 同一requested/applied stateが正常に継続している場合はtrue。
+  // この場合apply()はhardware I/Oもgeneration更新も行わない。
+  [[nodiscard]] bool
+  requestAlreadyApplied(const MotorCommandRequest &request) const noexcept;
   [[nodiscard]] esp_err_t apply(const MotorCommandRequest &request,
                                 std::uint64_t now_us) noexcept;
+  // deadline等で要求を実機へ適用してはいけない場合、requested証拠を保持したまま
+  // Coastへ安全化し、applied/result/timestampを同じgenerationへ記録する。
+  [[nodiscard]] esp_err_t
+  rejectAndCoast(const MotorCommandRequest &request, esp_err_t cause,
+                 std::uint64_t now_us) noexcept;
   [[nodiscard]] MotorCommandApplied currentApplied() const noexcept {
     return current_applied_;
   }
