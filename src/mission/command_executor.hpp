@@ -26,7 +26,7 @@ enum class CommandCode : uint8_t {
   para_close = 0x26,
   run_preflight_calibration = 0x30,
   export_flash_log = 0x31,
-  select_motor_profile = 0x32,
+  enter_recovery = 0x33,
   actuator_emergency_result = 0xF0,
   liftoff_emergency_result = 0xF1,
 };
@@ -37,7 +37,7 @@ enum class CommandDomain : uint8_t {
   parachute,
   calibration,
   storage,
-  motor_profile,
+  recovery,
   count,
 };
 
@@ -51,7 +51,7 @@ struct CommandContext {
   bool motor_test_busy{};
   bool calibration_supported{};
   bool storage_export_supported{};
-  bool motor_profile_selection_supported{};
+  bool deployment_power_cutoff_done{};
   bool fin_safe_commands_supported{};
 };
 
