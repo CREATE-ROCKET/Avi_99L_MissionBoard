@@ -65,6 +65,7 @@ private:
   SemaphoreHandle_t stop_ack_{nullptr};
   std::uint64_t next_scheduled_us_{0};
   std::uint64_t epoch_zero_us_{0};
+  std::uint64_t first_sample_us_{0};
   std::uint64_t last_sampled_slot_{0};
   bool have_sampled_slot_{false};
   std::uint32_t period_us_{0};

@@ -17,6 +17,19 @@ std::uint32_t periodUs(EncoderRate rate) noexcept {
   return 1'000'000U / static_cast<std::uint32_t>(rate);
 }
 
+static_assert(1'000'000U /
+                  static_cast<std::uint32_t>(EncoderRate::Hz1000) /
+                  2U ==
+              500U);
+static_assert(1'000'000U /
+                  static_cast<std::uint32_t>(EncoderRate::Hz2000) /
+                  2U ==
+              250U);
+static_assert(1'000'000U /
+                  static_cast<std::uint32_t>(EncoderRate::Hz5000) /
+                  2U ==
+              100U);
+
 void rememberOperation(esp_err_t operation, esp_err_t &first) noexcept {
   if (first == ESP_OK && operation != ESP_OK)
     first = operation;
@@ -92,10 +105,10 @@ void EncoderSampler::taskLoop() {
 
     const std::uint64_t now_us = static_cast<std::uint64_t>(
         std::max<std::int64_t>(esp_timer_get_time(), 0));
-    if (now_us < epoch_zero_us_)
+    if (now_us < first_sample_us_)
       continue;
     const std::uint64_t ideal_slot =
-        (now_us - epoch_zero_us_) / period_us_;
+        (now_us - first_sample_us_) / period_us_;
     if (have_sampled_slot_ && ideal_slot <= last_sampled_slot_) {
       statistics_.trigger_coalesced_or_missed += notifications;
       continue;
@@ -110,13 +123,13 @@ void EncoderSampler::taskLoop() {
     last_sampled_slot_ = ideal_slot;
     have_sampled_slot_ = true;
     if (ideal_slot >
-        (std::numeric_limits<std::uint64_t>::max() - epoch_zero_us_) /
+        (std::numeric_limits<std::uint64_t>::max() - first_sample_us_) /
             period_us_) {
       rememberFirst(ESP_ERR_INVALID_SIZE);
       running_.store(false);
       continue;
     }
-    next_scheduled_us_ = epoch_zero_us_ + ideal_slot * period_us_;
+    next_scheduled_us_ = first_sample_us_ + ideal_slot * period_us_;
 
     if (!running_.load()) {
       acknowledgeStop();
@@ -180,8 +193,11 @@ void EncoderSampler::taskLoop() {
 
 esp_err_t EncoderSampler::begin(EncoderRate rate,
                                 std::uint64_t epoch_zero_us) {
+  const std::uint32_t period = periodUs(rate);
   if (running_.load() || !isSupportedEncoderRate(rate) ||
-      epoch_zero_us < periodUs(rate))
+      epoch_zero_us < period ||
+      epoch_zero_us >
+          std::numeric_limits<std::uint64_t>::max() - period / 2U)
     return ESP_ERR_INVALID_ARG;
 
   queue_.reset();
@@ -189,10 +205,14 @@ esp_err_t EncoderSampler::begin(EncoderRate rate,
   first_error_.store(ESP_OK);
   stop_cleanup_error_.store(ESP_OK);
   generation_ = 0U;
-  period_us_ = periodUs(rate);
+  period_us_ = period;
   samples_per_epoch_ = expectedSamplesPerEpoch(rate);
   epoch_zero_us_ = epoch_zero_us;
-  next_scheduled_us_ = epoch_zero_us - period_us_;
+  // raw sampleを各slot中央へ置き、1 ms epoch終端のconsumer releaseと
+  // encoder taskを同時刻に起こさない。epoch所属はcapture timestampで
+  // 従来どおり半開区間へ厳密に割り当てる。
+  first_sample_us_ = epoch_zero_us_ + period_us_ / 2U;
+  next_scheduled_us_ = first_sample_us_ - period_us_;
   last_sampled_slot_ = 0U;
   have_sampled_slot_ = false;
   startup_status_ = {};
@@ -261,7 +281,7 @@ esp_err_t EncoderSampler::begin(EncoderRate rate,
   }
 
   const std::int64_t timer_start_us =
-      static_cast<std::int64_t>(epoch_zero_us - period_us_);
+      static_cast<std::int64_t>(first_sample_us_ - period_us_);
   while (esp_timer_get_time() + 2'000 < timer_start_us)
     vTaskDelay(1U);
   while (esp_timer_get_time() < timer_start_us)
