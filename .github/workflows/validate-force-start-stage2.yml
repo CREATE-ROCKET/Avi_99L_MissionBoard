@@ -23,6 +23,7 @@ jobs:
           python3 tools/apply_force_start_stage2.py
           python3 tools/apply_force_start_stage2_followup.py
           python3 tools/apply_force_start_stage2_tests.py
+          python3 tools/apply_force_start_stage2_test_fixups.py
 
       - name: Check Stage 2 invariants
         shell: bash
@@ -63,6 +64,7 @@ jobs:
           rm tools/apply_force_start_stage2.py
           rm tools/apply_force_start_stage2_followup.py
           rm tools/apply_force_start_stage2_tests.py
+          rm tools/apply_force_start_stage2_test_fixups.py
           rm .github/workflows/validate-force-start-stage2.yml
           rm -rf build/host_test .venv-platformio .pio
           git config user.name 'github-actions[bot]'
