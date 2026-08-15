@@ -233,24 +233,26 @@ ProfileRunner::ProfileRunner(CampaignStateMachine &campaign,
     : campaign_(campaign), motor_(motor), sampler_(sampler), writer_(writer),
       journal_(motorApply, &motor_) {}
 
-void ProfileRunner::consumerTimerCallback(void *context) {
+bool ProfileRunner::consumerTimerCallback(
+    gptimer_handle_t, const gptimer_alarm_event_data_t *, void *context) {
   auto &runner = *static_cast<ProfileRunner *>(context);
-  // ESP_TIMER_ISRでは固定lifetimeのconsumer taskへ通知するだけに留める。
+  // GPTimer ISRでは固定lifetimeのconsumer taskへ通知するだけに留める。
   // SAFETY: consumerはchar_runtime taskでrun中に削除されず、ISRではI/Oを行わない。
   const TaskHandle_t consumer =
       runner.consumer_task_.load(std::memory_order_acquire);
   if (!runner.consumer_timer_running_.load(std::memory_order_acquire) ||
       consumer == nullptr)
-    return;
+    return false;
   BaseType_t task_awoken = pdFALSE;
   vTaskNotifyGiveFromISR(consumer, &task_awoken);
-  if (task_awoken == pdTRUE)
-    esp_timer_isr_dispatch_need_yield();
+  return task_awoken == pdTRUE;
 }
 
 esp_err_t ProfileRunner::startConsumerTimer(
     std::uint64_t epoch_zero_us) {
-  if (consumer_timer_running_.load())
+  if (consumer_timer_running_.load() ||
+      epoch_zero_us >
+          std::numeric_limits<std::uint64_t>::max() - kEpochDurationUs)
     return ESP_ERR_INVALID_STATE;
   const TaskHandle_t consumer = xTaskGetCurrentTaskHandle();
   if (consumer == nullptr)
@@ -259,45 +261,42 @@ esp_err_t ProfileRunner::startConsumerTimer(
   writer_.setFailureNotificationTask(consumer);
   sampler_.setFailureNotificationTask(consumer);
   power_sampler_.setFailureNotificationTask(consumer);
-  if (consumer_timer_ == nullptr) {
-    esp_timer_create_args_t arguments{};
-    arguments.callback = consumerTimerCallback;
-    arguments.arg = this;
-    arguments.dispatch_method = ESP_TIMER_ISR;
-    arguments.name = "char_consumer";
-    arguments.skip_unhandled_events = true;
-    const esp_err_t create_result =
-        esp_timer_create(&arguments, &consumer_timer_);
-    if (create_result != ESP_OK) {
+
+  if (!consumer_timer_.initialized()) {
+    const esp_err_t initialize_result =
+        consumer_timer_.initialize(consumerTimerCallback, this);
+    if (initialize_result != ESP_OK) {
       (void)stopConsumerTimer();
-      return create_result;
+      return initialize_result;
     }
   }
+
   (void)xTaskNotifyStateClear(consumer);
   (void)ulTaskNotifyValueClear(consumer,
                                std::numeric_limits<std::uint32_t>::max());
+
+  // first alarmをepoch 0終端の絶対時刻へ設定し、その後はhardware auto-reloadで
+  // 固定1 ms周期を維持する。timer arm後のtask schedulingはalarm位相へ影響しない。
+  consumer_timer_running_.store(true, std::memory_order_release);
+  const esp_err_t result = consumer_timer_.start(
+      epoch_zero_us + kEpochDurationUs, kEpochDurationUs);
+  if (result != ESP_OK) {
+    consumer_timer_running_.store(false, std::memory_order_release);
+    (void)stopConsumerTimer();
+    return result;
+  }
+
+  // epoch 0のcommand処理は従来どおりepoch zeroから開始する。
   while (nowUs() + 2'000U < epoch_zero_us)
     vTaskDelay(1U);
   while (nowUs() < epoch_zero_us)
     taskYIELD();
-
-  // epoch zeroから固定1 ms gridでISR callbackを開始する。
-  // rate-checkでは100 us release deadlineを維持し、基準自体は緩和しない。
-  consumer_timer_running_.store(true, std::memory_order_release);
-  const esp_err_t result =
-      esp_timer_start_periodic(consumer_timer_, kEpochDurationUs);
-  if (result != ESP_OK) {
-    consumer_timer_running_.store(false, std::memory_order_release);
-    (void)stopConsumerTimer();
-  }
-  return result;
+  return ESP_OK;
 }
 
 esp_err_t ProfileRunner::stopConsumerTimer() noexcept {
   consumer_timer_running_.store(false, std::memory_order_release);
-  esp_err_t result = ESP_OK;
-  if (consumer_timer_ != nullptr && esp_timer_is_active(consumer_timer_))
-    result = esp_timer_stop(consumer_timer_);
+  const esp_err_t result = consumer_timer_.stop();
   writer_.setFailureNotificationTask(nullptr);
   sampler_.setFailureNotificationTask(nullptr);
   power_sampler_.setFailureNotificationTask(nullptr);
@@ -1112,7 +1111,7 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
     record.stage = campaign_.stage();
     record.encoder_rate = rate;
     record.profile_phase = episode.phase;
-    record.approach_branch = episode.branch;
+    record.approach_branch = episode.approach_branch;
     record.zero_reference_kind = plan.zeroReferenceKind();
     record.run_kind = run_kind;
     record.qualification = full ? 1U : 0U;
