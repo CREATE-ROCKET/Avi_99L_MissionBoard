@@ -69,6 +69,17 @@ struct ImuStreamResult {
   [[nodiscard]] bool passed() const;
 };
 
+enum class ImuHeartbeatWaitResult : std::uint8_t {
+  unavailable = 0,
+  ready,
+  failed,
+};
+
+// ProductionでFIFO付きICM42688を所有するtaskだけが使用できる。
+// GPIO INT/FIFO watermarkを待ち、登録sourceが無いbuildではunavailableを返す。
+[[nodiscard]] ImuHeartbeatWaitResult
+waitRegisteredImuHeartbeat(std::uint32_t timeout_ms) noexcept;
+
 class ImuBringup {
 public:
   static constexpr std::size_t kMaximumFifoBatch = 16;

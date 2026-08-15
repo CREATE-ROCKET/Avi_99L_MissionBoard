@@ -21,6 +21,33 @@ constexpr uint32_t kFifoWaitTimeoutMs = 5;
 // TODO(HW_TEST): 指定sample数取得時の終了猶予を実機で確定する
 constexpr uint64_t kCaptureCompletionMarginUs = 100'000;
 
+#if defined(AVI_99L_IMU_HEARTBEAT_CLOCK) && AVI_99L_IMU_HEARTBEAT_CLOCK
+std::atomic<ImuBringup *> g_heartbeat_source{nullptr};
+std::atomic<TaskHandle_t> g_heartbeat_owner{nullptr};
+
+bool registerHeartbeatSource(ImuBringup *source) noexcept {
+  if (source == nullptr)
+    return false;
+  ImuBringup *const current =
+      g_heartbeat_source.load(std::memory_order_acquire);
+  if (current != nullptr && current != source)
+    return false;
+  const TaskHandle_t owner = xTaskGetCurrentTaskHandle();
+  if (owner == nullptr)
+    return false;
+  g_heartbeat_owner.store(owner, std::memory_order_release);
+  g_heartbeat_source.store(source, std::memory_order_release);
+  return true;
+}
+
+void unregisterHeartbeatSource(ImuBringup *source) noexcept {
+  if (g_heartbeat_source.load(std::memory_order_acquire) != source)
+    return;
+  g_heartbeat_source.store(nullptr, std::memory_order_release);
+  g_heartbeat_owner.store(nullptr, std::memory_order_release);
+}
+#endif
+
 class ExclusiveGuard {
 public:
   explicit ExclusiveGuard(std::atomic<bool> &busy) : busy_(busy) {
@@ -125,6 +152,26 @@ void includeFifoStatus(const ICM42688::FifoStatus &status,
 
 } // 無名名前空間
 
+ImuHeartbeatWaitResult
+waitRegisteredImuHeartbeat(std::uint32_t timeout_ms) noexcept {
+#if defined(AVI_99L_IMU_HEARTBEAT_CLOCK) && AVI_99L_IMU_HEARTBEAT_CLOCK
+  ImuBringup *const source =
+      g_heartbeat_source.load(std::memory_order_acquire);
+  const TaskHandle_t owner =
+      g_heartbeat_owner.load(std::memory_order_acquire);
+  if (source == nullptr || owner == nullptr ||
+      owner != xTaskGetCurrentTaskHandle() || !source->initialized() ||
+      !source->fifoEnabled())
+    return ImuHeartbeatWaitResult::unavailable;
+  return source->waitFifo(timeout_ms) == ESP_OK
+             ? ImuHeartbeatWaitResult::ready
+             : ImuHeartbeatWaitResult::failed;
+#else
+  (void)timeout_ms;
+  return ImuHeartbeatWaitResult::unavailable;
+#endif
+}
+
 bool ImuSelfTestResult::passed() const {
   return begin_result == ESP_OK && who_am_i_result == ESP_OK &&
          who_am_i == kExpectedWhoAmI && self_test_result == ESP_OK &&
@@ -155,11 +202,13 @@ esp_err_t ImuBringup::beginImpl(SpiBringup &spi, bool fifo_enabled) {
   config.frequency_hz = board::kImuSpiFrequencyHz;
   config.accel_range = ICM42688::AccelRange::g16;
   config.gyro_range = ICM42688::GyroRange::dps2000;
+  // 第五版審査書の表2とVault仕様に合わせ、productionも1000 Hzを維持する。
   config.accel_odr = ICM42688::AccelOdr::hz1000;
   config.gyro_odr = ICM42688::GyroOdr::hz1000;
   config.filter = ICM42688::Filter::odr_div4;
   config.int_gpio = board::kImuInterrupt;
   config.fifo.enabled = fifo_enabled;
+  // 1 recordごとのFIFO threshold INTを1 kHz realtime heartbeatに使う。
   config.fifo.watermark_records = 1;
   const esp_err_t result = imu_.begin(*bus, board::kImuCs, config);
   if (result == ESP_OK) {
@@ -256,8 +305,16 @@ esp_err_t ImuBringup::endImpl() {
 
 esp_err_t ImuBringup::begin(SpiBringup &spi, bool fifo_enabled) {
   ExclusiveGuard guard{busy_};
-  return guard.acquired() ? beginImpl(spi, fifo_enabled)
-                          : ESP_ERR_INVALID_STATE;
+  if (!guard.acquired())
+    return ESP_ERR_INVALID_STATE;
+  const esp_err_t result = beginImpl(spi, fifo_enabled);
+#if defined(AVI_99L_IMU_HEARTBEAT_CLOCK) && AVI_99L_IMU_HEARTBEAT_CLOCK
+  if (result == ESP_OK && fifo_enabled && !registerHeartbeatSource(this)) {
+    const esp_err_t cleanup = endImpl();
+    return cleanup == ESP_OK ? ESP_ERR_INVALID_STATE : cleanup;
+  }
+#endif
+  return result;
 }
 
 esp_err_t ImuBringup::read(ImuSample &sample) {
@@ -289,7 +346,14 @@ esp_err_t ImuBringup::readFifo(ImuSample *samples, std::size_t capacity,
 
 esp_err_t ImuBringup::end() {
   ExclusiveGuard guard{busy_};
-  return guard.acquired() ? endImpl() : ESP_ERR_INVALID_STATE;
+  if (!guard.acquired())
+    return ESP_ERR_INVALID_STATE;
+  const esp_err_t result = endImpl();
+#if defined(AVI_99L_IMU_HEARTBEAT_CLOCK) && AVI_99L_IMU_HEARTBEAT_CLOCK
+  if (!imu_.initialized())
+    unregisterHeartbeatSource(this);
+#endif
+  return result;
 }
 
 esp_err_t ImuBringup::selfTest(SpiBringup &spi,
