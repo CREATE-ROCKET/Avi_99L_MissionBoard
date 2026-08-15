@@ -3401,7 +3401,7 @@ void internalFlashTask(void *) {
         recovery_mode_command_sent.store(false, std::memory_order_release);
         recovery_mode_command_pending.store(true, std::memory_order_release);
         recovery_entry_deadline_us =
-            static_cast<uint64_t>(esp_timer_get_time()) + 2'000'000;
+            static_cast<uint64_t>(esp_timer_get_time()) + 1'000'000;
       }
       enter_waiting = false;
     }

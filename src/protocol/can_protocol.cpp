@@ -232,7 +232,7 @@ CanFrame encode(const PowerTimeTelemetry &message) {
   result.data[2] = message.motor_voltage_raw;
   putU16(result.data, 3, message.descent_elapsed_raw);
   putU16(result.data, 5, message.recovery_elapsed_raw);
-  result.data[7] = message.persistence_flags;
+  result.data[7] = static_cast<uint8_t>(message.persistence_flags & 0x87U);
   return result;
 }
 
