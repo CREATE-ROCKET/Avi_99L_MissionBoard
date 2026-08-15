@@ -68,6 +68,42 @@ const char *stageName(AssemblyStage stage) noexcept {
   return "NONE";
 }
 
+const char *completionName(CompletionCode completion) noexcept {
+  switch (completion) {
+  case CompletionCode::Normal:
+    return "normal";
+  case CompletionCode::Aborted:
+    return "aborted";
+  case CompletionCode::Unsupported:
+    return "unsupported";
+  }
+  return "unknown";
+}
+
+const char *unsupportedReasonName(UnsupportedReason reason) noexcept {
+  switch (reason) {
+  case UnsupportedReason::None:
+    return "None";
+  case UnsupportedReason::TriggerCoalesced:
+    return "TriggerCoalesced";
+  case UnsupportedReason::IncompleteEpoch:
+    return "IncompleteEpoch";
+  case UnsupportedReason::InvalidRead:
+    return "InvalidRead";
+  case UnsupportedReason::DeadlineMiss:
+    return "DeadlineMiss";
+  case UnsupportedReason::QueueOverflow:
+    return "QueueOverflow";
+  case UnsupportedReason::WriterFailure:
+    return "WriterFailure";
+  case UnsupportedReason::SensorHealth:
+    return "SensorHealth";
+  case UnsupportedReason::OperatorMarkedUnsupported:
+    return "OperatorMarkedUnsupported";
+  }
+  return "Unknown";
+}
+
 void rememberOperation(esp_err_t operation, esp_err_t &first) noexcept {
   if (first == ESP_OK && operation != ESP_OK)
     first = operation;
@@ -174,7 +210,8 @@ MotorCommandRequest positionApproachCommand(
   const std::int16_t limit = static_cast<std::int16_t>(std::clamp<int>(
       requested_limit, kApproachMinimumActivePermille,
       kApproachMaximumPermille));
-  const std::int64_t undamped = std::max<std::int64_t>(1, proportional - damping);
+  const std::int64_t undamped =
+      std::max<std::int64_t>(1, proportional - damping);
   const std::int16_t magnitude = static_cast<std::int16_t>(
       std::clamp<std::int64_t>(undamped, kApproachMinimumActivePermille,
                                limit));
@@ -235,10 +272,10 @@ esp_err_t ProfileRunner::startConsumerTimer(
     vTaskDelay(1U);
   while (nowUs() < epoch_zero_us)
     taskYIELD();
-  if (nowUs() > epoch_zero_us + kConsumerDeadlineBudgetUs) {
-    (void)stopConsumerTimer();
-    return ESP_ERR_TIMEOUT;
-  }
+
+  // scheduler都合でepoch zeroから100 us以上遅れただけでrun自体をFailedにしない。
+  // periodic timerを開始し、実際のcommand/release latenessを固定1 ms gridに対して
+  // 計測する。rate-checkならDeadlineMissとしてunsupported、fullなら安全停止する。
   consumer_timer_running_.store(true);
   const esp_err_t result =
       esp_timer_start_periodic(consumer_timer_, kEpochDurationUs);
@@ -886,9 +923,12 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
       else
         stopForQualification();
     }
-    if (!release_deadline_missed &&
+    const bool consumer_schedule_invalid =
+        !release_deadline_missed &&
         (consumer_notifications != 1U || release_us < epoch_end ||
-         release_us >= epoch_end + kEpochDurationUs)) {
+         release_us >= epoch_end + kEpochDurationUs);
+    if (consumer_schedule_invalid) {
+      ++runtime_deadline_misses;
       if (full)
         stopForFatal(ESP_ERR_TIMEOUT, AbortReason::Deadline, release_us);
       else
@@ -897,14 +937,19 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
 
     std::uint64_t snapshot_us = nowUs();
     PowerEvidence power_evidence{};
-    bool power_valid =
+    bool power_measurement_valid =
         power_sampler_.latest(snapshot_us, power_evidence) &&
         power_sampler_.firstError() == ESP_OK;
     snapshot_us = nowUs();
     if (power_evidence.capture_timestamp_us > snapshot_us ||
         (power_evidence.capture_timestamp_us != 0U &&
          snapshot_us - power_evidence.capture_timestamp_us > 100'000U))
-      power_valid = false;
+      power_measurement_valid = false;
+    // rate-checkはmotor電源を物理遮断した状態でも実施するため0 Vを許容する。
+    // fullだけは実駆動が必要なので、ADC計測が有効でも0 mVならVbusInvalidとする。
+    const bool motor_power_present = power_evidence.motor_millivolts > 0U;
+    const bool power_valid =
+        power_measurement_valid && (!full || motor_power_present);
     epoch_command.logger_snapshot_timestamp_us = snapshot_us;
     if (writer_.firstError() != ESP_OK) {
       stopForFatal(writer_.firstError(), AbortReason::WriterError,
@@ -1168,6 +1213,47 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
   const esp_err_t close_result = writer_.close(footer);
   rememberOperation(close_result, first_error);
   (void)shutdown.mark(ShutdownStep::Close);
+
+  if (!full) {
+    const CompletionCode reported_completion =
+        first_error != ESP_OK
+            ? CompletionCode::Aborted
+            : (supported ? CompletionCode::Normal
+                         : CompletionCode::Unsupported);
+    const UnsupportedReason reported_reason =
+        reported_completion == CompletionCode::Unsupported
+            ? unsupported
+            : UnsupportedReason::None;
+    std::printf(
+        "CHAR_RATE_RESULT rate=%u classification=%s reason=%s "
+        "valid=%u total=%u trigger-coalesced=%llu pre-epoch=%llu "
+        "repeated=%llu skipped=%llu invalid=%llu late=%llu "
+        "startup-incomplete=%llu steady-incomplete=%llu deadline=%llu "
+        "raw-queue-overflow=%llu writer-queue-overflow=%llu "
+        "encoder-transport=%llu encoder-status=%llu vbus-invalid=%llu "
+        "first-error=%s\n",
+        static_cast<unsigned>(rate), completionName(reported_completion),
+        unsupportedReasonName(reported_reason),
+        static_cast<unsigned>(qualification_valid),
+        static_cast<unsigned>(qualification_total),
+        static_cast<unsigned long long>(
+            statistics.trigger_coalesced_or_missed),
+        static_cast<unsigned long long>(statistics.pre_epoch_samples),
+        static_cast<unsigned long long>(statistics.repeated_samples),
+        static_cast<unsigned long long>(statistics.skipped_samples),
+        static_cast<unsigned long long>(statistics.invalid_samples),
+        static_cast<unsigned long long>(statistics.late_after_release),
+        static_cast<unsigned long long>(statistics.startup_incomplete_epochs),
+        static_cast<unsigned long long>(
+            statistics.steady_state_incomplete_epochs),
+        static_cast<unsigned long long>(statistics.consumer_deadline_misses),
+        static_cast<unsigned long long>(statistics.raw_queue_overflows),
+        static_cast<unsigned long long>(statistics.writer_queue_overflows),
+        static_cast<unsigned long long>(statistics.encoder_transport_errors),
+        static_cast<unsigned long long>(statistics.encoder_status_faults),
+        static_cast<unsigned long long>(statistics.vbus_invalid_samples),
+        esp_err_to_name(first_error));
+  }
 
   CampaignStatus finish_status = CampaignStatus::Ok;
   if (first_error != ESP_OK)

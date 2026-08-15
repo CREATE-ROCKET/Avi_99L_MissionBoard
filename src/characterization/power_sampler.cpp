@@ -39,10 +39,13 @@ void PowerSampler::taskLoop() {
           sample.timestamp_us > 0
               ? static_cast<std::uint64_t>(sample.timestamp_us)
               : 0U;
+      // ADC計測の有効性とmotor電源の存在は別概念として扱う。
+      // 非駆動rate-checkでは0 Vは「有効に0 Vを測定した」結果であり、
+      // VbusInvalidへラッチしてencoder qualificationを壊してはいけない。
       const bool valid =
           result == ESP_OK && sample.motor.calibrated_valid &&
           std::isfinite(sample.motor.source_voltage_v) &&
-          sample.motor.source_voltage_v > 0.0F;
+          sample.motor.source_voltage_v >= 0.0F;
       evidence.read_result =
           valid ? ESP_OK
                 : (result == ESP_OK ? ESP_ERR_INVALID_RESPONSE : result);
@@ -51,7 +54,7 @@ void PowerSampler::taskLoop() {
         evidence.motor_millivolts =
             static_cast<std::uint16_t>(std::clamp<long>(
                 std::lround(sample.motor.source_voltage_v * 1'000.0F),
-                1L, std::numeric_limits<std::uint16_t>::max()));
+                0L, std::numeric_limits<std::uint16_t>::max()));
       } else {
         rememberFirst(evidence.read_result);
       }
