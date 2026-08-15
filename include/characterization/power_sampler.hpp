@@ -2,7 +2,6 @@
 
 #include "characterization/characterization_types.hpp"
 #include "characterization/platform_compat.hpp"
-#include "characterization/spsc_ring.hpp"
 
 #if defined(ESP_PLATFORM)
 #include "freertos/FreeRTOS.h"
@@ -42,8 +41,8 @@ private:
   StaticSemaphore_t stop_ack_storage_{};
   SemaphoreHandle_t stop_ack_{nullptr};
   std::atomic<TaskHandle_t> failure_notification_task_{nullptr};
+  portMUX_TYPE latest_lock_ = portMUX_INITIALIZER_UNLOCKED;
 #endif
-  SpscRing<PowerEvidence, 32U> queue_{};
   PowerEvidence latest_{};
   std::atomic<bool> running_{false};
   std::atomic<bool> stop_waiting_{false};

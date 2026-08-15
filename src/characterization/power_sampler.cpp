@@ -59,10 +59,15 @@ void PowerSampler::taskLoop() {
       } else {
         rememberFirst(evidence.read_result);
       }
-      if (!queue_.push(evidence)) {
-        rememberFirst(ESP_ERR_NO_MEM);
-        running_.store(false);
-      }
+
+      // 公開APIはlatest()だけなので履歴queueは保持しない。
+      // char_runtimeが長いrun-start lead中にまだlatest()を呼ばなくても、
+      // 最新snapshotを上書きし続けて古いsampleの蓄積で停止しない。
+      portENTER_CRITICAL(&latest_lock_);
+      latest_ = evidence;
+      have_latest_ = true;
+      portEXIT_CRITICAL(&latest_lock_);
+
       (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
     }
     if (stop_waiting_.exchange(false)) {
@@ -76,9 +81,10 @@ void PowerSampler::taskLoop() {
 esp_err_t PowerSampler::begin() {
   if (running_.load() || !bringup::power::initialized())
     return ESP_ERR_INVALID_STATE;
-  queue_.reset();
+  portENTER_CRITICAL(&latest_lock_);
   latest_ = {};
   have_latest_ = false;
+  portEXIT_CRITICAL(&latest_lock_);
   first_error_.store(ESP_OK);
   if (task_ == nullptr) {
     // task/stackはobjectのstatic lifetime中保持し、ADCはこのtaskだけが読む。
@@ -115,17 +121,18 @@ esp_err_t PowerSampler::stop() noexcept {
 bool PowerSampler::latest(std::uint64_t snapshot_us,
                           PowerEvidence &evidence) noexcept {
   RateCheckStageScope timing(RateCheckStage::PowerLatest);
-  PowerEvidence candidate{};
-  while (queue_.pop(candidate)) {
-    latest_ = candidate;
-    have_latest_ = true;
-  }
-  if (!have_latest_) {
+  bool have_latest = false;
+  portENTER_CRITICAL(&latest_lock_);
+  have_latest = have_latest_;
+  if (have_latest)
+    evidence = latest_;
+  portEXIT_CRITICAL(&latest_lock_);
+
+  if (!have_latest) {
     evidence = {};
     evidence.read_result = ESP_ERR_NOT_FOUND;
     return false;
   }
-  evidence = latest_;
   if (evidence.capture_timestamp_us == 0U ||
       evidence.capture_timestamp_us > snapshot_us ||
       snapshot_us - evidence.capture_timestamp_us > 100'000U) {
