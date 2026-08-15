@@ -202,6 +202,8 @@ Mission Boardが停止・通信断になるまでに明示的な`EnterRecoveryBe
 - `7`: `UNKNOWN`
 - `8..255`: reserved
 
+MissionStatus ageが300 ms以上1.0 s未満の場合は`UNKNOWN(7)`とし、ageとstatus flag bit2を併用して`MISSION STATUS LATE`を表す。CAN healthが`CONTROLLER_ERROR(6)`の場合も専用reasonがないため`UNKNOWN(7)`とし、診断にはCAN healthを使用する。
+
 ### 9.2 status flags
 
 - bit0: valid MissionStatusをboot後に1回以上受信
@@ -217,8 +219,8 @@ Mission Boardが停止・通信断になるまでに明示的な`EnterRecoveryBe
 - bit10: GNSS stale
 - bit11: last PowerTimeTelemetryあり
 - bit12: last MissionState valid
-- bit13: CAN controller active
-- bit14: CAN runtime error
+- bit13: CAN controller active。CAN healthが`ACTIVE(1)`、`WARNING(2)`、`PASSIVE(3)`の場合に1
+- bit14: CAN runtime error。CAN healthが`WARNING(2)`、`PASSIVE(3)`、`BUS_OFF(4)`、`RECOVERING(5)`、`CONTROLLER_ERROR(6)`の場合に1
 - bit15: reserved=0
 
 ### 9.3 GNSS state
@@ -247,7 +249,7 @@ Mission Boardが停止・通信断になるまでに明示的な`EnterRecoveryBe
 
 A8中のlogic/motor voltageは最後にMission Boardから受信した値でありlive値ではない。Groundは`PowerTime age`を併記し、A8中はbattery remaining-time推定へこのstale値を使用しない。
 
-A8はmode entry、reason/GNSS/CAN health変化時に即時送信し、その後は約0.5秒周期を基本とする。
+A8はmode entryやreason/GNSS/CAN health変化を契機とする即時・追加送信を行わず、500 ms absolute periodic deadlineで通常生成する。各生成時には最新snapshotを使用する。送信競合時は既存の共通schedulerのpriority/fairness policyを適用し、A8専用の前倒し、追加deadline、retryは設けない。
 
 ## 10. Ground Station表示
 
@@ -313,3 +315,4 @@ RecoveryBeaconへ直接遷移するComBoard local commandは使用しない。
 9. ComBoard reset後、Mission Recovery wakeの0x014再送でA5へ復帰する。
 10. A8受信中にGroundの3D predictionとMission graph補間が停止する。
 11. A7/A8 golden vectorをComBoard、Ground board、Ground Stationで一致させる。
+12. A8 mode entryまたはreason/GNSS/CAN health変化の直後にA8専用送信要求が追加されず、次の500 ms通常deadlineで最新snapshotが生成される。送信競合時は共通schedulerの既存policyだけが適用される。
