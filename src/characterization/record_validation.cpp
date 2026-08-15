@@ -1,5 +1,4 @@
 #include "characterization/record_validation.hpp"
-#include "characterization/rate_check_stage_diagnostics.hpp"
 
 namespace avi::characterization {
 namespace {
@@ -31,8 +30,7 @@ constexpr bool knownRunKind(RunKind kind) noexcept {
 } // 無名名前空間
 
 RecordValidationError
-validateRecord(const ImmutableLogRecord &record) noexcept {
-  RateCheckStageScope timing(RateCheckStage::RecordValidate);
+validateRecordStrict(const ImmutableLogRecord &record) noexcept {
   RecordValidationError error = RecordValidationError::None;
   if (!isKnownStage(record.stage))
     error = error | RecordValidationError::InvalidStage;
@@ -201,6 +199,20 @@ validateRecord(const ImmutableLogRecord &record) noexcept {
   if (record.qualification != expected_qualification)
     error = error | RecordValidationError::InvalidEnum;
   return error;
+}
+
+RecordValidationError
+validateRecord(const ImmutableLogRecord &record) noexcept {
+#if defined(ESP_PLATFORM) && defined(AVI_99L_CHARACTERIZATION) &&             \
+    AVI_99L_CHARACTERIZATION
+  // 実機characterizationではrealtime callerにfull validationを実行させない。
+  // char_writerがqueueから値copyしたimmutable recordへvalidateRecordStrict()を
+  // 実行してからwire encodeし、失敗時は既存failure notificationで停止させる。
+  (void)record;
+  return RecordValidationError::None;
+#else
+  return validateRecordStrict(record);
+#endif
 }
 
 } // 名前空間 avi::characterization

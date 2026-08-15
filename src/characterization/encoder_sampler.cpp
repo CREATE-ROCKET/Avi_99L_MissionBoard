@@ -14,18 +14,30 @@
 namespace avi::characterization {
 namespace {
 
+constexpr std::uint32_t kHz2000TriggerOffsetUs = 120U;
+
 std::uint32_t periodUs(EncoderRate rate) noexcept {
   return 1'000'000U / static_cast<std::uint32_t>(rate);
 }
 
-static_assert(1'000'000U /
-                  static_cast<std::uint32_t>(EncoderRate::Hz1000) /
-                  2U ==
-              500U);
-static_assert(1'000'000U /
-                  static_cast<std::uint32_t>(EncoderRate::Hz2000) /
-                  2U ==
-              250U);
+std::uint32_t firstTriggerOffsetUs(EncoderRate rate) noexcept {
+  switch (rate) {
+  case EncoderRate::Hz1000:
+    return 500U;
+  case EncoderRate::Hz2000:
+    // PRECHECK7.5ではscheduled->capture最大347 usだった。
+    // command deadline 100 usを避けた直後にtriggerし、500 us slot終端までの
+    // capture余裕を増やす。2 kHz採用可否は引き続きrate-checkで判定する。
+    return kHz2000TriggerOffsetUs;
+  case EncoderRate::Hz5000:
+    return 0U;
+  }
+  return 0U;
+}
+
+static_assert(500U < 1'000U);
+static_assert(kHz2000TriggerOffsetUs > kConsumerDeadlineBudgetUs);
+static_assert(kHz2000TriggerOffsetUs < 500U);
 
 void rememberOperation(esp_err_t operation, esp_err_t &first) noexcept {
   if (first == ESP_OK && operation != ESP_OK)
@@ -267,9 +279,10 @@ esp_err_t EncoderSampler::begin(EncoderRate rate,
     return ESP_ERR_INVALID_ARG;
 
   const std::uint32_t period = periodUs(rate);
-  if (epoch_zero_us < period ||
-      epoch_zero_us >
-          std::numeric_limits<std::uint64_t>::max() - period / 2U)
+  const std::uint32_t first_trigger_offset = firstTriggerOffsetUs(rate);
+  if (first_trigger_offset == 0U || first_trigger_offset >= period ||
+      epoch_zero_us > std::numeric_limits<std::uint64_t>::max() -
+                          first_trigger_offset)
     return ESP_ERR_INVALID_ARG;
 
   queue_.reset();
@@ -284,6 +297,8 @@ esp_err_t EncoderSampler::begin(EncoderRate rate,
   max_capture_lateness_us_.store(0U, std::memory_order_relaxed);
   drain_timing_started_us_ = 0U;
   drain_timing_active_ = false;
+  drain_snapshot_end_ = 0U;
+  drain_snapshot_active_ = false;
   rate_check_timing_enabled_.store(rateCheckStageDiagnosticsActive(),
                                    std::memory_order_release);
   max_read_duration_us_ = 0U;
@@ -291,10 +306,10 @@ esp_err_t EncoderSampler::begin(EncoderRate rate,
   period_us_ = period;
   samples_per_epoch_ = expectedSamplesPerEpoch(rate);
   epoch_zero_us_ = epoch_zero_us;
-  // raw sampleを各slot中央へ置き、1 ms epoch終端のconsumer releaseと
-  // encoder taskを同時刻に起こさない。epoch所属はcapture timestampで
-  // 従来どおり半開区間へ厳密に割り当てる。
-  first_sample_us_ = epoch_zero_us_ + period_us_ / 2U;
+  // 1 kHzは500 us、2 kHzは120/620 usでtriggerする。
+  // slot所属はscheduled時刻ではなくactual capture timestampで従来どおり
+  // 半開区間へ厳密に割り当て、future sampleを現在epochへ借りない。
+  first_sample_us_ = epoch_zero_us_ + first_trigger_offset;
   next_scheduled_us_ = first_sample_us_ - period_us_;
   last_sampled_slot_ = 0U;
   have_sampled_slot_ = false;
@@ -357,8 +372,8 @@ esp_err_t EncoderSampler::begin(EncoderRate rate,
     }
   }
 
-  // GPTimerのfirst alarmをslot中心の絶対時刻へ直接設定する。
-  // 相対start APIの呼出し遅延をsampling phaseへ混入させない。
+  // first alarmは絶対時刻へ固定し、その後はhardware auto-reloadを使う。
+  // 2 kHzではcommand deadline後にtriggerしてcaptureのslot終端余裕を確保する。
   running_.store(true, std::memory_order_release);
   result = timer_.start(first_sample_us_, period_us_);
   if (result != ESP_OK) {
@@ -389,6 +404,8 @@ esp_err_t EncoderSampler::stop() {
   rate_check_timing_enabled_.store(false, std::memory_order_release);
   drain_timing_active_ = false;
   drain_timing_started_us_ = 0U;
+  drain_snapshot_end_ = 0U;
+  drain_snapshot_active_ = false;
 
   if (pipeline_running_) {
     const esp_err_t pipeline_result = encoder_.stopPipelinedRead();
@@ -444,29 +461,31 @@ EncoderTimingDiagnostics EncoderSampler::timingDiagnostics() const noexcept {
 }
 
 bool EncoderSampler::pop(RawEncoderSample &sample) noexcept {
-  const bool popped = queue_.pop(sample);
-  if (!rate_check_timing_enabled_.load(std::memory_order_acquire) ||
-      !running_.load(std::memory_order_acquire)) {
-    drain_timing_active_ = false;
-    drain_timing_started_us_ = 0U;
-    return popped;
-  }
-
-  if (popped) {
-    if (!drain_timing_active_) {
+  if (!drain_snapshot_active_) {
+    drain_snapshot_end_ = queue_.consumerHeadSnapshot();
+    drain_snapshot_active_ = true;
+    if (rate_check_timing_enabled_.load(std::memory_order_acquire) &&
+        running_.load(std::memory_order_acquire)) {
       drain_timing_started_us_ = rateCheckStageNowUs();
       drain_timing_active_ = drain_timing_started_us_ != 0U;
     }
-  } else if (drain_timing_active_) {
+  }
+
+  const bool popped = queue_.popUntil(drain_snapshot_end_, sample);
+  if (popped)
+    return true;
+
+  drain_snapshot_active_ = false;
+  if (drain_timing_active_) {
     const std::uint64_t finished_us = rateCheckStageNowUs();
     if (finished_us >= drain_timing_started_us_) {
       recordRateCheckStageDuration(RateCheckStage::EncoderDrain,
                                    finished_us - drain_timing_started_us_);
     }
-    drain_timing_active_ = false;
-    drain_timing_started_us_ = 0U;
   }
-  return popped;
+  drain_timing_active_ = false;
+  drain_timing_started_us_ = 0U;
+  return false;
 }
 
 } // 名前空間 avi::characterization

@@ -36,7 +36,12 @@ constexpr bool hasError(RecordValidationError error) noexcept {
   return error != RecordValidationError::None;
 }
 
+// characterization実機buildではrealtime callerのvalidateRecord()をdeferし、
+// char_writerがencode直前にvalidateRecordStrict()を必ず実行する。
+// native/offline buildではvalidateRecord()も従来どおりstrict validationを行う。
 [[nodiscard]] RecordValidationError
 validateRecord(const ImmutableLogRecord &record) noexcept;
+[[nodiscard]] RecordValidationError
+validateRecordStrict(const ImmutableLogRecord &record) noexcept;
 
 } // 名前空間 avi::characterization

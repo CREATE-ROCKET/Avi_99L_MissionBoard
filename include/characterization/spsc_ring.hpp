@@ -14,6 +14,8 @@ template <typename T, std::size_t Capacity> class SpscRing {
   static_assert(std::is_trivially_copyable_v<T>);
 
 public:
+  using ConsumerCursor = std::size_t;
+
   [[nodiscard]] bool push(const T &value) noexcept {
     const std::size_t head = head_.load(std::memory_order_relaxed);
     const std::size_t next = increment(head);
@@ -27,6 +29,22 @@ public:
   [[nodiscard]] bool pop(T &value) noexcept {
     const std::size_t tail = tail_.load(std::memory_order_relaxed);
     if (tail == head_.load(std::memory_order_acquire))
+      return false;
+    value = storage_[tail];
+    tail_.store(increment(tail), std::memory_order_release);
+    return true;
+  }
+
+  // consumerが処理開始時点に公開済みだった要素だけを有限個drainするための境界。
+  // snapshot取得後にproducerがpushした要素は次回consumer cycleへ残す。
+  [[nodiscard]] ConsumerCursor consumerHeadSnapshot() const noexcept {
+    return head_.load(std::memory_order_acquire);
+  }
+
+  [[nodiscard]] bool popUntil(ConsumerCursor end,
+                              T &value) noexcept {
+    const std::size_t tail = tail_.load(std::memory_order_relaxed);
+    if (tail == end)
       return false;
     value = storage_[tail];
     tail_.store(increment(tail), std::memory_order_release);

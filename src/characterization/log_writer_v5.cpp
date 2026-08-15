@@ -76,6 +76,13 @@ void LogWriterV5::processRecordBatch(ImmutableLogRecord first_record) {
 
   bool encoded = true;
   for (std::size_t index = 0U; index < count; ++index) {
+    // full record validationはwriter taskだけで行う。char_runtime側はmotor safety、
+    // epoch成立、queue失敗を直接監視し、重いwire整合性確認を1 kHz pathへ置かない。
+    if (hasError(validateRecordStrict(batch_[index]))) {
+      encoded = false;
+      rememberFirst(ESP_ERR_INVALID_RESPONSE);
+      break;
+    }
     wire_v5::RecordBytes bytes{};
     if (!wire_v5::encodeRecord(batch_[index], bytes)) {
       encoded = false;
@@ -295,11 +302,8 @@ esp_err_t LogWriterV5::enqueue(
   if (!accepting_.load() || file_ == nullptr ||
       first_error_.load() != ESP_OK)
     return ESP_ERR_INVALID_STATE;
-  if (hasError(validateRecord(record))) {
-    rememberFirst(ESP_ERR_INVALID_RESPONSE);
-    return ESP_ERR_INVALID_RESPONSE;
-  }
-  // queueへ完成済みrecordを値コピーし、writerはlive motor stateを読まない。
+  // 完成済みimmutable recordを値copyするだけに留める。
+  // strict validationはchar_writerのprocessRecordBatch()でencode直前に行う。
   RateCheckStageScope timing(RateCheckStage::WriterEnqueue);
   if (xQueueSend(queue_, &record, 0U) != pdTRUE) {
     queue_overflows_.fetch_add(1U);
