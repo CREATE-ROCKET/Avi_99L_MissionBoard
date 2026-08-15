@@ -27,7 +27,7 @@ bool commandKnown(CommandCode code) {
   return (raw >= 0x01 && raw <= 0x04) ||
          (raw >= 0x10 && raw <= 0x13) ||
          (raw >= 0x20 && raw <= 0x26) ||
-         (raw >= 0x30 && raw <= 0x32);
+         (raw >= 0x30 && raw <= 0x31) || raw == 0x33;
 }
 
 CommandDomain domainFor(CommandCode code) {
@@ -54,8 +54,8 @@ CommandDomain domainFor(CommandCode code) {
     return CommandDomain::calibration;
   case CommandCode::export_flash_log:
     return CommandDomain::storage;
-  case CommandCode::select_motor_profile:
-    return CommandDomain::motor_profile;
+  case CommandCode::enter_recovery:
+    return CommandDomain::recovery;
   default:
     return CommandDomain::sequence;
   }
@@ -72,8 +72,6 @@ bool argumentsValid(const GenericCommandRequest &request, CommandCode code) {
                      static_cast<uint16_t>(request.arguments[1]) << 8U;
     return std::abs(static_cast<int32_t>(static_cast<int16_t>(raw))) < 1800;
   }
-  case CommandCode::select_motor_profile:
-    return request.arguments[0] != 0 && allZero(request, 1);
   default:
     return allZero(request, 0);
   }
@@ -96,13 +94,14 @@ bool stateValid(CommandCode code, MissionState state) {
   case CommandCode::para_close:
   case CommandCode::run_preflight_calibration:
   case CommandCode::export_flash_log:
-  case CommandCode::select_motor_profile:
     return state == MissionState::command_receive;
   case CommandCode::cancel_sequence:
     return state == MissionState::liftoff_detection;
   case CommandCode::disable_fin_control:
     return state == MissionState::liftoff_detection ||
            state == MissionState::engine_burn || state == MissionState::control;
+  case CommandCode::enter_recovery:
+    return state == MissionState::descent;
   default:
     return false;
   }
@@ -144,6 +143,9 @@ CommandDecision CommandExecutor::begin(const GenericCommandRequest &request,
     rejection = CommandReason::invalid_argument;
   else if (!stateValid(code, context.state))
     rejection = CommandReason::invalid_state;
+  else if (code == CommandCode::enter_recovery &&
+           !context.deployment_power_cutoff_done)
+    rejection = CommandReason::safety_interlock;
   else if (isStart(code) &&
            (busy(CommandDomain::parachute) || busy(CommandDomain::fin) ||
             busy(CommandDomain::calibration) || context.motor_test_busy))
@@ -165,9 +167,7 @@ CommandDecision CommandExecutor::begin(const GenericCommandRequest &request,
   else if ((domain == CommandDomain::calibration &&
             !context.calibration_supported) ||
            (domain == CommandDomain::storage &&
-            !context.storage_export_supported) ||
-           (domain == CommandDomain::motor_profile &&
-            !context.motor_profile_selection_supported))
+            !context.storage_export_supported))
     rejection = CommandReason::not_supported;
   else if (busy(domain))
     rejection = CommandReason::busy;

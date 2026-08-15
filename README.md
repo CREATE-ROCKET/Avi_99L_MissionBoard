@@ -92,14 +92,16 @@ git -C lib/Avi_ESP_Libs rev-parse HEAD
 PlatformIOと`espressif32@7.0.1`、指定されたtool packageを初回だけnetwork経由で取得します。
 
 ```sh
-pio pkg install -e avi_99l_missionboard
-pio run
+AVI_99L_MOTOR_PROFILE_ID=1 pio pkg install -e avi_99l_missionboard
+AVI_99L_MOTOR_PROFILE_ID=1 pio run -e avi_99l_missionboard
 ```
 
-既定は`MISSION_BRINGUP_SHELL=0`のproduction runtimeです。既存bring-up shellは`pio run -e avi_99l_missionboard_bringup`でbuildします。既知のdriver panicを再現し得るCAN比較診断は、専用environmentだけに隔離しています。
+`AVI_99L_MOTOR_PROFILE_ID`はbuildごとに明示指定必須です。現行catalogは`1=kFlightMotorA`、`2=kSpareMotorB`で、未指定または未知IDではbuildを失敗させます。active profileはruntime/NVS/CAN/LoRa/USBから変更できません。
+
+既定environmentは`MISSION_BRINGUP_SHELL=0`のproduction runtimeです。既存bring-up shellは`AVI_99L_MOTOR_PROFILE_ID=1 pio run -e avi_99l_missionboard_bringup`でbuildします。既知のdriver panicを再現し得るCAN比較診断は、専用environmentだけに隔離しています。
 
 ```sh
-pio run -e avi_99l_missionboard_can_diag
+AVI_99L_MOTOR_PROFILE_ID=1 pio run -e avi_99l_missionboard_can_diag
 ```
 
 `avi_99l_missionboard_can_diag`だけが`MISSION_CAN_UNSAFE_DIAG=1`を定義します。通常のproduction/bring-up buildでは`can-test`とraw ESP-IDF lifecycle試験を`ESP_ERR_NOT_SUPPORTED`で拒否します。2026-08-13のbuild logで実際にcompileされたESP-IDFは6.0.1であり、PlatformIO platform versionから推測した値ではありません。既定production buildは暫定flight設定を有効化しているため、`StartSequence`後にactuator出力を実行します。
@@ -128,7 +130,7 @@ project-local board manifestは`boards/avi_99l_missionboard.json`、partition ta
 実機data取得専用buildはproductionと別entry pointです。起動時は必ずmotor coast/disarmで、profileを自動開始しません。
 
 ```sh
-pio run -e avi_99l_missionboard_characterization
+AVI_99L_MOTOR_PROFILE_ID=1 pio run -e avi_99l_missionboard_characterization
 pio test -e native
 python3 tools/capture_characterization.py --self-test
 python3 tools/verify_characterization.py --self-test
@@ -138,7 +140,7 @@ python3 tools/package_spica_characterization.py --self-test
 対象board・portを確認し、人間がcharacterization firmwareのuploadを明示許可した場合に限り、専用environmentを指定します。
 
 ```sh
-pio run -e avi_99l_missionboard_characterization -t upload \
+AVI_99L_MOTOR_PROFILE_ID=1 pio run -e avi_99l_missionboard_characterization -t upload \
   --upload-port "$MISSION_PORT"
 ```
 
@@ -182,7 +184,7 @@ pio run -t upload --upload-port "$MISSION_PORT"
 次はhardware reviewとoperatorの明示許可後だけ使うcharacterization専用uploadです。
 
 ```sh
-pio run -e avi_99l_missionboard_characterization -t upload \
+AVI_99L_MOTOR_PROFILE_ID=1 pio run -e avi_99l_missionboard_characterization -t upload \
   --upload-port "$MISSION_PORT"
 ```
 
