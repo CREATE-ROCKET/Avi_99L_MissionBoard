@@ -142,6 +142,14 @@ CanFrame encode(const RecoveryControl &message) {
   return result;
 }
 
+CanFrame encode(const RecoveryModeCommand &message) {
+  auto result = frame(CanId::recovery_mode_command, 3);
+  result.data[0] = message.sequence;
+  result.data[1] = static_cast<uint8_t>(message.mode);
+  result.data[2] = static_cast<uint8_t>(message.reason);
+  return result;
+}
+
 CanFrame encode(const GenericCommandRequest &message) {
   auto result = frame(CanId::generic_command_request, 8);
   result.data[0] = message.transaction_id;
@@ -224,7 +232,7 @@ CanFrame encode(const PowerTimeTelemetry &message) {
   result.data[2] = message.motor_voltage_raw;
   putU16(result.data, 3, message.descent_elapsed_raw);
   putU16(result.data, 5, message.recovery_elapsed_raw);
-  result.data[7] = message.persistence_flags;
+  result.data[7] = static_cast<uint8_t>(message.persistence_flags & 0x87U);
   return result;
 }
 
@@ -232,7 +240,7 @@ CanFrame encode(const DescentCoreTelemetry &message) {
   auto result = frame(CanId::descent_core_telemetry, 4);
   result.data[0] = message.sequence;
   putU16(result.data, 1,
-         static_cast<uint16_t>(message.descent_status & 0x1FFFU));
+         static_cast<uint16_t>(message.descent_status & 0x001FU));
   result.data[3] = message.parachute_angle_raw;
   return result;
 }
@@ -309,13 +317,29 @@ CodecError decode(const CanFrame &input, RecoveryControl &message) {
     return error;
   if ((input.data[0] & 0xE0U) != 0)
     return CodecError::reserved_bits;
-  const auto opcode = static_cast<RecoveryOpcode>(input.data[0] & 0x0FU);
+  const uint8_t opcode_raw = input.data[0] & 0x0FU;
+  const auto opcode = static_cast<RecoveryOpcode>(opcode_raw);
   const auto source =
       static_cast<RecoverySource>((input.data[0] >> 4U) & 0x01U);
-  if (static_cast<uint8_t>(opcode) > 3)
+  if (opcode_raw < static_cast<uint8_t>(RecoveryOpcode::wake) ||
+      opcode_raw > static_cast<uint8_t>(RecoveryOpcode::stop_log_dump))
     return CodecError::invalid_enum;
   message = {opcode, source, input.data[1], getU24(input.data, 2),
              getU24(input.data, 5)};
+  return CodecError::none;
+}
+
+CodecError decode(const CanFrame &input, RecoveryModeCommand &message) {
+  const auto error = validate(input, CanId::recovery_mode_command, 3);
+  if (error != CodecError::none)
+    return error;
+  const auto mode = static_cast<RecoveryMode>(input.data[1]);
+  const auto reason = static_cast<RecoveryModeReason>(input.data[2]);
+  if (mode != RecoveryMode::enter_recovery_beacon ||
+      static_cast<uint8_t>(reason) >
+          static_cast<uint8_t>(RecoveryModeReason::reset_recovery))
+    return CodecError::invalid_enum;
+  message = {input.data[0], mode, reason};
   return CodecError::none;
 }
 
@@ -409,10 +433,13 @@ CodecError decode(const CanFrame &input, MissionStatusTelemetry &message) {
 
 CodecError decode(const CanFrame &input, PowerTimeTelemetry &message) {
   const auto error = validate(input, CanId::power_time_telemetry, 8);
-  if (error == CodecError::none)
-    message = {input.data[0], input.data[1], input.data[2],
-               getU16(input.data, 3), getU16(input.data, 5), input.data[7]};
-  return error;
+  if (error != CodecError::none)
+    return error;
+  if ((input.data[7] & 0x78U) != 0)
+    return CodecError::reserved_bits;
+  message = {input.data[0], input.data[1], input.data[2],
+             getU16(input.data, 3), getU16(input.data, 5), input.data[7]};
+  return CodecError::none;
 }
 
 CodecError decode(const CanFrame &input, DescentCoreTelemetry &message) {
@@ -420,7 +447,7 @@ CodecError decode(const CanFrame &input, DescentCoreTelemetry &message) {
   if (error != CodecError::none)
     return error;
   const uint16_t status = getU16(input.data, 1);
-  if ((status & 0xE000U) != 0)
+  if ((status & 0xFFE0U) != 0)
     return CodecError::reserved_bits;
   message = {input.data[0], status, input.data[3]};
   return CodecError::none;
@@ -430,10 +457,12 @@ CodecError decode(const CanFrame &input, RecoveryStatusMessage &message) {
   const auto error = validate(input, CanId::recovery_status, 8);
   if (error != CodecError::none)
     return error;
-  const auto opcode = static_cast<RecoveryOpcode>(input.data[0]);
+  const uint8_t opcode_raw = input.data[0];
+  const auto opcode = static_cast<RecoveryOpcode>(opcode_raw);
   const auto status = static_cast<RecoveryStatusCode>(input.data[2]);
   const auto source = static_cast<RecoverySource>(input.data[3]);
-  if (static_cast<uint8_t>(opcode) > 3 ||
+  if (opcode_raw < static_cast<uint8_t>(RecoveryOpcode::wake) ||
+      opcode_raw > static_cast<uint8_t>(RecoveryOpcode::stop_log_dump) ||
       static_cast<uint8_t>(status) > 9 ||
       static_cast<uint8_t>(source) > 1)
     return CodecError::invalid_enum;
