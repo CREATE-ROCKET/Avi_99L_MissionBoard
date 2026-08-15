@@ -1111,7 +1111,7 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
     record.stage = campaign_.stage();
     record.encoder_rate = rate;
     record.profile_phase = episode.phase;
-    record.approach_branch = episode.approach_branch;
+    record.approach_branch = episode.branch;
     record.zero_reference_kind = plan.zeroReferenceKind();
     record.run_kind = run_kind;
     record.qualification = full ? 1U : 0U;
