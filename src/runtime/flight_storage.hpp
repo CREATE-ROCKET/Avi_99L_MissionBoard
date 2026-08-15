@@ -6,10 +6,9 @@
 #include <cstdio>
 
 #include "esp_err.h"
+#include "esp_partition.h"
 #include "runtime/flight_log.hpp"
-
-struct esp_partition_t;
-struct sdmmc_card_t;
+#include "sdmmc_cmd.h"
 
 namespace runtime::flight_storage {
 
