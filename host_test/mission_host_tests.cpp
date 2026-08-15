@@ -557,6 +557,7 @@ void testCommandExecutor() {
 
   CommandContext context{};
   context.resources_preallocated = true;
+  context.runtime_invariants_available = true;
   context.persistence_load_complete = true;
   context.persistence_runtime_available = true;
   context.fin_safe_commands_supported = true;
@@ -591,6 +592,16 @@ void testCommandExecutor() {
                             static_cast<uint8_t>(
                                 CommandCode::force_start_sequence)),
                     no_resources)
+             .result.reason == CommandReason::internal_error);
+
+  CommandExecutor invariant_gate;
+  auto invariant_failed = context;
+  invariant_failed.runtime_invariants_available = false;
+  assert(invariant_gate
+             .begin(command(15,
+                            static_cast<uint8_t>(
+                                CommandCode::force_start_sequence)),
+                    invariant_failed)
              .result.reason == CommandReason::internal_error);
 
   CommandExecutor load_gate;

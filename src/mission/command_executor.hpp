@@ -44,6 +44,7 @@ enum class CommandDomain : uint8_t {
 struct CommandContext {
   protocol::MissionState state{protocol::MissionState::command_receive};
   bool resources_preallocated{};
+  bool runtime_invariants_available{};
   bool persistence_load_complete{};
   bool persistence_runtime_available{};
   bool fin_available{true};

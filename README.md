@@ -295,3 +295,12 @@ CANはstandard 11-bit、125 kbit/s、DLC 8以下、multi-byteはlittle-endianで
 - Deep SleepはRTC marker/wake causeを検証した専用task subsetで10秒周期wakeします。Internal Flash/SD log reader未接続のためlog dump要求は`SourceUnavailable`です。2秒command windowは`TODO(HW_TEST)`です。
 - 3基板実機でMission→ComBoard CAN、ComBoard↔Ground LoRa、Ground→Missionの安全なcommand round-tripは確認済みです。今回接続したproduction motor motion、STS収納保持/Open、差圧zero、Control遷移、5秒/25秒cutoffは未検証であり、成功扱いしません。
 - Mission基板上のmicroSDはbring-up `sd-test`で1 MiB write/read/CRCをPASSしていますが、Mission production loggerは未接続です。今回BLOCKEDとなった`CAN.CSV` logging/readbackはComBoard側microSDの初期化問題であり、Missionのbring-up microSD PASSを取り消す結果ではありません。
+
+
+## ForceStartSequence / パラシュート Stage 2
+
+`Natsu-B/Vault` の `04c_ForceStartSequence詳細.md` を正とする。`ForceStartSequence` (`0x04`) がbypassするのは7項目のpreflight `NotConfigured` gateだけであり、protocol/state/Busy、resource preallocation、runtime invariant、NVS owner failureはbypassしない。Open/Closeは独立optionalのflight snapshotとしてfreezeし、実移動直前のfresh currentからshortest pathを再計算する。exact half-turnでは動かさない。
+
+CommandReceiveからSTS電源ON/Hold/reconnectを継続し、flight中はOpen成功・失敗・retry exhaustedのいずれでも離床+25秒までHold/power-onを維持する。5秒deadlineはOpen retry終了期限でありpower cutoffではない。STS transport/read/hold失敗後はconnectionをinvalidateし、bounded retryで再初期化する。deployment failureはflight attemptごとのone-shot event/statusとして扱う。
+
+Host testは `cmake -S host_test -B build/host_test && cmake --build build/host_test && ctest --test-dir build/host_test --output-on-failure` で実行する。

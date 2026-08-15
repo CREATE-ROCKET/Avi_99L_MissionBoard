@@ -150,6 +150,8 @@ CommandDecision CommandExecutor::begin(const GenericCommandRequest &request,
     rejection = CommandReason::busy;
   else if (isStart(code) && !context.resources_preallocated)
     rejection = CommandReason::internal_error;
+  else if (isStart(code) && !context.runtime_invariants_available)
+    rejection = CommandReason::internal_error;
   else if (isStart(code) && !context.persistence_load_complete)
     rejection = CommandReason::busy;
   else if (isStart(code) && !context.persistence_runtime_available)
