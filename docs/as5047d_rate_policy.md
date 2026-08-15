@@ -48,3 +48,35 @@ V5 recordのfull validationは`char_runtime`では実施せず、immutable recor
 2 kHzはPRECHECK7.5でscheduled→actual capture最大347 usが観測され、250/750 us triggerでは500 us slot境界を越えた。このため2 kHzのprovisional triggerを120/620 usへ前倒しする。120 usは100 us command deadlineより後に置き、encoder taskがcommand apply deadline内を直接奪わないようにする。
 
 この120/620 usは採用済みflight定数ではなく実機qualification用のprovisional phaseである。actual capture timestampが各half-open slot内へ入り、repeated/skipped/deadlineが0になることをrate-checkで確認できない場合、2 kHzはunsupportedのままとする。deadlineやslot境界を緩めて成立扱いにしてはならない。
+
+### 5.2. Task affinityとwriter throughput
+
+PRECHECK7.8では`char_runtime`をCore 0へ分離したことで、1 kHzの`consumer-work-max-us`は644 us、`consumer-wait-late-max-us`は0まで改善し、2 kHzでもraw epochはcompleteになった。一方、1000/2000 Hzとも約233 recordでwriter queueがoverflowした。
+
+characterizationではtask affinityを次のように固定する。
+
+- Core 0: `char_runtime` priority 21、`char_vbus` priority 12、`char_console` priority 5
+- Core 1: `char_encoder` priority 23、`char_writer` priority 10
+
+`char_encoder`は同Coreのwriterより常に優先し、AS5047D captureをSD書込みより優先する。writer queue depthを増やして持続throughput不足を隠すことはしない。
+
+rate-check終了時は`CHAR_WRITER_TIMING`を出力する。
+
+```text
+queue-high-water
+max-batch-records
+validate-max-us
+encode-max-us
+fwrite-max-us
+records-written
+```
+
+`queue-high-water`が継続的に増えて128へ到達する場合はwriterの持続処理速度不足とする。`fwrite-max-us`が支配的ならSD/FAT側、`validate-max-us`または`encode-max-us`が支配的ならCPU側として切り分ける。
+
+## 6. Characterization build最適化
+
+characterization firmwareはtiming qualification専用buildとして、ESP-IDF側の`CONFIG_COMPILER_OPTIMIZATION_PERF=y`を有効にし、PlatformIO compile flagで`-O3`を明示する。さらにESP-IDFのcompile-time/link-time LTOを有効にする。
+
+`-Ofast`およびfast-math系optionは使用しない。`std::isfinite`、NaN/Inf、浮動小数点比較等の安全判定の意味論を維持するためである。
+
+ESP-IDFの正式なperformance optimizationは`-O2`であり、`-O3`はcustom optimization levelである。このため最適化変更後のbinaryは別firmware SHAとして扱い、1/2 kHz rate-check、full 1 kHz、writer throughput、position guard、安全停止を再qualificationする。deadlineやacceptance基準は最適化のために緩和しない。
