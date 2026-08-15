@@ -306,9 +306,11 @@ public:
         console_stack_, &console_task_control_, 0);
     if (console_task_ == nullptr)
       return ESP_ERR_NO_MEM;
+    // priority 23のchar_encoderとは別coreへ固定し、SPI取得によるpreemptionを
+    // 1 kHz consumerのdeadline計測へ混入させない。
     worker_task_ = xTaskCreateStaticPinnedToCore(
         workerEntry, "char_runtime", sizeof(worker_stack_), this, 21,
-        worker_stack_, &worker_task_control_, 1);
+        worker_stack_, &worker_task_control_, 0);
     if (worker_task_ == nullptr)
       return ESP_ERR_NO_MEM;
     if (xSemaphoreTake(startup_ack_, portMAX_DELAY) != pdTRUE)
