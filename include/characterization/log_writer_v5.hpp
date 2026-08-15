@@ -20,7 +20,7 @@ namespace avi::characterization {
 
 class LogWriterV5 {
 public:
-  static constexpr std::size_t kQueueDepth = 128U;
+  static constexpr std::size_t kQueueDepth = 512U;
   static constexpr std::size_t kBatchRecords = 16U;
 
   [[nodiscard]] esp_err_t initialize();
@@ -62,6 +62,7 @@ private:
 
   static void taskEntry(void *context);
   void taskLoop();
+  [[nodiscard]] esp_err_t initializeStorage() noexcept;
   void rememberFirst(esp_err_t error) noexcept;
   void processRecordBatch(ImmutableLogRecord first_record);
   void processControl(const ControlRequest &request);
@@ -78,6 +79,8 @@ private:
   QueueHandle_t control_queue_{nullptr};
   StaticSemaphore_t control_ack_storage_{};
   SemaphoreHandle_t control_ack_{nullptr};
+  StaticSemaphore_t startup_ack_storage_{};
+  SemaphoreHandle_t startup_ack_{nullptr};
   StaticTask_t task_tcb_{};
   StackType_t task_stack_[4096]{};
   TaskHandle_t task_{nullptr};
@@ -87,12 +90,17 @@ private:
       encoded_batch_{};
   std::atomic<bool> control_pending_{false};
   std::atomic<esp_err_t> control_result_{ESP_OK};
+  std::atomic<esp_err_t> startup_result_{ESP_ERR_NOT_FINISHED};
   std::atomic<TaskHandle_t> failure_notification_task_{nullptr};
   std::atomic<std::uint32_t> queue_high_water_{0U};
   std::atomic<std::uint32_t> max_batch_records_{0U};
   std::atomic<std::uint32_t> max_validate_us_{0U};
   std::atomic<std::uint32_t> max_encode_us_{0U};
   std::atomic<std::uint32_t> max_fwrite_us_{0U};
+  std::atomic<std::uint32_t> batch_count_{0U};
+  std::atomic<std::uint32_t> total_validate_us_{0U};
+  std::atomic<std::uint32_t> total_encode_us_{0U};
+  std::atomic<std::uint32_t> total_fwrite_us_{0U};
 #endif
   FILE *file_{nullptr};
   std::array<char, 128> current_path_{};

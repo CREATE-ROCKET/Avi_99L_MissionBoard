@@ -52,6 +52,21 @@ void updateAtomicMaximum(std::atomic<std::uint32_t> &target,
   }
 }
 
+void addAtomicTotal(std::atomic<std::uint32_t> &target,
+                    std::uint32_t value) noexcept {
+  std::uint32_t current = target.load(std::memory_order_relaxed);
+  for (;;) {
+    const std::uint32_t next =
+        value > std::numeric_limits<std::uint32_t>::max() - current
+            ? std::numeric_limits<std::uint32_t>::max()
+            : current + value;
+    if (target.compare_exchange_weak(current, next,
+                                     std::memory_order_relaxed,
+                                     std::memory_order_relaxed))
+      return;
+  }
+}
+
 esp_err_t writeFile(void *context, const std::uint8_t *data,
                     std::size_t size) noexcept {
   auto *file = static_cast<FILE *>(context);
@@ -90,6 +105,32 @@ void LogWriterV5::taskEntry(void *context) {
   static_cast<LogWriterV5 *>(context)->taskLoop();
 }
 
+esp_err_t LogWriterV5::initializeStorage() noexcept {
+  sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+  sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
+  slot.width = 4;
+  slot.clk = board::kSdClk;
+  slot.cmd = board::kSdCmd;
+  slot.d0 = board::kSdDat0;
+  slot.d1 = board::kSdDat1;
+  slot.d2 = board::kSdDat2;
+  slot.d3 = board::kSdDat3;
+  esp_vfs_fat_sdmmc_mount_config_t mount{};
+  mount.format_if_mount_failed = false;
+  mount.max_files = 2;
+  mount.allocation_unit_size = 16U * 1024U;
+  sdmmc_card_t *card = nullptr;
+  const esp_err_t result =
+      esp_vfs_fat_sdmmc_mount(kMountPoint, &host, &slot, &mount, &card);
+  if (result != ESP_OK)
+    return result;
+  if (::mkdir(kLogDirectory, 0775) != 0 && errno != EEXIST) {
+    (void)esp_vfs_fat_sdcard_unmount(kMountPoint, card);
+    return ESP_FAIL;
+  }
+  return ESP_OK;
+}
+
 void LogWriterV5::processRecordBatch(ImmutableLogRecord first_record) {
   batch_[0] = first_record;
   std::size_t count = 1U;
@@ -104,7 +145,9 @@ void LogWriterV5::processRecordBatch(ImmutableLogRecord first_record) {
     // epoch成立、queue失敗を直接監視し、重いwire整合性確認を1 kHz pathへ置かない。
     const std::int64_t validate_started_us = esp_timer_get_time();
     const bool record_valid = !hasError(validateRecordStrict(batch_[index]));
-    updateAtomicMaximum(max_validate_us_, elapsedUs(validate_started_us));
+    const std::uint32_t validate_elapsed_us = elapsedUs(validate_started_us);
+    updateAtomicMaximum(max_validate_us_, validate_elapsed_us);
+    addAtomicTotal(total_validate_us_, validate_elapsed_us);
     if (!record_valid) {
       encoded = false;
       rememberFirst(ESP_ERR_INVALID_RESPONSE);
@@ -114,7 +157,9 @@ void LogWriterV5::processRecordBatch(ImmutableLogRecord first_record) {
     wire_v5::RecordBytes bytes{};
     const std::int64_t encode_started_us = esp_timer_get_time();
     const bool record_encoded = wire_v5::encodeRecord(batch_[index], bytes);
-    updateAtomicMaximum(max_encode_us_, elapsedUs(encode_started_us));
+    const std::uint32_t encode_elapsed_us = elapsedUs(encode_started_us);
+    updateAtomicMaximum(max_encode_us_, encode_elapsed_us);
+    addAtomicTotal(total_encode_us_, encode_elapsed_us);
     if (!record_encoded) {
       encoded = false;
       rememberFirst(ESP_ERR_INVALID_RESPONSE);
@@ -129,7 +174,10 @@ void LogWriterV5::processRecordBatch(ImmutableLogRecord first_record) {
     const std::int64_t fwrite_started_us = esp_timer_get_time();
     const std::size_t written =
         std::fwrite(encoded_batch_.data(), 1U, byte_count, file_);
-    updateAtomicMaximum(max_fwrite_us_, elapsedUs(fwrite_started_us));
+    const std::uint32_t fwrite_elapsed_us = elapsedUs(fwrite_started_us);
+    updateAtomicMaximum(max_fwrite_us_, fwrite_elapsed_us);
+    addAtomicTotal(total_fwrite_us_, fwrite_elapsed_us);
+    batch_count_.fetch_add(1U, std::memory_order_relaxed);
     if (written != byte_count) {
       rememberFirst(ESP_FAIL);
     } else {
@@ -195,6 +243,16 @@ void LogWriterV5::processControl(const ControlRequest &request) {
 }
 
 void LogWriterV5::taskLoop() {
+  // SDMMC hostのinterrupt allocationをchar_runtimeと分離するため、
+  // mountをCore 1にpinされたchar_writer task自身から実行する。
+  const esp_err_t storage_result = initializeStorage();
+  startup_result_.store(storage_result, std::memory_order_release);
+  (void)xSemaphoreGive(startup_ack_);
+  if (storage_result != ESP_OK) {
+    for (;;)
+      vTaskDelay(portMAX_DELAY);
+  }
+
   for (;;) {
     ImmutableLogRecord first{};
     if (xQueueReceive(queue_, &first, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -228,27 +286,10 @@ esp_err_t LogWriterV5::submitControl(const ControlRequest &request) {
 esp_err_t LogWriterV5::initialize() {
   if (initialized_)
     return ESP_OK;
-  sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-  sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
-  slot.width = 4;
-  slot.clk = board::kSdClk;
-  slot.cmd = board::kSdCmd;
-  slot.d0 = board::kSdDat0;
-  slot.d1 = board::kSdDat1;
-  slot.d2 = board::kSdDat2;
-  slot.d3 = board::kSdDat3;
-  esp_vfs_fat_sdmmc_mount_config_t mount{};
-  mount.format_if_mount_failed = false;
-  mount.max_files = 2;
-  mount.allocation_unit_size = 16U * 1024U;
-  sdmmc_card_t *card = nullptr;
-  esp_err_t result =
-      esp_vfs_fat_sdmmc_mount(kMountPoint, &host, &slot, &mount, &card);
-  if (result != ESP_OK)
-    return result;
-  if (::mkdir(kLogDirectory, 0775) != 0 && errno != EEXIST) {
-    (void)esp_vfs_fat_sdcard_unmount(kMountPoint, card);
-    return ESP_FAIL;
+  if (task_ != nullptr) {
+    const esp_err_t previous =
+        startup_result_.load(std::memory_order_acquire);
+    return previous == ESP_ERR_NOT_FINISHED ? ESP_ERR_INVALID_STATE : previous;
   }
 
   // queue storage/control block/task stackはobject lifetime中保持される。
@@ -261,15 +302,26 @@ esp_err_t LogWriterV5::initialize() {
       1U, sizeof(ControlRequest), control_queue_storage_.data(),
       &control_queue_control_);
   control_ack_ = xSemaphoreCreateBinaryStatic(&control_ack_storage_);
-  if (control_queue_ == nullptr || control_ack_ == nullptr)
+  startup_ack_ = xSemaphoreCreateBinaryStatic(&startup_ack_storage_);
+  if (control_queue_ == nullptr || control_ack_ == nullptr ||
+      startup_ack_ == nullptr)
     return ESP_ERR_NO_MEM;
+
+  startup_result_.store(ESP_ERR_NOT_FINISHED, std::memory_order_release);
   // Core 0はpriority 21のchar_runtime専用に近い状態へ保つ。
   // char_writerはCore 1へ置き、同coreのchar_encoder(priority 23)を常に優先する。
+  // SDMMC mountもこのtaskの先頭で行い、storage ISRをCore 1側へ割り当てる。
   task_ = xTaskCreateStaticPinnedToCore(
       taskEntry, "char_writer", sizeof(task_stack_), this, 10,
       task_stack_, &task_tcb_, 1);
   if (task_ == nullptr)
     return ESP_ERR_NO_MEM;
+  if (xSemaphoreTake(startup_ack_, portMAX_DELAY) != pdTRUE)
+    return ESP_FAIL;
+
+  const esp_err_t result = startup_result_.load(std::memory_order_acquire);
+  if (result != ESP_OK)
+    return result;
   initialized_ = true;
   return ESP_OK;
 }
@@ -331,6 +383,10 @@ esp_err_t LogWriterV5::open(const LogHeaderV5 &header,
   max_validate_us_.store(0U);
   max_encode_us_.store(0U);
   max_fwrite_us_.store(0U);
+  batch_count_.store(0U);
+  total_validate_us_.store(0U);
+  total_encode_us_.store(0U);
+  total_fwrite_us_.store(0U);
   file_crc32_ = wire_v5::crc32(bytes.data(), bytes.size());
   synced_.store(false);
   accepting_.store(true);
@@ -395,17 +451,41 @@ esp_err_t LogWriterV5::close(const LogFooterV5 &footer) {
         static_cast<unsigned>(diagnostics.record_validate_max_us),
         static_cast<unsigned>(diagnostics.writer_enqueue_max_us),
         static_cast<unsigned>(diagnostics.encoder_read_max_us));
+
+    const std::uint64_t records = records_written_.load();
+    const std::uint32_t batches = batch_count_.load();
+    const std::uint32_t validate_total = total_validate_us_.load();
+    const std::uint32_t encode_total = total_encode_us_.load();
+    const std::uint32_t fwrite_total = total_fwrite_us_.load();
+    const std::uint32_t validate_average =
+        records == 0U ? 0U
+                      : static_cast<std::uint32_t>(validate_total / records);
+    const std::uint32_t encode_average =
+        records == 0U ? 0U
+                      : static_cast<std::uint32_t>(encode_total / records);
+    const std::uint32_t fwrite_average =
+        batches == 0U ? 0U : fwrite_total / batches;
     std::printf(
-        "CHAR_WRITER_TIMING rate=%u queue-high-water=%u "
-        "max-batch-records=%u validate-max-us=%u encode-max-us=%u "
-        "fwrite-max-us=%u records-written=%llu\n",
+        "CHAR_WRITER_TIMING rate=%u queue-depth=%u queue-high-water=%u "
+        "max-batch-records=%u batch-count=%u validate-max-us=%u "
+        "validate-total-us=%u validate-avg-us=%u encode-max-us=%u "
+        "encode-total-us=%u encode-avg-us=%u fwrite-max-us=%u "
+        "fwrite-total-us=%u fwrite-avg-us=%u records-written=%llu\n",
         static_cast<unsigned>(diagnostics.rate),
+        static_cast<unsigned>(kQueueDepth),
         static_cast<unsigned>(queue_high_water_.load()),
         static_cast<unsigned>(max_batch_records_.load()),
+        static_cast<unsigned>(batches),
         static_cast<unsigned>(max_validate_us_.load()),
+        static_cast<unsigned>(validate_total),
+        static_cast<unsigned>(validate_average),
         static_cast<unsigned>(max_encode_us_.load()),
+        static_cast<unsigned>(encode_total),
+        static_cast<unsigned>(encode_average),
         static_cast<unsigned>(max_fwrite_us_.load()),
-        static_cast<unsigned long long>(records_written_.load()));
+        static_cast<unsigned>(fwrite_total),
+        static_cast<unsigned>(fwrite_average),
+        static_cast<unsigned long long>(records));
   }
   endRateCheckStageDiagnostics();
   return result;
