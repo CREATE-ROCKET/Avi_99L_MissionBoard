@@ -79,15 +79,19 @@ constexpr uint32_t kCalibrationDurationMs = 3'000;
 // TODO(SIMULATION): ICM連続欠落許容sample数をSpicaで決定する
 constexpr uint32_t kImuInterpolatableMissingSamples = 1;
 
-// TODO(HW_TEST): FlightMotorA実測値
-constexpr MotorProfile kFlightMotorA{1, MotorPolarity::unconfigured, false,
-                                     0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
+// TODO(HW_TEST): FlightMotorAの極性、巻線抵抗、定数、効率、電流上限を実測値へ置換する。
+// 現値はhost testで使っていた候補値であり、flight qualification済みではない。
+constexpr MotorProfile kFlightMotorA{1, MotorPolarity::positive_in1, true,
+                                     3.48F, 0.00855F, 1120.0F, 0.60F,
+                                     2.0F, 1.21208F};
 // TODO(HW_TEST): SpareMotorB実測値
 constexpr MotorProfile kSpareMotorB{2, MotorPolarity::unconfigured, false,
                                     0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
 
-// TODO(HW_TEST): 動翼・stopper組付後に決定
-constexpr FinSoftwareLimits kFinSoftwareLimits{false, 0.0F, 0.0F};
+// TODO(HW_TEST): 動翼・stopper組付後の実測値でsoftware limitを確定する。
+// 機械上限±15 degに対し、暫定的に1 degのmarginを設ける。
+constexpr FinSoftwareLimits kFinSoftwareLimits{
+    true, -0.24434609527920614F, 0.24434609527920614F};
 
 // TODO(SIMULATION): alpha/betaをSpica + 実encoder logで確定
 constexpr AlphaBetaConfig kThetaDotFilter{false, 0.0F, 0.0F, 0};

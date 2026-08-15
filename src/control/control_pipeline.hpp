@@ -15,6 +15,31 @@ struct RollState {
   double fin_rate_rad_s{};
 };
 
+class ControlRollReference {
+public:
+  [[nodiscard]] bool capture(uint32_t flight_epoch, double roll_rad,
+                             uint64_t sample_timestamp_us,
+                             uint64_t control_tick_us);
+  void invalidate();
+  [[nodiscard]] bool validFor(uint32_t flight_epoch) const;
+  [[nodiscard]] uint32_t flightEpoch() const { return flight_epoch_; }
+  [[nodiscard]] double referenceRad() const { return reference_rad_; }
+  [[nodiscard]] uint64_t sampleTimestampUs() const {
+    return sample_timestamp_us_;
+  }
+  [[nodiscard]] uint64_t captureTickUs() const { return capture_tick_us_; }
+  [[nodiscard]] bool deviation(uint32_t flight_epoch,
+                               double current_roll_rad,
+                               double &deviation_rad) const;
+
+private:
+  uint32_t flight_epoch_{};
+  double reference_rad_{};
+  uint64_t sample_timestamp_us_{};
+  uint64_t capture_tick_us_{};
+  bool valid_{};
+};
+
 struct GainPoint {
   double airspeed_mps{};
   std::array<double, 4> gain{};

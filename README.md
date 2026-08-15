@@ -2,7 +2,7 @@
 
 ESP32-S3-WROOM-1-N16R8を搭載した99L Mission Board firmwareです。Vault 00〜07/04aに基づくMission FSM、CAN codec、command lifecycle、sensor continuity、制御pipeline、パラシュート安全coreをproduction moduleとして実装し、既存bring-up firmwareも明示選択できる形で維持しています。
 
-現時点ではMotorProfile、fin software limit、パラシュートOpen/Close永続設定が未確定・未接続です。既定production buildは各owner taskとsensor/CANを起動しますが、`StartSequence`を`NotConfigured`で拒否し、motor coast/パラシュート電源OFFを維持します。飛行可能firmwareを意味しません。
+既定production buildは、未確定値へ`TODO(HW_TEST)`または`TODO(SIMULATION)`を残した暫定設定で`StartSequence`を受理し、ZeroHold/Roll制御からTB67H450 PWMまでの動翼経路と、STS3215の収納保持/Open/retry/電源遮断経路を実行します。これはbench/HILで一連の動作を検証するための実装であり、飛行認定済みfirmwareではありません。`StartSequence`後は実際にmotorとパラシュートサーボが動作し得ます。
 
 詳細な試験順序は[docs/bringup.md](docs/bringup.md)、実施結果は[docs/bringup_results.md](docs/bringup_results.md)を参照してください。
 
@@ -21,12 +21,38 @@ ESP32-S3-WROOM-1-N16R8を搭載した99L Mission Board firmwareです。Vault 00
 
 ICM42688のfreshnessは取得時の`host_timestamp_us`と`esp_timer_get_time()`を同じhost clock domainで比較します。ICM sensor timestampはhistory/姿勢計算用に保持しますが、clock driftを含むsensor時刻とhost時刻を直接比較して再初期化を繰り返してはいけません。CAN送信はTX完了callbackまで1枠を占有するため、production telemetryは5 msの有限timeoutで直列化します。Emergencyのstate判定はCanTaskのmutex noWait snapshotに依存せず、nonzero transactionをlatchしてMissionRealtimeTaskへ渡します。
 
+## 暫定flight設定
+
+未確定値を空欄のまま残すと、状態機械だけが進み、実出力は常時coastするという検証不能な状態になります。そこで、暫定値を`src/config/flight_config.hpp`と`src/config/board_config.hpp`へ集約し、値の根拠がsimulationかhardware testかをTODOで区別しています。
+
+| 対象 | 暫定値 | 確定方法 |
+|---|---:|---|
+| motor極性 | 正torqueでIN1 PWM | `TODO(HW_TEST)`で回転方向を確認 |
+| motor抵抗 / torque定数 / 無負荷速度 | 3.48 Ω / 0.00855 N·m/A / 1120 rpm | `TODO(HW_TEST)`で個体同定 |
+| drivetrain効率 / motor電流 / 出力torque上限 | 0.60 / 2.0 A / 1.21208 N·m | `TODO(HW_TEST)`で効率・温度・機構負荷を確認 |
+| motor bus / PWM duty上限 | 9.0 V / 15% | `TODO(HW_TEST)`でADC実測と安全上限を確定 |
+| fin software limit | ±14° | `TODO(HW_TEST)`でstopper余裕を確認 |
+| fin zero | production起動後の最初の有効AS5047D角を0°とする | `TODO(HW_TEST)`で機械zero取得手順へ置換 |
+| para Close / Open / 許容差 | 0° / 90° / ±2° | `TODO(HW_TEST)`で機構角を確定 |
+| para速度 / 加速度 / torque | 180°/s / 360°/s² / 20% | `TODO(HW_TEST)`で開放時間とstall余裕を確認 |
+| para電源安定 / 初期化目安 / retry | 100 ms / 1.5 s / 20 ms | `TODO(HW_TEST)`で電源立上り分布を確認 |
+| 差圧zero / 平均窓 / 負圧許容 | 400 sample / 8 sample / 5 Pa | `TODO(SIMULATION)`と`TODO(HW_TEST)`でfilterと実測noiseを確認 |
+| Saint-Venant係数 | 0.92 | `TODO(SIMULATION)`で空力モデルと照合 |
+| Roll gain | 60〜180 m/sの全点で`{0.08, 2.32, 0.04, 0.296}` | `TODO(SIMULATION)`でSpica/HIL同定値へ置換 |
+
+`config_flags`はbit0=MotorProfile、bit1=fin zero取得、bit2=para設定、bit3=SSC zero取得を示します。bit7は暫定値を含みflight qualification未完了であることを常時示します。SSC zeroはCommandReceive中の400 sampleを自動取得する暫定実装です。`StartSequence`自体はbit3未取得でも受理されますが、そのflightではControl gateを通過できないため、bench/HILではbit3を確認してから開始します。再度CommandReceiveへ戻った場合は前flightのzeroを破棄して取り直します。
+
+Control遷移時には、同じtickで最新かつ未来時刻ではないunwrapped roll角を一度だけ基準角として取得します。角度偏差は最短角へwrapしません。Controlを離れた場合、flight epochが変わった場合、reset/recoveryで無効化された場合は基準角も破棄します。
+
 ## 安全上の注意
 
 - 起動直後、他のdriverやtaskより先にGPIO38、39、40、44をLOWへ設定します。TB67H450は停止、+5 Vとpara電源はOFFです。
-- actuatorを動かす試験は自動実行しません。USB consoleから対応commandを明示的に入力した場合だけ実行します。
-- motor PWMは`motor-arm`後だけ許可されます。arm状態はRAMだけに保持され、resetで必ず解除されます。試験中でも`motor-disarm`を受理し、通常は即時、出力lock競合時も5 ms以内に安全停止を再試行します。
-- motorには動翼・stopperが無いため飛行用±15度limitは使いません。bring-up専用上限はduty 15%、速度100 rad/s、command時間45秒です。速度上限は実測前の暫定値で、`combined-motor-imu-test`の実行時間は41秒です。
+- **production buildでは`StartSequence`によりactuatorが動作します。** 機体へ接続する前に、motor電源とpara電源を独立して物理遮断できるfixture上で確認してください。暫定値のまま飛行へ使用してはいけません。
+- bring-up buildのactuator試験は自動実行しません。USB consoleから対応commandを明示的に入力した場合だけ実行します。
+- production motorはcommand_receive、reset/recovery無効化、ActuatorEmergency、sensor/config不正時にcoastまたはbrakeへ移ります。±14°のsoftware limitでstopper方向またはzero torqueが要求された場合は、back-EMF補償PWMを残さず明示brakeとし、中心方向のtorqueだけを許可します。ActuatorEmergencyではmotorをcoast、Paraをtorque OFFかつGPIO44 OFFのFreeへ移し、差圧系GPIO40は維持します。driver APIが失敗した場合はmotor unavailableをlatchし、coastへ退避します。
+- production paraはStartSequence後にClose位置へ移動して保持し、Descent/Open要求後は0.5秒間隔のretryを含む5秒の全体deadlineで動作します。成功・通信不能のどちらでもOpen試行終了時にGPIO44のPara電源だけを遮断し、GPIO40の差圧系電源は維持します。SafetyTaskは離床+25秒でGPIO40/44の両方をUART taskと独立に遮断し、再投入不能にラッチします。
+- bring-up motor PWMは`motor-arm`後だけ許可されます。arm状態はRAMだけに保持され、resetで必ず解除されます。試験中でも`motor-disarm`を受理し、通常は即時、出力lock競合時も5 ms以内に安全停止を再試行します。production経路はbring-upのarm状態を使用せず、Mission FSMと安全gateで出力を管理します。
+- bring-upでmotor単体を接続する場合は動翼・stopperが無いため、飛行用software limitを使いません。bring-up専用上限はduty 15%、速度100 rad/s、command時間45秒です。速度上限は実測前の暫定値で、`combined-motor-imu-test`の実行時間は41秒です。
 - bring-upのSTS UART1はshell初期化時、Para電源OFFのまま一度だけopenし、shell lifetime中は保持します。`sts-*` command時だけPara電源をONにして100 ms待機し、起動中のtimeoutだけを1.5秒のdeadline内で再PINGしてからSTS3215を初期化します。終了時はtorqueを無効化してPara電源をOFFにしますが、UARTはcloseしません。最初の移動は`sts-small-move`で絶対値3度以下に限定します。
 - `aux5v-on`はGPIO40をHIGHにし、`aux5v-off`またはresetまで+5 Vを保持します。必要な試験中だけ明示的にONにし、終了後は必ずOFFへ戻します。
 - `pio device monitor`とbinary captureを同時に開かないでください。同じUSB deviceを同時利用できません。
@@ -70,7 +96,7 @@ pio run
 pio run -e avi_99l_missionboard_can_diag
 ```
 
-`avi_99l_missionboard_can_diag`だけが`MISSION_CAN_UNSAFE_DIAG=1`を定義します。通常のproduction/bring-up buildでは`can-test`とraw ESP-IDF lifecycle試験を`ESP_ERR_NOT_SUPPORTED`で拒否します。2026-08-13のbuild logで実際にcompileされたESP-IDFは6.0.1であり、PlatformIO platform versionから推測した値ではありません。flight設定が未確定の既定buildではactuator commandを自動実行しません。
+`avi_99l_missionboard_can_diag`だけが`MISSION_CAN_UNSAFE_DIAG=1`を定義します。通常のproduction/bring-up buildでは`can-test`とraw ESP-IDF lifecycle試験を`ESP_ERR_NOT_SUPPORTED`で拒否します。2026-08-13のbuild logで実際にcompileされたESP-IDFは6.0.1であり、PlatformIO platform versionから推測した値ではありません。既定production buildは暫定flight設定を有効化しているため、`StartSequence`後にactuator出力を実行します。
 
 host testはworkspace外の実行可能なbuild directoryを指定します。
 
@@ -196,19 +222,20 @@ CANはstandard 11-bit、125 kbit/s、DLC 8以下、multi-byteはlittle-endianで
 - LPS25HB/SSCは外部pull-upのI2C0 300 kHz。SSC未接続は正常な起動条件で、Controlだけをinhibitします。
 - 現在のLPS25HB個体はpressure/temperatureの妥当性を保証できません。bring-upではtransport/config/read/cleanupとread latencyだけを評価し、物理値、実効ODR、freshness、離床・頂点判定を合格扱いしません。
 - 2026-08-13のaddress probeでは100 ms以上安定後も未使用`0x5D`へ1/3,200のintermittent false ACKがありました。logic analyzerでwire ACK/NACKを確認するまでI2C address検出も未解決です。
-- STS3215はUART1唯一owner。Open位置未復元時は動作せずpower cutoffします。
+- STS3215はUART1唯一ownerです。productionでは暫定Close/Open位置をcompile-time設定から使用し、電源投入、position mode確認、収納保持、Open、retry、電源遮断までをParachuteTaskだけが実行します。NVSからの位置復元は未接続です。
 - bring-upのSTS tx/response timeout 100 msと起動deadline 1.5秒は`TODO(HW_TEST)`暫定値です。2026-08-13の実機ではPara電源ON後の最初の6回がtimeoutし、7回目のPING、STS3215初期化、50回のtelemetry read、cleanupが成功しました。個体差・電源条件を測定後に安全に短縮します。
-- MotorProfile polarity/個体値、fin software limitは`TODO(HW_TEST)`のまま未設定です。
-- Roll gain table、freshness/debounce、quadratic estimator、torque scaleは`TODO(SIMULATION)`を保持します。
+- MotorProfile polarity/個体値、fin software limit、para位置・速度・torqueは暫定値を設定し、`TODO(HW_TEST)`を保持します。
+- Roll gain table、freshness/debounce、quadratic estimator、差圧filter、torque scaleは暫定値を設定し、`TODO(SIMULATION)`を保持します。
 
 ## known limitations
 
 - NVS para設定、Internal Flash append log、SD production loggerはowner taskの安全stubまでで、flight pathへ未接続です。software/watchdog reset用checkpointはversion/CRC付きRTC memoryで復旧し、POR後の絶対時刻復旧は未接続のため安全側に飛行再開しません。
-- Roll gain tableとmotor/fin configuration未確定のためproduction runtimeはflight-disabledです。
-- ICM history/replay、AS5047D unwrap、quadratic fin rateまではruntimeへ接続済みですが、Roll/ZeroHold/TorqueMapperからmotor出力への経路はprofile確定まで無効で、常にcoastします。
-- ParachuteTaskはSTS唯一ownerですが、Open位置永続loader未接続のためflight Openを安全拒否します。
+- production runtimeは暫定flight設定で有効ですが、値はsimulation/HIL/実機で未確定です。bit7が立っているbuildを飛行認定済みとして扱ってはいけません。
+- ICM history/replay、AS5047D unwrap、quadratic fin rate、ZeroHold/Roll、TorqueMapper、TB67H450 PWMは接続済みです。起動時AS5047D角をzeroとするため、電源投入時の翼角がずれていれば、そのずれを0°として制御します。
+- ParachuteTaskは暫定compile-time位置を使用します。NVS位置設定、productionの手動Para/Fin command、明示PreflightCalibration commandは未接続です。差圧zeroはCommandReceive中の自動取得で代用しています。
+- ADCによるmotor/logic電圧監視とbattery present threshold/debounceはproduction flight gateへ未接続です。
 - AS5047DではDIAG/AGC/magnitudeが全て0の応答を一度確認しましたが、最終再試験では`offset_done=1`、AGC 61、magnitude 4616で正常化しました。bring-upとproduction startupは共通health判定でall-zeroを`ESP_ERR_INVALID_RESPONSE`とし、productionはpipelineを開始せずfin angle/rateをunavailable、motorをcoastに保ちます。角度0度そのものは故障条件ではありません。実機productionでは正常status時のpipeline開始と、一時診断buildでall-zeroを注入した際のstatus拒否/pipeline未開始を確認しました。確認を妨げていたMissionRealtimeTaskのstack overflowは、task専有の大型history/FIFO wrapperをstatic storageへ移して解消し、startup時点の最小空き2,504 byteを実測しています。このgateはstartupと明示reinitialize時だけで、1 kHz loopへ周期的なpipeline停止を追加していません。飛行中にMISOがstuck-lowへ遷移した場合のDIAG検出は残TODOです。
 - ESP-IDF 6.0.1のlocal `esp_twai_onchip.c`にはEspressif issue [#18803](https://github.com/espressif/esp-idf/issues/18803)の修正がありません。TX完了通知のevent-group更新がtimer taskへ遅延したままnodeを削除するuse-after-freeを実機で再現したため、Avi_ESP_Libsの`CANCREATE::test()`はESP-IDF 6以上を既知safe release確認まで`ESP_ERR_NOT_SUPPORTED`で拒否します。常駐ownerを使うproduction CANとはlifecycleが異なります。
 - Deep SleepはRTC marker/wake causeを検証した専用task subsetで10秒周期wakeします。Internal Flash/SD log reader未接続のためlog dump要求は`SourceUnavailable`です。2秒command windowは`TODO(HW_TEST)`です。
-- 3基板実機でMission→ComBoard CAN、ComBoard↔Ground LoRa、Ground→Missionの安全なcommand round-tripは確認済みです。motor motion、STS hold/move、パラシュートOpen/Close、flight enableは安全条件により未実施で、成功扱いしません。
+- 3基板実機でMission→ComBoard CAN、ComBoard↔Ground LoRa、Ground→Missionの安全なcommand round-tripは確認済みです。今回接続したproduction motor motion、STS収納保持/Open、差圧zero、Control遷移、5秒/25秒cutoffは未検証であり、成功扱いしません。
 - Mission基板上のmicroSDはbring-up `sd-test`で1 MiB write/read/CRCをPASSしていますが、Mission production loggerは未接続です。今回BLOCKEDとなった`CAN.CSV` logging/readbackはComBoard側microSDの初期化問題であり、Missionのbring-up microSD PASSを取り消す結果ではありません。

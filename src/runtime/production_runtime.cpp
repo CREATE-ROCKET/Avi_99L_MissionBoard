@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 
@@ -18,6 +19,7 @@
 #include "bringup/safe_outputs.hpp"
 #include "bringup/spi_bringup.hpp"
 #include "config/board_config.hpp"
+#include "config/flight_config.hpp"
 #include "esp_task_wdt.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -26,6 +28,7 @@
 #include "mission/command_executor.hpp"
 #include "mission/mission_state.hpp"
 #include "mission/recovery.hpp"
+#include "actuators/production_motor.hpp"
 #include "actuators/safety_core.hpp"
 #include "control/control_pipeline.hpp"
 #include "protocol/can_protocol.hpp"
@@ -34,9 +37,11 @@
 #include "runtime/recovery_boot.hpp"
 #include "runtime/emergency_latch.hpp"
 #include "sensors/air_data_flight_logic.hpp"
+#include "sensors/airspeed_estimator.hpp"
 #include "sensors/as5047d_health.hpp"
 #include "sensors/attitude_estimator.hpp"
 #include "sensors/flight_detectors.hpp"
+#include "sensors/sensor_health.hpp"
 
 namespace runtime {
 namespace {
@@ -66,6 +71,8 @@ struct RuntimeStatus {
       protocol::quantization::FinAngleError::not_initialized)};
   uint16_t fin_rate_raw{static_cast<uint16_t>(
       protocol::quantization::FinRateError::estimator_not_ready)};
+  uint16_t requested_torque_raw{static_cast<uint16_t>(
+      protocol::quantization::TorqueError::unavailable)};
 };
 
 struct AirDataSnapshot {
@@ -79,8 +86,13 @@ struct AirDataSnapshot {
   uint8_t airspeed_raw{
       static_cast<uint8_t>(
           protocol::quantization::AirspeedError::ssc_not_initialized)};
+  double static_pressure_pa{};
+  double ssc_temperature_celsius{};
+  double airspeed_mps{};
   bool lps_valid{};
   bool ssc_valid{};
+  bool ssc_zero_valid{};
+  bool airspeed_valid{};
 };
 
 struct PowerRequest {
@@ -100,7 +112,7 @@ struct EmergencyEnvelope {
 };
 
 struct ParaRequest {
-  enum class Kind : uint8_t { hold, open, power_off } kind{Kind::hold};
+  enum class Kind : uint8_t { hold, open, free, power_off } kind{Kind::hold};
   uint32_t flight_epoch{};
   bool safety_authorized{};
 };
@@ -175,9 +187,13 @@ std::atomic<uint16_t> event_overflow_latch{};
 std::atomic<bool> runtime_started{false};
 std::atomic<bool> imu_ready{false};
 std::atomic<bool> encoder_ready{false};
+std::atomic<bool> motor_ready{false};
+std::atomic<bool> fin_zero_configured{false};
 std::atomic<bool> lps_ready{false};
 std::atomic<bool> ssc_ready{false};
 std::atomic<bool> sts_ready{false};
+std::atomic<protocol::ParaMode> para_mode_actual{
+    protocol::ParaMode::powered_off};
 std::atomic<bool> can_healthy{false};
 EmergencyLatch actuator_emergency_latch;
 EmergencyLatch liftoff_emergency_latch;
@@ -195,6 +211,7 @@ TimeState time_state;
 SemaphoreHandle_t time_mutex{};
 StaticSemaphore_t time_mutex_storage;
 std::atomic<bool> fin_zero_hold_valid{false};
+std::atomic<bool> actuator_output_inhibited{false};
 mission::MissionStateMachine state_machine;
 mission::CommandExecutor command_executor;
 SemaphoreHandle_t state_mutex{};
@@ -321,6 +338,9 @@ void safetyTask(void *) {
       // Emergency latchはqueue容量と無関係にSafetyTaskからpowerを落とす。
       (void)bringup::safe_outputs::setAux5v(false);
       (void)bringup::safe_outputs::setParaPower(false);
+      sts_ready.store(false, std::memory_order_release);
+      para_mode_actual.store(protocol::ParaMode::powered_off,
+                             std::memory_order_release);
     }
     if (recovery_requested.load(std::memory_order_acquire)) {
       const bool aux_safe = bringup::safe_outputs::setAux5v(false) == ESP_OK;
@@ -328,6 +348,11 @@ void safetyTask(void *) {
           bringup::safe_outputs::setParaPower(false) == ESP_OK;
       recovery_power_safe.store(aux_safe && para_safe,
                                 std::memory_order_release);
+      if (para_safe) {
+        sts_ready.store(false, std::memory_order_release);
+        para_mode_actual.store(protocol::ParaMode::powered_off,
+                               std::memory_order_release);
+      }
     }
     PowerRequest request{};
     while (xQueueReceive(power_queue, &request, 0) == pdTRUE) {
@@ -335,6 +360,9 @@ void safetyTask(void *) {
       if (cutoff_latched) {
         (void)bringup::safe_outputs::setAux5v(false);
         (void)bringup::safe_outputs::setParaPower(false);
+        sts_ready.store(false, std::memory_order_release);
+        para_mode_actual.store(protocol::ParaMode::powered_off,
+                               std::memory_order_release);
       } else {
         (void)bringup::safe_outputs::setAux5v(request.auxiliary_5v);
         (void)bringup::safe_outputs::setParaPower(request.parachute_power);
@@ -382,6 +410,9 @@ void safetyTask(void *) {
       cutoff_latched = true;
       (void)bringup::safe_outputs::setAux5v(false);
       (void)bringup::safe_outputs::setParaPower(false);
+      sts_ready.store(false, std::memory_order_release);
+      para_mode_actual.store(protocol::ParaMode::powered_off,
+                             std::memory_order_release);
       const ParaRequest para{ParaRequest::Kind::power_off, tracked_epoch,
                              true};
       (void)xQueueSend(para_queue, &para, 0);
@@ -396,26 +427,166 @@ void parachuteTask(void *) {
   STSCREATE bus;
   STS3215 servo;
   actuators::ParachuteController controller;
+
+  enum class DesiredState : uint8_t { powered_off, close_and_hold, open };
+  DesiredState desired = DesiredState::powered_off;
+  uint32_t active_epoch = 0;
+  uint64_t power_enabled_at_us = 0;
+  uint64_t next_initialization_attempt_us = 0;
+  uint64_t open_requested_at_us = 0;
   bool power_enabled = false;
-  auto powerOff = [&]() {
+  bool mode_prepared = false;
+  bool close_command_sent = false;
+  bool close_hold_confirmed = false;
+  bool controller_started = false;
+
+  auto queuePower = [](const PowerRequest &request) {
+    if (xQueueSend(power_queue, &request, 0) == pdTRUE)
+      return true;
+    // queue飽和時も電源OFF要求だけはGPIOへ直接反映する。
+    if (request.cutoff || !request.parachute_power)
+      (void)bringup::safe_outputs::setParaPower(false);
+    if (request.cutoff || !request.auxiliary_5v)
+      (void)bringup::safe_outputs::setAux5v(false);
+    return false;
+  };
+
+  auto powerOff = [&](bool latch_cutoff, bool preserve_auxiliary_5v,
+                      protocol::ParaMode final_mode) {
     if (servo.initialized()) {
       (void)servo.disableTorque();
       (void)servo.end();
     }
     if (bus.initialized())
       (void)bus.end();
-    PowerRequest power{false, false, true};
-    (void)xQueueSend(power_queue, &power, 0);
+    const PowerRequest power{preserve_auxiliary_5v && !latch_cutoff, false,
+                             latch_cutoff};
+    (void)queuePower(power);
     controller.notifyPowerCutoff();
+    sts_ready.store(false, std::memory_order_release);
+    para_mode_actual.store(final_mode, std::memory_order_release);
+    desired = DesiredState::powered_off;
+    active_epoch = 0;
+    power_enabled_at_us = 0;
+    next_initialization_attempt_us = 0;
+    open_requested_at_us = 0;
     power_enabled = false;
+    mode_prepared = false;
+    close_command_sent = false;
+    close_hold_confirmed = false;
+    controller_started = false;
   };
+
+  auto requestPower = [&](uint64_t now_us) {
+    if (power_enabled)
+      return true;
+    const PowerRequest power{true, true, false};
+    if (!queuePower(power))
+      return false;
+    power_enabled = true;
+    power_enabled_at_us = now_us;
+    next_initialization_attempt_us =
+        now_us + static_cast<uint64_t>(
+                     flight_config::kParachute.power_stabilization_ms) *
+                     1'000ULL;
+    return true;
+  };
+
+  auto initializeServo = [&](uint64_t now_us) {
+    if (!power_enabled ||
+        now_us < power_enabled_at_us +
+                     static_cast<uint64_t>(
+                         flight_config::kParachute.power_stabilization_ms) *
+                         1'000ULL ||
+        now_us < next_initialization_attempt_us)
+      return false;
+    next_initialization_attempt_us =
+        now_us + static_cast<uint64_t>(
+                     flight_config::kParachute.retry_interval_ms) *
+                     1'000ULL;
+
+    if (!bus.initialized()) {
+      STSCREATE::Config config{};
+      config.port = board::kParaUart;
+      config.tx = board::kParaTx;
+      config.rx = board::kParaRx;
+      config.direction_enable = board::kParaDirectionEnable;
+      config.direction_polarity = STSCREATE::DirectionPolarity::tx_high;
+      config.baudrate = STSCREATE::Baudrate::bps1000000;
+      config.lock_timeout = avi::Timeout::noWait();
+      config.tx_timeout =
+          avi::Timeout::milliseconds(board::kParaTxTimeoutMs);
+      config.response_timeout =
+          avi::Timeout::milliseconds(board::kParaResponseTimeoutMs);
+      if (bus.begin(config) != ESP_OK)
+        return false;
+    }
+    if (!servo.initialized() &&
+        servo.begin(bus, board::kParaServoId) != ESP_OK)
+      return false;
+    if (!servo.configurationValid()) {
+      // 不完全な初期化状態を保持せず、次回retryでbeginからやり直す。
+      (void)servo.end();
+      return false;
+    }
+    if (!mode_prepared) {
+      if (servo.verifyOperatingMode(STS3215::OperatingMode::position) !=
+              ESP_OK &&
+          servo.setOperatingMode(
+              STS3215::OperatingMode::position,
+              STS3215::Persistence::volatile_only) != ESP_OK)
+        return false;
+      mode_prepared =
+          servo.verifyOperatingMode(STS3215::OperatingMode::position) ==
+          ESP_OK;
+    }
+    sts_ready.store(mode_prepared, std::memory_order_release);
+    return mode_prepared;
+  };
+
+  auto motion = []() {
+    STS3215::Motion result{};
+    result.speed_deg_s = flight_config::kParachute.speed_deg_s;
+    result.acceleration_deg_s2 =
+        flight_config::kParachute.acceleration_deg_s2;
+    result.torque_limit = STS3215::TorqueLimit::percent(
+        flight_config::kParachute.torque_limit_percent);
+    return result;
+  };
+
   for (;;) {
+    if (recovery_requested.load(std::memory_order_acquire) &&
+        desired != DesiredState::powered_off)
+      powerOff(false, false, protocol::ParaMode::powered_off);
+
     ParaRequest request{};
     while (xQueueReceive(para_queue, &request, 0) == pdTRUE) {
-      if (request.kind == ParaRequest::Kind::power_off) {
-        powerOff();
+      if (request.kind == ParaRequest::Kind::free ||
+          request.kind == ParaRequest::Kind::power_off) {
+        bool current_request = request.safety_authorized ||
+                               request.flight_epoch == 0;
+        if (!current_request && xSemaphoreTake(state_mutex, 0) == pdTRUE) {
+          const auto snapshot = state_machine.snapshot();
+          current_request = request.flight_epoch == snapshot.flight_epoch;
+          xSemaphoreGive(state_mutex);
+        } else if (!current_request) {
+          (void)xQueueSendToFront(para_queue, &request, 0);
+          break;
+        }
+        if (current_request) {
+          const bool free_requested = request.kind == ParaRequest::Kind::free;
+          const bool absolute_cutoff =
+              !free_requested && request.safety_authorized;
+          const bool preserve_auxiliary_5v =
+              !absolute_cutoff &&
+              !recovery_requested.load(std::memory_order_acquire);
+          powerOff(absolute_cutoff, preserve_auxiliary_5v,
+                   free_requested ? protocol::ParaMode::free
+                                  : protocol::ParaMode::powered_off);
+        }
         continue;
       }
+
       bool current_request = false;
       if (xSemaphoreTake(state_mutex, 0) == pdTRUE) {
         const auto snapshot = state_machine.snapshot();
@@ -429,27 +600,135 @@ void parachuteTask(void *) {
         (void)xQueueSendToFront(para_queue, &request, 0);
         break;
       }
-      if (!current_request) {
-        powerOff();
-      } else if (request.kind == ParaRequest::Kind::hold) {
-        // Open/Close設定未復元時はUARTへ駆動commandを送らない。
-        if (servo.initialized())
-          (void)servo.holdCurrentPosition({STS3215::TorqueLimit::percent(10)});
+      if (!current_request)
+        continue;
+
+      const uint64_t now_us = static_cast<uint64_t>(esp_timer_get_time());
+      const bool same_epoch = active_epoch == request.flight_epoch;
+      // 同一flightでOpenへ進んだ後は、遅延したHold要求で収納方向へ戻さない。
+      // SafetyTaskとFSMからの重複Openも無視し、最初の5秒deadlineを延長しない。
+      if (same_epoch && desired == DesiredState::open)
+        continue;
+      if (same_epoch && desired == DesiredState::close_and_hold &&
+          request.kind == ParaRequest::Kind::hold)
+        continue;
+
+      active_epoch = request.flight_epoch;
+      if (request.kind == ParaRequest::Kind::hold) {
+        desired = DesiredState::close_and_hold;
+        close_command_sent = false;
+        close_hold_confirmed = false;
+        controller_started = false;
       } else {
-        // TEMPORARY_IMPLEMENTATION: 永続Open位置未復元のためOpenを拒否し電源を遮断する。
-        powerOff();
+        desired = DesiredState::open;
+        open_requested_at_us = now_us;
+        controller = actuators::ParachuteController{};
+        controller_started = false;
+      }
+      if (requestPower(now_us)) {
+        para_mode_actual.store(
+            desired == DesiredState::open
+                ? protocol::ParaMode::opening_or_retrying
+                : protocol::ParaMode::closing,
+            std::memory_order_release);
+      } else {
+        para_mode_actual.store(protocol::ParaMode::powered_off,
+                               std::memory_order_release);
       }
     }
-    if (power_enabled && servo.initialized()) {
-      STS3215::Data data{};
-      const esp_err_t read = servo.read(data);
-      sts_ready.store(read == ESP_OK, std::memory_order_release);
-      const auto action = controller.tick(
-          {static_cast<uint64_t>(esp_timer_get_time()), read == ESP_OK,
-           data.position_deg, !data.moving});
-      if (action == actuators::ParachuteAction::cut_power)
-        powerOff();
+
+    const uint64_t now_us = static_cast<uint64_t>(esp_timer_get_time());
+    if (desired != DesiredState::powered_off) {
+      if (!requestPower(now_us)) {
+        sts_ready.store(false, std::memory_order_release);
+      } else if (initializeServo(now_us)) {
+        para_mode_actual.store(
+            desired == DesiredState::open
+                ? protocol::ParaMode::opening_or_retrying
+                : (close_hold_confirmed ? protocol::ParaMode::hold
+                                        : protocol::ParaMode::closing),
+            std::memory_order_release);
+        if (desired == DesiredState::close_and_hold) {
+          if (!close_command_sent) {
+            const esp_err_t result = servo.moveAbsoluteDegrees(
+                flight_config::kParachute.close_position_deg, motion());
+            close_command_sent = result == ESP_OK;
+            sts_ready.store(result == ESP_OK, std::memory_order_release);
+          }
+          if (close_command_sent && !close_hold_confirmed) {
+            STS3215::Data data{};
+            const esp_err_t read = servo.read(data);
+            sts_ready.store(read == ESP_OK, std::memory_order_release);
+            const bool reached =
+                read == ESP_OK && !data.moving &&
+                std::abs(data.position_deg -
+                         flight_config::kParachute.close_position_deg) <=
+                    flight_config::kParachute.target_tolerance_deg;
+            if (reached) {
+              const esp_err_t hold = servo.holdCurrentPosition(
+                  {STS3215::TorqueLimit::percent(
+                      flight_config::kParachute.torque_limit_percent)});
+              close_hold_confirmed = hold == ESP_OK;
+              sts_ready.store(hold == ESP_OK, std::memory_order_release);
+              if (close_hold_confirmed)
+                para_mode_actual.store(protocol::ParaMode::hold,
+                                       std::memory_order_release);
+            }
+          }
+        } else if (desired == DesiredState::open) {
+          STS3215::Data data{};
+          const esp_err_t read = servo.read(data);
+          sts_ready.store(read == ESP_OK, std::memory_order_release);
+          if (!controller_started && read == ESP_OK) {
+            controller_started =
+                controller.startOpen(now_us, data.position_deg) ==
+                actuators::ParachuteAction::command_open;
+            if (controller_started &&
+                servo.moveAbsoluteDegrees(
+                    flight_config::kParachute.open_position_deg,
+                    motion()) != ESP_OK)
+              sts_ready.store(false, std::memory_order_release);
+          }
+          if (controller_started) {
+            const bool reached =
+                read == ESP_OK && !data.moving &&
+                std::abs(data.position_deg -
+                         flight_config::kParachute.open_position_deg) <=
+                    flight_config::kParachute.target_tolerance_deg;
+            const auto action = controller.tick(
+                {now_us, read == ESP_OK, data.position_deg, reached});
+            if (action == actuators::ParachuteAction::retry_open) {
+              if (servo.moveAbsoluteDegrees(
+                      flight_config::kParachute.open_position_deg,
+                      motion()) != ESP_OK)
+                sts_ready.store(false, std::memory_order_release);
+            } else if (action == actuators::ParachuteAction::cut_power) {
+              // Open試行の5秒deadlineではPara電源だけを切る。
+              // GPIO40/44の絶対cutoff latchは離床+25秒のSafetyTaskだけが行う。
+              powerOff(false, true, protocol::ParaMode::powered_off);
+            }
+          }
+        }
+      }
+
+      // Controller開始前に通信が成立しない場合も5秒で電源を遮断する。
+      if (desired == DesiredState::open && open_requested_at_us != 0 &&
+          now_us >= open_requested_at_us &&
+          now_us - open_requested_at_us >= 5'000'000)
+        powerOff(false, true, protocol::ParaMode::powered_off);
+
+      // TODO(HW_TEST): 1.5秒以内に初期化できない個体を故障扱いにするか、
+      // Openの5秒deadlineまでretryするかを実機電源条件で確定する。
+      if (desired == DesiredState::close_and_hold && power_enabled_at_us != 0 &&
+          now_us >= power_enabled_at_us &&
+          now_us - power_enabled_at_us >=
+              static_cast<uint64_t>(
+                  flight_config::kParachute.initialization_deadline_ms) *
+                  1'000ULL &&
+          !servo.initialized())
+        sts_ready.store(false, std::memory_order_release);
     }
+
     if (!servo.initialized())
       sts_ready.store(false, std::memory_order_release);
     resetWatchdog();
@@ -468,7 +747,13 @@ void missionRealtimeTask(void *) {
   static sensors::GyroHistoryRing gyro_history;
   sensors::ImuLiftoffDetector liftoff_detector;
   sensors::AttitudeEstimator attitude;
+  sensors::AirspeedGate airspeed_gate;
   control::QuadraticN3FinVelocityEstimator fin_velocity;
+  control::ZeroHoldController zero_hold_controller;
+  control::RollController roll_controller{flight_config::kRollGainSchedule};
+  control::TorqueMapper torque_mapper{board::kFlightMotorA,
+                                      board::kFinSoftwareLimits};
+  actuators::ProductionMotorDriver motor_driver;
   bool liftoff_detected = false;
   bool imu_liftoff_latched = false;
   bool lps_liftoff_latched = false;
@@ -483,6 +768,7 @@ void missionRealtimeTask(void *) {
   bool previous_imu_error = false;
   bool previous_encoder_error = false;
   bool previous_air_data_error = false;
+  bool previous_motor_saturation = false;
   bool previous_reset_invalidated = false;
   uint64_t last_imu_host_sample_us = 0;
   uint64_t last_imu_recovery_attempt_us = 0;
@@ -490,10 +776,14 @@ void missionRealtimeTask(void *) {
   uint64_t sensor_to_host_offset_us = 0;
   uint32_t attitude_epoch = 0;
   bool fin_angle_available = false;
+  bool fin_zero_available = false;
   double previous_wrapped_fin_rad = 0.0;
   double unwrapped_fin_rad = 0.0;
+  double fin_zero_reference_rad = 0.0;
+  double fin_angle_rad = 0.0;
   double fin_rate_rad_s = 0.0;
   bool fin_rate_valid = false;
+  control::ControlRollReference control_reference;
   std::printf("MissionRealtimeTask spi begin start\n");
   const esp_err_t spi_result = spi.begin();
   std::printf("MissionRealtimeTask spi begin result=%s\n",
@@ -524,8 +814,10 @@ void missionRealtimeTask(void *) {
     (void)encoder.end();
   imu_ready.store(imu_result == ESP_OK, std::memory_order_release);
   encoder_ready.store(pipeline_result == ESP_OK, std::memory_order_release);
-  std::printf("MissionRealtimeTask encoder pipeline result=%s\n",
-              esp_err_to_name(pipeline_result));
+  const esp_err_t motor_result = motor_driver.initialize();
+  motor_ready.store(motor_result == ESP_OK, std::memory_order_release);
+  std::printf("MissionRealtimeTask encoder pipeline result=%s motor=%s\n",
+              esp_err_to_name(pipeline_result), esp_err_to_name(motor_result));
   std::printf("MissionRealtimeTask stack free min bytes=%u\n",
               static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
 
@@ -534,9 +826,8 @@ void missionRealtimeTask(void *) {
   for (;;) {
     vTaskDelayUntil(&wake, 1);
     if (recovery_requested.load(std::memory_order_acquire)) {
-      recovery_motor_safe.store(
-          bringup::safe_outputs::motorCoast() == ESP_OK,
-          std::memory_order_release);
+      recovery_motor_safe.store(motor_driver.coast() == ESP_OK,
+                                std::memory_order_release);
     }
     EmergencyEnvelope emergency{};
     while (xQueueReceive(emergency_queue, &emergency, 0) == pdTRUE) {
@@ -574,9 +865,14 @@ void missionRealtimeTask(void *) {
         xSemaphoreGive(executor_mutex);
         enqueueResult(decision.result, true);
         if (decision.execute) {
-          (void)bringup::safe_outputs::motorCoast();
-          const PowerRequest power{false, false, false};
+          actuator_output_inhibited.store(true, std::memory_order_release);
+          (void)motor_driver.coast();
+          // ActuatorEmergencyはmotor/ParaをFreeにするcommandであり、
+          // 差圧系のGPIO40までpower cycleしない。
+          const PowerRequest power{true, false, false};
+          const ParaRequest para{ParaRequest::Kind::free, 0, false};
           (void)xQueueSend(power_queue, &power, 0);
+          (void)xQueueSendToFront(para_queue, &para, 0);
           for (std::size_t index = 0; index < decision.interrupted_count;
                ++index)
             enqueueResult(decision.interrupted[index], true);
@@ -603,7 +899,8 @@ void missionRealtimeTask(void *) {
           emergency_metadata_overflow.fetch_add(1,
                                                 std::memory_order_relaxed);
       }
-      (void)bringup::safe_outputs::motorCoast();
+      actuator_output_inhibited.store(true, std::memory_order_release);
+      (void)motor_driver.coast();
     }
 
     MissionCommandEnvelope command_envelope{};
@@ -625,15 +922,44 @@ void missionRealtimeTask(void *) {
           mission::TransitionResult::not_configured;
       const auto code = static_cast<mission::CommandCode>(
           command_envelope.request.command);
-      if (code == mission::CommandCode::cancel_sequence)
+      const auto before_transition = state_machine.snapshot();
+      ParaRequest post_transition_para{};
+      bool post_transition_para_valid = false;
+      if (code == mission::CommandCode::cancel_sequence) {
         transition = state_machine.cancelSequence();
-      else if (code == mission::CommandCode::disable_fin_control)
+        if (transition == mission::TransitionResult::completed) {
+          post_transition_para = {ParaRequest::Kind::power_off,
+                                  before_transition.flight_epoch, false};
+          post_transition_para_valid = true;
+        }
+      } else if (code == mission::CommandCode::disable_fin_control) {
         transition = state_machine.disableFinControl();
-      else if (code == mission::CommandCode::start_sequence)
+      } else if (code == mission::CommandCode::start_sequence) {
         transition = state_machine.startSequence(
-            static_cast<uint64_t>(esp_timer_get_time()), {});
+            static_cast<uint64_t>(esp_timer_get_time()),
+            flight_config::kSequenceConfiguration);
+        if (transition == mission::TransitionResult::completed) {
+          const auto started = state_machine.snapshot();
+          post_transition_para = {ParaRequest::Kind::hold,
+                                  started.flight_epoch, false};
+          if (xQueueSend(para_queue, &post_transition_para, 0) != pdTRUE) {
+            // Para close/holdを開始できない状態でsequenceだけ進めない。
+            (void)state_machine.cancelSequence();
+            transition = mission::TransitionResult::not_configured;
+          } else {
+            post_transition_para_valid = false;
+            actuator_output_inhibited.store(false,
+                                             std::memory_order_release);
+          }
+        }
+      }
       const auto transition_state = state_machine.snapshot().state;
       xSemaphoreGive(state_mutex);
+      if (post_transition_para_valid &&
+          xQueueSendToFront(para_queue, &post_transition_para, 0) != pdTRUE) {
+        // Cancel後の電源OFFはqueue飽和時も物理出力へ直接反映する。
+        (void)bringup::safe_outputs::setParaPower(false);
+      }
       const auto reason = transitionReason(transition);
       const auto final = command_executor.finish(
           command_envelope.request.transaction_id,
@@ -660,9 +986,18 @@ void missionRealtimeTask(void *) {
       current_epoch = snapshot.flight_epoch;
       xSemaphoreGive(state_mutex);
     }
-    if (current_epoch != detector_epoch ||
-        detector_state == protocol::MissionState::command_receive) {
+    if (current_epoch != detector_epoch) {
       detector_epoch = current_epoch;
+      liftoff_detector.reset();
+      airspeed_gate.reset();
+      zero_hold_controller.resetValidity();
+      fin_zero_hold_valid.store(false, std::memory_order_release);
+      control_reference.invalidate();
+      liftoff_detected = false;
+      imu_liftoff_latched = false;
+      lps_liftoff_latched = false;
+      imu_data_loss_latched = false;
+    } else if (detector_state == protocol::MissionState::command_receive) {
       liftoff_detector.reset();
       liftoff_detected = false;
       imu_liftoff_latched = false;
@@ -769,25 +1104,52 @@ void missionRealtimeTask(void *) {
         fin_rate_valid = false;
         fin_velocity.reset();
       } else {
+        constexpr double kPi = 3.141592653589793;
+        constexpr double kTwoPi = 6.283185307179586;
         const double wrapped = static_cast<double>(sample.angle_radians);
         if (!fin_angle_available) {
-          unwrapped_fin_rad = wrapped;
+          if (fin_zero_available) {
+            // transient後は直前unwrapped角に最も近いturnへ復帰する。
+            const double turns =
+                std::round((unwrapped_fin_rad - wrapped) / kTwoPi);
+            unwrapped_fin_rad = wrapped + turns * kTwoPi;
+          } else {
+            unwrapped_fin_rad = wrapped;
+          }
           fin_angle_available = true;
         } else {
           double delta = wrapped - previous_wrapped_fin_rad;
-          if (delta > 3.141592653589793)
-            delta -= 6.283185307179586;
-          else if (delta < -3.141592653589793)
-            delta += 6.283185307179586;
+          if (delta > kPi)
+            delta -= kTwoPi;
+          else if (delta < -kPi)
+            delta += kTwoPi;
           unwrapped_fin_rad += delta;
         }
         previous_wrapped_fin_rad = wrapped;
+        if (!fin_zero_available) {
+          // TODO(HW_TEST): 起動時の物理直進位置を0 degとみなす暫定zeroを、
+          // NVS値または明示calibrationへ置換する。
+          fin_zero_reference_rad = unwrapped_fin_rad;
+          fin_zero_available = true;
+          fin_zero_configured.store(true, std::memory_order_release);
+        }
+        fin_angle_rad = unwrapped_fin_rad - fin_zero_reference_rad;
         fin_rate_valid = fin_velocity.update(sample.host_timestamp_us,
-                                             unwrapped_fin_rad,
+                                             fin_angle_rad,
                                              fin_rate_rad_s);
         encoder_ready.store(true, std::memory_order_release);
       }
+    } else {
+      encoder_ready.store(false, std::memory_order_release);
+      fin_rate_valid = false;
     }
+    const bool fin_sample_valid =
+        encoder_ready.load(std::memory_order_acquire) && fin_zero_available &&
+        fin_rate_valid && std::isfinite(fin_angle_rad) &&
+        std::isfinite(fin_rate_rad_s);
+    const bool zero_hold_valid = zero_hold_controller.updateValidity(
+        fin_angle_rad, fin_rate_rad_s, fin_sample_valid);
+    fin_zero_hold_valid.store(zero_hold_valid, std::memory_order_release);
 
     AirDataSnapshot air_data{};
     if (xQueueReceive(air_data_queue, &air_data, 0) == pdTRUE) {
@@ -806,17 +1168,21 @@ void missionRealtimeTask(void *) {
     const bool lps_fresh =
         latest_air_data.lps_monotonic_us != 0 &&
         tick.monotonic_us >= latest_air_data.lps_monotonic_us &&
-        tick.monotonic_us - latest_air_data.lps_monotonic_us <= 120'000;
+        tick.monotonic_us - latest_air_data.lps_monotonic_us <=
+            sensors::FreshnessThresholds::lps_us;
     const bool ssc_fresh =
         latest_air_data.ssc_monotonic_us != 0 &&
         tick.monotonic_us >= latest_air_data.ssc_monotonic_us &&
-        tick.monotonic_us - latest_air_data.ssc_monotonic_us <= 30'000;
+        tick.monotonic_us - latest_air_data.ssc_monotonic_us <=
+            sensors::FreshnessThresholds::ssc_us;
     tick.deployment_pressure_condition =
         lps_fresh &&
         latest_air_data.flight.flight_epoch == current_epoch &&
         latest_air_data.flight.pressure_apex_detected;
     tick.control.fin_control_available =
-        encoder_ready.load(std::memory_order_acquire);
+        fin_sample_valid && motor_ready.load(std::memory_order_acquire) &&
+        !actuator_output_inhibited.load(std::memory_order_acquire) &&
+        flight_config::productionFlightConfigurationReady();
     tick.control.fin_zero_hold_valid =
         fin_zero_hold_valid.load(std::memory_order_acquire);
     tick.control.attitude_valid = attitude.state().valid;
@@ -828,8 +1194,12 @@ void missionRealtimeTask(void *) {
         latest_air_data.ssc_valid;
     tick.control.gyro_bias_valid =
         attitude_epoch == current_epoch && attitude.state().valid;
-    // TODO(HW_TEST): SSC zero確定まではControl gateをfail-safeで閉じる。
-    tick.control.ssc_zero_valid = false;
+    tick.control.ssc_zero_valid = latest_air_data.ssc_zero_valid;
+    const bool airspeed_available =
+        tick.control.lps_available && tick.control.ssc_available &&
+        latest_air_data.airspeed_valid;
+    tick.control.airspeed_above_60 =
+        airspeed_gate.update(airspeed_available, latest_air_data.airspeed_mps);
     if (xSemaphoreTake(state_mutex, 0) == pdTRUE) {
       state_machine.tick(tick);
       recovery_boot::storeFlightCheckpoint(state_machine.snapshot());
@@ -850,12 +1220,7 @@ void missionRealtimeTask(void *) {
                             : (mission_snapshot.fin == mission::FinDirective::roll_control
                                    ? protocol::FinMode::roll_control
                                    : protocol::FinMode::brake);
-      status.para_mode =
-          mission_snapshot.parachute == mission::ParaDirective::powered_off
-              ? protocol::ParaMode::powered_off
-              : (mission_snapshot.parachute == mission::ParaDirective::open
-                     ? protocol::ParaMode::opening_or_retrying
-                     : protocol::ParaMode::hold);
+      status.para_mode = para_mode_actual.load(std::memory_order_acquire);
       power_cutoff = mission_snapshot.deployment_power_cutoff_latched;
       deployment_started = mission_snapshot.deployment_started;
       flight_epoch = mission_snapshot.flight_epoch;
@@ -876,7 +1241,124 @@ void missionRealtimeTask(void *) {
     if (mission_snapshot.reset_invalidated) {
       attitude.invalidateForReset();
       attitude_epoch = 0;
+      control_reference.invalidate();
     }
+
+    control::TorqueRequest torque_request{};
+    control::MotorCommand motor_command{};
+    bool motor_saturated = false;
+    protocol::quantization::TorqueError torque_error =
+        protocol::quantization::TorqueError::unavailable;
+    const bool output_inhibited =
+        recovery_requested.load(std::memory_order_acquire) ||
+        actuator_output_inhibited.load(std::memory_order_acquire) ||
+        mission_snapshot.reset_invalidated;
+
+    if (previous_state == protocol::MissionState::control &&
+        mission_snapshot.state != protocol::MissionState::control)
+      control_reference.invalidate();
+    if (mission_snapshot.state == protocol::MissionState::control &&
+        !control_reference.validFor(mission_snapshot.flight_epoch)) {
+      const auto &attitude_state = attitude.state();
+      if (previous_state != protocol::MissionState::control &&
+          attitude_state.valid &&
+          attitude_epoch == mission_snapshot.flight_epoch)
+        (void)control_reference.capture(
+            mission_snapshot.flight_epoch, attitude_state.roll_rad,
+            attitude_state.timestamp_us, tick.monotonic_us);
+    }
+
+    auto applyTorque = [&](const control::TorqueRequest &request) {
+      torque_request = request;
+      if (!request.valid) {
+        torque_error =
+            protocol::quantization::TorqueError::controller_input_invalid;
+        return motor_driver.brake();
+      }
+      motor_command = torque_mapper.map(
+          request.output_torque_nm, fin_angle_rad, fin_rate_rad_s,
+          flight_config::kMotorBusVoltageV);
+      if (!motor_command.valid) {
+        torque_error = protocol::quantization::TorqueError::limit_config_invalid;
+        return motor_driver.brake();
+      }
+      motor_saturated =
+          request.saturated || motor_command.saturated ||
+          motor_command.pwm_duty >
+              flight_config::kProductionMotorMaximumDuty;
+      torque_error = protocol::quantization::TorqueError::unknown;
+      if (motor_command.brake)
+        return motor_driver.brake();
+      return motor_driver.apply(motor_command);
+    };
+
+    esp_err_t motor_output_result = ESP_OK;
+    bool motor_output_coasting = false;
+    bool motor_output_braking = false;
+    if (output_inhibited ||
+        mission_snapshot.state == protocol::MissionState::command_receive) {
+      motor_output_result = motor_driver.coast();
+      motor_output_coasting = true;
+      if (mission_snapshot.reset_invalidated)
+        torque_error = protocol::quantization::TorqueError::reset_invalidated;
+    } else if (!motor_ready.load(std::memory_order_acquire) ||
+               !motor_driver.initialized()) {
+      motor_output_result = motor_driver.coast();
+      motor_output_coasting = true;
+      torque_error = protocol::quantization::TorqueError::internal_error;
+    } else if (mission_snapshot.fin == mission::FinDirective::zero_hold) {
+      if (fin_sample_valid) {
+        const auto request =
+            zero_hold_controller.compute(fin_angle_rad, fin_rate_rad_s);
+        motor_output_result = applyTorque(request);
+        motor_output_braking = !request.valid || !motor_command.valid;
+      } else {
+        motor_output_result = motor_driver.brake();
+        motor_output_braking = true;
+        torque_error =
+            protocol::quantization::TorqueError::controller_input_invalid;
+      }
+    } else if (mission_snapshot.fin == mission::FinDirective::roll_control) {
+      const auto &attitude_state = attitude.state();
+      double roll_deviation_rad = 0.0;
+      const bool reference_valid = control_reference.deviation(
+          mission_snapshot.flight_epoch, attitude_state.roll_rad,
+          roll_deviation_rad);
+      const bool inputs_valid =
+          fin_sample_valid && reference_valid && attitude_state.valid &&
+          attitude_epoch == mission_snapshot.flight_epoch &&
+          airspeed_available;
+      if (inputs_valid) {
+        const control::RollState state{
+            roll_deviation_rad, fin_angle_rad,
+            attitude_state.roll_rate_rad_s, fin_rate_rad_s};
+        const auto request = roll_controller.compute(
+            state, latest_air_data.airspeed_mps,
+            board::kFlightMotorA.max_output_torque_nm);
+        motor_output_result = applyTorque(request);
+        motor_output_braking = !request.valid || !motor_command.valid;
+      } else {
+        motor_output_result = motor_driver.brake();
+        motor_output_braking = true;
+        torque_error =
+            protocol::quantization::TorqueError::controller_input_invalid;
+      }
+    } else {
+      motor_output_result = motor_driver.brake();
+      motor_output_braking = true;
+    }
+    if (motor_output_result != ESP_OK) {
+      motor_ready.store(false, std::memory_order_release);
+      (void)motor_driver.coast();
+      motor_output_coasting = true;
+      motor_output_braking = false;
+      torque_error = protocol::quantization::TorqueError::internal_error;
+    }
+    if (motor_output_coasting)
+      status.fin_mode = protocol::FinMode::free;
+    else if (motor_output_braking)
+      status.fin_mode = protocol::FinMode::brake;
+
     const bool encoder_alive = encoder_ready.load(std::memory_order_acquire);
     constexpr double kRadiansToDegrees = 57.29577951308232;
     if (attitude.state().valid) {
@@ -894,23 +1376,33 @@ void missionRealtimeTask(void *) {
       status.roll_raw = static_cast<uint16_t>(reason);
       status.roll_rate_raw = static_cast<uint16_t>(reason);
     }
-    // Fin zero永続値未復元中はabsolute angleをvalid値として公開しない。
-    status.fin_angle_raw = static_cast<uint8_t>(
-        encoder_alive
-            ? protocol::quantization::FinAngleError::zero_not_configured
-            : protocol::quantization::FinAngleError::not_initialized);
+    status.fin_angle_raw =
+        encoder_alive && fin_zero_available
+            ? protocol::quantization::encodeFinAngle(
+                  fin_angle_rad * kRadiansToDegrees,
+                  protocol::quantization::FinAngleError::out_of_mechanical_range)
+            : static_cast<uint8_t>(
+                  encoder_alive
+                      ? protocol::quantization::FinAngleError::zero_not_configured
+                      : protocol::quantization::FinAngleError::not_initialized);
     status.fin_rate_raw =
-        fin_rate_valid
+        fin_sample_valid
             ? protocol::quantization::encodeFinRate(
                   fin_rate_rad_s * kRadiansToDegrees,
                   protocol::quantization::FinRateError::estimator_numeric_error)
             : static_cast<uint16_t>(
                   protocol::quantization::FinRateError::estimator_not_ready);
+    status.requested_torque_raw =
+        torque_request.valid
+            ? protocol::quantization::encodeRequestedTorque(
+                  torque_request.output_torque_nm,
+                  protocol::quantization::TorqueError::controller_numeric_error)
+            : static_cast<uint16_t>(torque_error);
     static bool cutoff_sent = false;
     static bool deployment_sent = false;
     if (power_cutoff && !cutoff_sent) {
       const PowerRequest power{false, false, true};
-      const ParaRequest para{ParaRequest::Kind::power_off, flight_epoch};
+      const ParaRequest para{ParaRequest::Kind::power_off, flight_epoch, true};
       (void)xQueueSend(power_queue, &power, 0);
       (void)xQueueSend(para_queue, &para, 0);
       cutoff_sent = true;
@@ -947,7 +1439,8 @@ void missionRealtimeTask(void *) {
                             ssc_not_initialized);
     status.lps_sample_valid = lps_fresh && latest_air_data.lps_valid;
     status.airspeed_sample_valid =
-        ssc_fresh && latest_air_data.ssc_valid && status.airspeed_raw <= 245;
+        ssc_fresh && latest_air_data.ssc_valid &&
+        latest_air_data.airspeed_valid && status.airspeed_raw <= 245;
     status.deployment_power_cutoff = power_cutoff;
     status.flight_elapsed_us = mission_snapshot.elapsed_us;
     const bool air_data_error = !status.lps_sample_valid ||
@@ -964,10 +1457,20 @@ void missionRealtimeTask(void *) {
         (imu_data_loss_latched ? (1U << 9U) : 0U) |
         (!encoder_alive ? (1U << 10U) : 0U) |
         (air_data_error ? (1U << 11U) : 0U) |
+        (motor_saturated ? (1U << 12U) : 0U) |
         (status.fin_mode == protocol::FinMode::brake ? (1U << 13U) : 0U) |
         (mission_snapshot.reset_invalidated ? (1U << 14U) : 0U) |
         (mission_snapshot.control_reentry_inhibited ? (1U << 15U) : 0U);
-    status.config_flags = 0;
+    // config_flagsは暫定flight設定の可視化に使用する。
+    // bit0 MotorProfile、bit1 Fin zero、bit2 Para設定、bit3 SSC zero、
+    // bit7は未qualificationの暫定値を含むことを示す。
+    status.config_flags =
+        (board::kFlightMotorA.parameters_valid ? (1U << 0U) : 0U) |
+        (fin_zero_configured.load(std::memory_order_acquire) ? (1U << 1U)
+                                                             : 0U) |
+        (flight_config::kParachute.ready() ? (1U << 2U) : 0U) |
+        (latest_air_data.ssc_zero_valid ? (1U << 3U) : 0U) |
+        (1U << 7U);
     (void)xQueueOverwrite(status_queue, &status);
 
     uint16_t event_flags = 0;
@@ -992,6 +1495,9 @@ void missionRealtimeTask(void *) {
     if (air_data_error && !previous_air_data_error)
       event_flags |=
           protocol::eventFlag(protocol::MissionEventFlag::air_data_error);
+    if (motor_saturated && !previous_motor_saturation)
+      event_flags |= protocol::eventFlag(
+          protocol::MissionEventFlag::fin_motor_saturation);
     if (mission_snapshot.reset_invalidated && !previous_reset_invalidated)
       event_flags |= protocol::eventFlag(
           protocol::MissionEventFlag::reset_or_recovery);
@@ -1008,8 +1514,8 @@ void missionRealtimeTask(void *) {
     previous_imu_error = imu_data_loss_latched;
     previous_encoder_error = !encoder_alive;
     previous_air_data_error = air_data_error;
+    previous_motor_saturation = motor_saturated;
     previous_reset_invalidated = mission_snapshot.reset_invalidated;
-    (void)bringup::safe_outputs::motorCoast();
     resetWatchdog();
   }
 }
@@ -1056,35 +1562,133 @@ void airDataTask(void *) {
               ssc_result == ESP_ERR_NOT_FOUND ? " (未接続は継続可能)" : "");
 
   sensors::AirDataFlightLogic flight_logic;
+  sensors::DifferentialPressureConditioner pressure_conditioner{
+      flight_config::kAirData.zero_calibration_samples,
+      flight_config::kAirData.moving_average_samples,
+      flight_config::kAirData.negative_pressure_tolerance_pa};
   AirDataSnapshot snapshot{};
   mission::MissionSnapshot mission_snapshot{};
   uint64_t last_ssc_us = 0;
   uint64_t last_lps_us = 0;
+
+  auto updateMissionSnapshot = [&]() {
+    if (xSemaphoreTake(state_mutex, 0) == pdTRUE) {
+      const auto updated = state_machine.snapshot();
+      if (updated.state == protocol::MissionState::command_receive &&
+          mission_snapshot.state != protocol::MissionState::command_receive) {
+        // benchでsequenceをやり直す場合は、前flightのzeroを流用しない。
+        // TODO(HW_TEST): 明示PreflightCalibrationへ移行後はcommand側でresetする。
+        pressure_conditioner.reset();
+        snapshot.ssc_zero_valid = false;
+        snapshot.airspeed_valid = false;
+      }
+      mission_snapshot = updated;
+      xSemaphoreGive(state_mutex);
+    }
+  };
+  auto setInitialSscError = [&](esp_err_t result) {
+    if (snapshot.ssc_monotonic_us != 0)
+      return;
+    snapshot.airspeed_raw = static_cast<uint8_t>(
+        result == ESP_ERR_TIMEOUT
+            ? protocol::quantization::AirspeedError::ssc_i2c_timeout
+            : protocol::quantization::AirspeedError::ssc_i2c_error);
+  };
+  auto setInitialLpsError = [&](esp_err_t result) {
+    if (snapshot.lps_monotonic_us != 0)
+      return;
+    snapshot.pressure_raw = static_cast<uint16_t>(
+        result == ESP_ERR_TIMEOUT
+            ? protocol::quantization::LpsPressureError::i2c_timeout
+            : protocol::quantization::LpsPressureError::i2c_bus_error);
+    snapshot.temperature_raw = static_cast<uint8_t>(
+        result == ESP_ERR_TIMEOUT
+            ? protocol::quantization::LpsTemperatureError::i2c_timeout
+            : protocol::quantization::LpsTemperatureError::i2c_bus_error);
+  };
+
   for (;;) {
     const uint64_t now_us = static_cast<uint64_t>(esp_timer_get_time());
     if (now_us - last_ssc_us >= 2'500) {
       last_ssc_us = now_us;
+      updateMissionSnapshot();
       if (ssc.initialized()) {
         SSCDRRN005PD2A5::Data data{};
         const esp_err_t result = ssc.read(data);
         if (result == ESP_OK) {
           snapshot.ssc_monotonic_us = now_us;
           snapshot.ssc_valid = true;
-          // TODO(SIMULATION): Saint-Venant係数K=0.92の最終検証前は速度へ変換しない。
-          snapshot.airspeed_raw = static_cast<uint8_t>(
-              protocol::quantization::AirspeedError::internal_invalid);
+          snapshot.ssc_temperature_celsius = data.temperature_celsius;
+          // TODO(HW_TEST): 静止・無風のCommandReceive起動約1秒をzero取得に
+          // 使用する暫定実装を、明示PreflightCalibrationへ置換する。
+          (void)pressure_conditioner.updateZero(
+              data.differential_pressure_pa,
+              mission_snapshot.state ==
+                  protocol::MissionState::command_receive);
+          snapshot.ssc_zero_valid = pressure_conditioner.zeroValid();
+          snapshot.airspeed_valid = false;
+
+          const auto conditioned =
+              pressure_conditioner.update(data.differential_pressure_pa);
+          const bool static_pressure_fresh =
+              snapshot.lps_valid && snapshot.lps_monotonic_us != 0 &&
+              now_us >= snapshot.lps_monotonic_us &&
+              now_us - snapshot.lps_monotonic_us <=
+                  sensors::FreshnessThresholds::lps_us;
+          if (!conditioned.zero_valid) {
+            snapshot.airspeed_raw = static_cast<uint8_t>(
+                protocol::quantization::AirspeedError::internal_invalid);
+          } else if (conditioned.negative_beyond_tolerance) {
+            snapshot.airspeed_raw = static_cast<uint8_t>(
+                protocol::quantization::AirspeedError::
+                    negative_differential_pressure);
+          } else if (!conditioned.valid) {
+            snapshot.airspeed_raw = static_cast<uint8_t>(
+                protocol::quantization::AirspeedError::internal_invalid);
+          } else if (!static_pressure_fresh) {
+            snapshot.airspeed_raw = static_cast<uint8_t>(
+                protocol::quantization::AirspeedError::
+                    static_pressure_invalid);
+          } else {
+            const auto airspeed = sensors::computeSaintVenantAirspeed(
+                snapshot.static_pressure_pa, conditioned.pressure_pa,
+                data.temperature_celsius,
+                flight_config::kAirData.pitot_coefficient);
+            if (airspeed.valid) {
+              snapshot.airspeed_mps = airspeed.airspeed_mps;
+              snapshot.airspeed_raw = protocol::quantization::encodeAirspeed(
+                  airspeed.airspeed_mps,
+                  protocol::quantization::AirspeedError::internal_invalid);
+              snapshot.airspeed_valid = snapshot.airspeed_raw <= 245;
+            } else if (airspeed.error ==
+                       sensors::AirspeedModelError::
+                           negative_differential_pressure) {
+              snapshot.airspeed_raw = static_cast<uint8_t>(
+                  protocol::quantization::AirspeedError::
+                      negative_differential_pressure);
+            } else if (airspeed.error ==
+                       sensors::AirspeedModelError::static_pressure_invalid) {
+              snapshot.airspeed_raw = static_cast<uint8_t>(
+                  protocol::quantization::AirspeedError::
+                      static_pressure_invalid);
+            } else {
+              snapshot.airspeed_raw = static_cast<uint8_t>(
+                  protocol::quantization::AirspeedError::internal_invalid);
+            }
+          }
+        } else {
+          setInitialSscError(result);
         }
+      } else {
+        setInitialSscError(ESP_ERR_INVALID_STATE);
       }
       (void)xQueueOverwrite(air_data_queue, &snapshot);
     }
 
     if (now_us - last_lps_us >= 40'000) {
       last_lps_us = now_us;
+      updateMissionSnapshot();
       double pressure_hpa = 0.0;
-      if (xSemaphoreTake(state_mutex, pdMS_TO_TICKS(2)) == pdTRUE) {
-        mission_snapshot = state_machine.snapshot();
-        xSemaphoreGive(state_mutex);
-      }
       esp_err_t read_result = ESP_ERR_INVALID_STATE;
       LPS25HB::Data data{};
       if (lps.initialized())
@@ -1092,6 +1696,7 @@ void airDataTask(void *) {
       if (read_result == ESP_OK) {
         snapshot.lps_monotonic_us = now_us;
         snapshot.lps_valid = true;
+        snapshot.static_pressure_pa = data.pressure_pa;
         pressure_hpa = static_cast<double>(data.pressure_pa) / 100.0;
         snapshot.pressure_raw = protocol::quantization::encodeLpsPressure(
             pressure_hpa, protocol::quantization::LpsPressureError::unknown);
@@ -1099,15 +1704,15 @@ void airDataTask(void *) {
             protocol::quantization::encodeLpsTemperature(
                 data.temperature_celsius,
                 protocol::quantization::LpsTemperatureError::unknown);
+      } else {
+        setInitialLpsError(read_result);
       }
-      if (read_result == ESP_OK) {
-        snapshot.flight = flight_logic.update(
-            mission_snapshot.flight_epoch, mission_snapshot.state,
-            mission_snapshot.elapsed_us, pressure_hpa, true);
-        if (snapshot.flight.pressure_apex_detected)
-          pressure_deployment_epoch.store(snapshot.flight.flight_epoch,
-                                          std::memory_order_release);
-      }
+      snapshot.flight = flight_logic.update(
+          mission_snapshot.flight_epoch, mission_snapshot.state,
+          mission_snapshot.elapsed_us, pressure_hpa, read_result == ESP_OK);
+      if (snapshot.flight.pressure_apex_detected)
+        pressure_deployment_epoch.store(snapshot.flight.flight_epoch,
+                                        std::memory_order_release);
       (void)xQueueOverwrite(air_data_queue, &snapshot);
     }
     resetWatchdog();
@@ -1308,8 +1913,7 @@ void canTask(void *) {
             latest.state != protocol::MissionState::descent) {
           const protocol::ControlTelemetry control{
               sequences.next(protocol::CanId::control_telemetry),
-              static_cast<uint16_t>(
-                  protocol::quantization::TorqueError::unavailable),
+              latest.requested_torque_raw,
               protocol::quantization::encodeFlightElapsed(
                   static_cast<double>(latest.flight_elapsed_us) / 1.0e6,
                   protocol::quantization::TimeError::unavailable)};
@@ -1426,9 +2030,13 @@ void commandWorkerTask(void *) {
       } else {
         context.state = protocol::MissionState::unknown;
       }
-      context.sequence_configured = false;
+      context.sequence_configured =
+          flight_config::productionFlightConfigurationReady();
       context.resources_preallocated = true;
-      context.fin_available = encoder_ready.load(std::memory_order_acquire);
+      context.fin_available =
+          encoder_ready.load(std::memory_order_acquire) &&
+          motor_ready.load(std::memory_order_acquire) &&
+          fin_zero_configured.load(std::memory_order_acquire);
       context.parachute_available = false;
       context.fin_safe_commands_supported = false;
       if (xSemaphoreTake(executor_mutex, pdMS_TO_TICKS(2)) != pdTRUE) {
@@ -1674,12 +2282,7 @@ esp_err_t ProductionRuntime::start() {
       }
     }
   }
-  flight_enabled_ = board::kFlightMotorA.parameters_valid &&
-                    board::kFlightMotorA.polarity !=
-                        board::MotorPolarity::unconfigured &&
-                    board::kFinSoftwareLimits.configured;
-  // Open/Close永続設定のproduction loader未接続なので必ずflight-disabledとする。
-  flight_enabled_ = false;
+  flight_enabled_ = flight_config::productionFlightConfigurationReady();
 
   const std::array<TaskFunction_t, 9> functions{
       safetyTask,         parachuteTask, missionRealtimeTask,
@@ -1699,7 +2302,9 @@ esp_err_t ProductionRuntime::start() {
   std::printf("production runtime: flight_enabled=%s\n",
               flight_enabled_ ? "true" : "false");
   if (!flight_enabled_)
-    std::printf("飛行設定未確定のためSequence Startを拒否し、actuatorを安全状態に維持します。\n");
+    std::printf("飛行設定が不完全なためSequence Startを拒否します。\n");
+  else
+    std::printf("暫定flight設定を有効化しました。TODO(HW_TEST/SIMULATION)の値を含み、flight-qualifiedではありません。\n");
   return ESP_OK;
 }
 

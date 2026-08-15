@@ -28,6 +28,39 @@ bool finiteState(const RollState &state) {
 
 } // 無名名前空間
 
+bool ControlRollReference::capture(uint32_t flight_epoch, double roll_rad,
+                                   uint64_t sample_timestamp_us,
+                                   uint64_t control_tick_us) {
+  // Control中の再取得は目標角そのものを動かすため、明示invalidateまで一度だけ許可する。
+  if (valid_ || flight_epoch == 0 || !std::isfinite(roll_rad) ||
+      sample_timestamp_us > control_tick_us)
+    return false;
+  flight_epoch_ = flight_epoch;
+  reference_rad_ = roll_rad;
+  sample_timestamp_us_ = sample_timestamp_us;
+  capture_tick_us_ = control_tick_us;
+  valid_ = true;
+  return true;
+}
+
+void ControlRollReference::invalidate() { *this = {}; }
+
+bool ControlRollReference::validFor(uint32_t flight_epoch) const {
+  return valid_ && flight_epoch != 0 && flight_epoch_ == flight_epoch;
+}
+
+bool ControlRollReference::deviation(uint32_t flight_epoch,
+                                     double current_roll_rad,
+                                     double &deviation_rad) const {
+  if (!validFor(flight_epoch) || !std::isfinite(current_roll_rad))
+    return false;
+  const double candidate = current_roll_rad - reference_rad_;
+  if (!std::isfinite(candidate))
+    return false;
+  deviation_rad = candidate;
+  return true;
+}
+
 TorqueRequest RollController::compute(const RollState &state,
                                       double airspeed_mps,
                                       double output_limit_nm) const {
@@ -58,8 +91,10 @@ TorqueRequest RollController::compute(const RollState &state,
                               ? (limited_speed - left.airspeed_mps) /
                                     denominator
                               : 0.0;
+  // Control遷移時に取得したunwrapped基準角との差を呼出側から受け取る。
+  // ここで最短角へwrapすると、複数回転後に逆方向の目標へ化ける。
   const std::array<double, 4> values{
-      wrapRollError(state.roll_rad), state.fin_rad, state.roll_rate_rad_s,
+      state.roll_rad, state.fin_rad, state.roll_rate_rad_s,
       state.fin_rate_rad_s};
   double torque{};
   for (std::size_t index = 0; index < values.size(); ++index) {
@@ -79,7 +114,7 @@ TorqueRequest RollController::compute(const RollState &state,
 double RollController::wrapRollError(double roll_rad) {
   if (!std::isfinite(roll_rad))
     return roll_rad;
-  // 目標0から現在角を引いた最短方向errorを返す。
+  // 診断・表示用に最短方向の角度差を返す。制御本体では使用しない。
   double wrapped = std::fmod(-roll_rad + kPi, kTwoPi);
   if (wrapped < 0.0)
     wrapped += kTwoPi;
@@ -179,10 +214,14 @@ MotorCommand TorqueMapper::map(double requested_output_torque_nm,
   bool saturated = false;
   double torque = clampMagnitude(requested_output_torque_nm,
                                  profile_.max_output_torque_nm, saturated);
-  if ((fin_angle_rad >= limits_.maximum_rad && torque > 0.0) ||
-      (fin_angle_rad <= limits_.minimum_rad && torque < 0.0)) {
-    torque = 0.0;
-    saturated = true;
+  const bool upper_limit_brake =
+      fin_angle_rad >= limits_.maximum_rad && torque >= 0.0;
+  const bool lower_limit_brake =
+      fin_angle_rad <= limits_.minimum_rad && torque <= 0.0;
+  if (upper_limit_brake || lower_limit_brake) {
+    // limit位置でtorqueを0にするだけではback-EMF補償電圧が残り、
+    // stopper方向へPWMを出し続け得るため、明示的なbrake commandとする。
+    return {0.0, 0.0, 0.0, 0.0, true, true, true, true};
   }
   const double motor_torque =
       torque / (kTotalGearRatio * profile_.drivetrain_efficiency);

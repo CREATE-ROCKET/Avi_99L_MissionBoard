@@ -8,6 +8,7 @@
 #include "runtime/task_architecture.hpp"
 #include "runtime/emergency_latch.hpp"
 #include "sensors/air_data_flight_logic.hpp"
+#include "sensors/airspeed_estimator.hpp"
 #include "sensors/attitude_estimator.hpp"
 #include "sensors/flight_detectors.hpp"
 #include "sensors/sensor_health.hpp"
@@ -504,6 +505,36 @@ void testSensors() {
   assert(apex.update(929.0, true, 10'000'000));
   assert(!apex.update(NAN, false, 11'000'000));
 
+  sensors::DifferentialPressureConditioner conditioner{4, 2, 1.0};
+  assert(!conditioner.updateZero(2.0, false));
+  assert(!conditioner.updateZero(2.0, true));
+  assert(!conditioner.updateZero(4.0, true));
+  assert(!conditioner.updateZero(2.0, true));
+  assert(conditioner.updateZero(4.0, true));
+  assert(std::abs(conditioner.zeroOffsetPa() - 3.0) < 1.0e-12);
+  auto conditioned = conditioner.update(5.0);
+  assert(conditioned.valid && conditioned.zero_valid &&
+         std::abs(conditioned.pressure_pa - 2.0) < 1.0e-12);
+  conditioned = conditioner.update(7.0);
+  assert(conditioned.valid &&
+         std::abs(conditioned.pressure_pa - 3.0) < 1.0e-12);
+  conditioned = conditioner.update(1.5);
+  assert(conditioned.negative_beyond_tolerance && !conditioned.valid);
+
+  const auto zero_speed = sensors::computeSaintVenantAirspeed(
+      101325.0, 0.0, 20.0, 0.92);
+  assert(zero_speed.valid && zero_speed.airspeed_mps == 0.0);
+  const auto positive_speed = sensors::computeSaintVenantAirspeed(
+      101325.0, 100.0, 20.0, 0.92);
+  assert(positive_speed.valid && positive_speed.airspeed_mps > 10.0 &&
+         positive_speed.airspeed_mps < 20.0);
+  assert(!sensors::computeSaintVenantAirspeed(
+              0.0, 100.0, 20.0, 0.92)
+              .valid);
+  assert(!sensors::computeSaintVenantAirspeed(
+              101325.0, -1.0, 20.0, 0.92)
+              .valid);
+
   sensors::AirDataFlightLogic air_data_logic;
   sensors::AirDataFlightEvent event{};
   for (int index = 0; index < 10; ++index)
@@ -556,6 +587,37 @@ void testAttitudeContinuity() {
 
 void testControlPipeline() {
   using namespace control;
+  constexpr double kPi = 3.14159265358979323846;
+
+  ControlRollReference reference;
+  double deviation_rad = 123.0;
+  assert(!reference.validFor(1));
+  assert(!reference.capture(0, 1.0, 100, 100));
+  assert(!reference.capture(1, NAN, 100, 100));
+  assert(!reference.capture(1, 1.0, 101, 100));
+  const double captured_roll = 6.0 * kPi + 0.25;
+  assert(reference.capture(7, captured_roll, 100, 120));
+  assert(reference.validFor(7));
+  assert(reference.flightEpoch() == 7);
+  assert(reference.referenceRad() == captured_roll);
+  assert(reference.sampleTimestampUs() == 100);
+  assert(reference.captureTickUs() == 120);
+  assert(reference.deviation(7, captured_roll, deviation_rad));
+  assert(std::abs(deviation_rad) < 1.0e-12);
+  assert(!reference.capture(7, captured_roll + 1.0, 101, 101));
+  assert(reference.deviation(7, captured_roll + 0.5, deviation_rad));
+  assert(std::abs(deviation_rad - 0.5) < 1.0e-12);
+  assert(!reference.deviation(8, captured_roll, deviation_rad));
+  reference.invalidate();
+  assert(!reference.validFor(7));
+  assert(reference.flightEpoch() == 0);
+  assert(reference.sampleTimestampUs() == 0);
+  assert(reference.captureTickUs() == 0);
+  assert(reference.capture(8, captured_roll + 2.0 * kPi, 200, 200));
+  assert(reference.deviation(8, captured_roll + 2.0 * kPi + 0.5,
+                             deviation_rad));
+  assert(std::abs(deviation_rad - 0.5) < 1.0e-12);
+
   RollGainSchedule schedule{};
   schedule.configured = true;
   for (std::size_t index = 0; index < schedule.points.size(); ++index) {
@@ -568,7 +630,11 @@ void testControlPipeline() {
                   10.0 * 3.14159265358979323846 / 180.0) < 1.0e-12);
   const auto request = roll.compute({0.1, 0, 0, 0}, 70.0, 1.0);
   assert(request.valid && !request.saturated);
-  assert(std::abs(request.output_torque_nm - 0.2) < 1.0e-12);
+  assert(std::abs(request.output_torque_nm + 0.2) < 1.0e-12);
+  const auto multi_turn = roll.compute({degrees370, 0, 0, 0}, 70.0, 20.0);
+  assert(multi_turn.valid && !multi_turn.saturated);
+  assert(std::abs(multi_turn.output_torque_nm + 2.0 * degrees370) <
+         1.0e-12);
   assert(!roll.compute({0, 0, 0, 0}, 60.0, 1.0).valid);
 
   ZeroHoldController zero;
@@ -595,8 +661,11 @@ void testControlPipeline() {
   TorqueMapper mapper{profile, limits};
   auto motor = mapper.map(0.5, 0.0, 0.0, 9.0);
   assert(motor.valid && !motor.brake && motor.positive_in1);
-  motor = mapper.map(0.5, 0.21, 0.0, 9.0);
-  assert(motor.valid && motor.saturated && motor.requested_output_torque_nm == 0);
+  motor = mapper.map(0.5, 0.21, 1.0, 9.0);
+  assert(motor.valid && motor.brake && motor.saturated &&
+         motor.requested_output_torque_nm == 0 && motor.pwm_duty == 0);
+  motor = mapper.map(-0.5, 0.21, 1.0, 9.0);
+  assert(motor.valid && !motor.brake);
   motor = mapper.map(10.0, 0.0, 0.0, 9.0);
   assert(motor.valid && motor.saturated &&
          motor.requested_output_torque_nm <= 1.212081);
