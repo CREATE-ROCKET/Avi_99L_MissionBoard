@@ -14,6 +14,7 @@ enum class CanId : uint16_t {
   command_result = 0x011,
   time_request = 0x012,
   time_response = 0x013,
+  recovery_mode_command = 0x014,
   mission_event = 0x020,
   kinematics_telemetry = 0x100,
   control_telemetry = 0x101,
@@ -64,10 +65,16 @@ enum class CommandReason : uint8_t {
 
 enum class TimeSource : uint8_t { invalid = 0, gnss = 1, ground = 2 };
 enum class RecoveryOpcode : uint8_t {
-  enter_recovery = 0,
   wake = 1,
   start_log_dump = 2,
   stop_log_dump = 3,
+};
+enum class RecoveryMode : uint8_t { enter_recovery_beacon = 1 };
+enum class RecoveryModeReason : uint8_t {
+  auto_elapsed_120 = 0,
+  ground_requested = 1,
+  recovery_wake_retry = 2,
+  reset_recovery = 3,
 };
 enum class RecoverySource : uint8_t {
   internal_flash = 0,
@@ -153,6 +160,12 @@ struct RecoveryControl {
   uint8_t transfer_id{};
   uint32_t offset{};
   uint32_t length{};
+};
+
+struct RecoveryModeCommand {
+  uint8_t sequence{};
+  RecoveryMode mode{RecoveryMode::enter_recovery_beacon};
+  RecoveryModeReason reason{RecoveryModeReason::auto_elapsed_120};
 };
 
 struct GenericCommandRequest {
@@ -279,6 +292,7 @@ struct ControlRollTelemetryV2 {
 
 [[nodiscard]] CanFrame encode(CanId id, const EmergencyStop &message);
 [[nodiscard]] CanFrame encode(const RecoveryControl &message);
+[[nodiscard]] CanFrame encode(const RecoveryModeCommand &message);
 [[nodiscard]] CanFrame encode(const GenericCommandRequest &message);
 [[nodiscard]] CanFrame encode(const CommandResult &message);
 [[nodiscard]] CanFrame encode(const TimeRequest &message);
@@ -300,6 +314,8 @@ struct ControlRollTelemetryV2 {
                                 EmergencyStop &message);
 [[nodiscard]] CodecError decode(const CanFrame &frame,
                                 RecoveryControl &message);
+[[nodiscard]] CodecError decode(const CanFrame &frame,
+                                RecoveryModeCommand &message);
 [[nodiscard]] CodecError decode(const CanFrame &frame,
                                 GenericCommandRequest &message);
 [[nodiscard]] CodecError decode(const CanFrame &frame, CommandResult &message);
