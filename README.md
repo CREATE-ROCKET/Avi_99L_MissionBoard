@@ -307,3 +307,4 @@ CANはstandard 11-bit、125 kbit/s、DLC 8以下、multi-byteはlittle-endianで
 - `forced_start`とpreflight snapshot/missing mask、optional parachute snapshotはsoftware/watchdog reset時にRTC checkpointから復元します。
 - Start/Force受理時の同一`PreflightReadinessSnapshot`はRTC auditにも保存し、software/watchdog reset後に検証して内部logへ復元します。
 - `PowerTimeTelemetry.persistence_flags`のbit0/1/2でparachute NVS load完了/runtime ready/corruptを公開します。
+- parachute endpoint corruptionはCRC/schema/size等の`ParachuteBlobError` reasonをMissionEvent detailへ保持し、Descent statusの予約bitには最初のdeployment failureとcorrupt latchを載せます。
