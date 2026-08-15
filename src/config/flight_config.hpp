@@ -86,9 +86,7 @@ inline constexpr control::RollGainSchedule kRollGainSchedule{
     true};
 
 [[nodiscard]] inline bool productionFlightConfigurationReady() {
-  return board::kFlightMotorA.parameters_valid &&
-         board::kFlightMotorA.polarity !=
-             board::MotorPolarity::unconfigured &&
+  return board::kMotorProfileValid &&
          board::kFinSoftwareLimits.configured &&
          board::kFinSoftwareLimits.minimum_rad <
              board::kFinSoftwareLimits.maximum_rad &&

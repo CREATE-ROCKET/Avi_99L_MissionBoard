@@ -92,15 +92,14 @@ struct ParachuteConfiguration {
 };
 
 struct FlightParachuteConfiguration {
-  AbsoluteParachuteAngle open;
-  AbsoluteParachuteAngle close;
+  std::optional<AbsoluteParachuteAngle> open{};
+  std::optional<AbsoluteParachuteAngle> close{};
 };
 
 enum class FlightParachutePreparationError : uint8_t {
   none,
   open_not_configured,
   close_not_configured,
-  open_close_exactly_half_turn,
   current_open_exactly_half_turn,
 };
 
@@ -148,23 +147,30 @@ public:
   }
 
   [[nodiscard]] FlightParachutePreparationResult
-  freezeFlightSnapshot(AbsoluteParachuteAngle current) {
+  freezeNormalFlightSnapshot(AbsoluteParachuteAngle current) {
     if (!active_.open.has_value())
       return {FlightParachutePreparationError::open_not_configured};
     if (!active_.close.has_value())
       return {FlightParachutePreparationError::close_not_configured};
-    if (!shortestParachuteDisplacement(*active_.close, *active_.open).valid())
-      return {
-          FlightParachutePreparationError::open_close_exactly_half_turn};
     if (!shortestParachuteDisplacement(current, *active_.open).valid())
       return {FlightParachutePreparationError::current_open_exactly_half_turn};
 
-    flight_snapshot_ = {*active_.open, *active_.close};
+    // Open/Close相互のhalf-turnはStart拒否理由にしない。
+    flight_snapshot_ = {active_.open, active_.close};
     flight_snapshot_valid_ = true;
     return {};
   }
 
-  void discardFlightSnapshot() { flight_snapshot_valid_ = false; }
+  void freezeForcedFlightSnapshot() {
+    // Forceでもmissing/corrupt endpointを生成・補正しない。
+    flight_snapshot_ = {active_.open, active_.close};
+    flight_snapshot_valid_ = true;
+  }
+
+  void discardFlightSnapshot() {
+    flight_snapshot_ = {};
+    flight_snapshot_valid_ = false;
+  }
 
   [[nodiscard]] bool flightSnapshotValid() const {
     return flight_snapshot_valid_;
@@ -176,9 +182,7 @@ public:
 
 private:
   ParachuteConfiguration active_{};
-  FlightParachuteConfiguration flight_snapshot_{
-      *AbsoluteParachuteAngle::fromCount(0),
-      *AbsoluteParachuteAngle::fromCount(0)};
+  FlightParachuteConfiguration flight_snapshot_{};
   bool flight_snapshot_valid_{};
 };
 

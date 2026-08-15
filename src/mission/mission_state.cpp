@@ -28,8 +28,8 @@ bool ControlAvailability::ready() const {
 }
 
 bool SequenceConfiguration::ready() const {
-  return fin_zero_configured && parachute_open_configured &&
-         parachute_close_configured && resources_preallocated;
+  return readiness.resources_preallocated &&
+         (force_start || readiness.missingMask() == 0);
 }
 
 TransitionResult MissionStateMachine::startSequence(
@@ -45,9 +45,11 @@ TransitionResult MissionStateMachine::startSequence(
   snapshot_.reset_invalidated = false;
   snapshot_.deployment_started = false;
   snapshot_.deployment_power_cutoff_latched = false;
+  snapshot_.forced_start = configuration.force_start;
+  snapshot_.preflight_missing_mask = configuration.readiness.missingMask();
   snapshot_.parachute = ParaDirective::hold;
   control_gate_evaluated_ = false;
-  fin_control_available_ = configuration.fin_zero_configured;
+  fin_control_available_ = configuration.readiness.fin_zero_configured;
   elapsed_offset_us_ = 0;
   invalidateControlRollReference();
   invalidateLiftoff();
@@ -62,6 +64,8 @@ TransitionResult MissionStateMachine::cancelSequence() {
   snapshot_.fin_control_disabled = false;
   snapshot_.control_reentry_inhibited = false;
   snapshot_.deployment_started = false;
+  snapshot_.forced_start = false;
+  snapshot_.preflight_missing_mask = 0;
   control_gate_evaluated_ = false;
   fin_control_available_ = false;
   elapsed_offset_us_ = 0;
@@ -102,26 +106,48 @@ TransitionResult MissionStateMachine::liftoffDetectionEmergencyStop() {
 
 TransitionResult MissionStateMachine::restoreAfterReset(
     uint64_t now_us, const ResetCheckpoint &checkpoint) {
-  if (!checkpoint.valid || !checkpoint.elapsed_valid ||
-      checkpoint.state == protocol::MissionState::command_receive ||
-      checkpoint.state == protocol::MissionState::liftoff_detection)
+  if (!checkpoint.valid ||
+      checkpoint.state == protocol::MissionState::command_receive)
     return TransitionResult::not_configured;
 
   snapshot_ = {};
+  snapshot_.flight_epoch = checkpoint.flight_epoch == 0
+                               ? 1
+                               : checkpoint.flight_epoch;
+  snapshot_.forced_start = checkpoint.forced_start;
+  snapshot_.preflight_missing_mask = checkpoint.preflight_missing_mask;
+  snapshot_.control_reentry_inhibited = true;
+  snapshot_.reset_invalidated = true;
+  invalidateControlRollReference();
+  control_gate_evaluated_ = true;
+  fin_control_available_ = false;
+
+  if (checkpoint.state == protocol::MissionState::liftoff_detection) {
+    snapshot_.state = protocol::MissionState::liftoff_detection;
+    snapshot_.fin = FinDirective::brake;
+    snapshot_.parachute = checkpoint.power_cutoff_latched
+                              ? ParaDirective::powered_off
+                              : ParaDirective::hold;
+    snapshot_.deployment_power_cutoff_latched =
+        checkpoint.power_cutoff_latched;
+    invalidateLiftoff();
+    updateDirectives(now_us);
+    return TransitionResult::completed;
+  }
+
+  if (!checkpoint.elapsed_valid ||
+      (checkpoint.state != protocol::MissionState::engine_burn &&
+       checkpoint.state != protocol::MissionState::control &&
+       checkpoint.state != protocol::MissionState::descent))
+    return TransitionResult::not_configured;
+
   snapshot_.state = checkpoint.deployment_started ||
                             checkpoint.state == protocol::MissionState::descent
                         ? protocol::MissionState::descent
                         : protocol::MissionState::engine_burn;
-  snapshot_.flight_epoch = checkpoint.flight_epoch == 0
-                               ? 1
-                               : checkpoint.flight_epoch;
   snapshot_.liftoff_time_valid = true;
-  snapshot_.liftoff_time_us =
-      now_us;
+  snapshot_.liftoff_time_us = now_us;
   snapshot_.elapsed_us = checkpoint.elapsed_us;
-  snapshot_.control_reentry_inhibited = true;
-  snapshot_.reset_invalidated = true;
-  invalidateControlRollReference();
   snapshot_.deployment_started = checkpoint.deployment_started;
   snapshot_.deployment_power_cutoff_latched = checkpoint.power_cutoff_latched;
   snapshot_.fin = FinDirective::brake;
@@ -130,8 +156,6 @@ TransitionResult MissionStateMachine::restoreAfterReset(
                             : (checkpoint.deployment_started
                                    ? ParaDirective::open
                                    : ParaDirective::hold);
-  control_gate_evaluated_ = true;
-  fin_control_available_ = false;
   elapsed_offset_us_ = checkpoint.elapsed_us;
   updateDirectives(now_us);
   return TransitionResult::completed;

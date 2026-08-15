@@ -81,12 +81,35 @@ constexpr uint32_t kImuInterpolatableMissingSamples = 1;
 
 // TODO(HW_TEST): FlightMotorAの極性、巻線抵抗、定数、効率、電流上限を実測値へ置換する。
 // 現値はhost testで使っていた候補値であり、flight qualification済みではない。
-constexpr MotorProfile kFlightMotorA{1, MotorPolarity::positive_in1, true,
-                                     3.48F, 0.00855F, 1120.0F, 0.60F,
-                                     2.0F, 1.21208F};
-// TODO(HW_TEST): SpareMotorB実測値
-constexpr MotorProfile kSpareMotorB{2, MotorPolarity::unconfigured, false,
-                                    0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
+inline constexpr MotorProfile kFlightMotorA{
+    1, MotorPolarity::positive_in1, true, 3.48F, 0.00855F, 1120.0F,
+    0.60F, 2.0F, 1.21208F};
+inline constexpr bool kFlightMotorAQualified = false; // TODO(HW_TEST)
+
+// TODO(HW_TEST): SpareMotorB実測値とqualification。
+inline constexpr MotorProfile kSpareMotorB{
+    2, MotorPolarity::unconfigured, false, 0.0F, 0.0F, 0.0F,
+    0.0F, 0.0F, 0.0F};
+inline constexpr bool kSpareMotorBQualified = false;
+
+#ifndef AVI_99L_MOTOR_PROFILE_ID
+#error "AVI_99L_MOTOR_PROFILE_ID must be selected at build time"
+#elif AVI_99L_MOTOR_PROFILE_ID == 1
+inline constexpr const MotorProfile &kActiveMotorProfile = kFlightMotorA;
+inline constexpr bool kActiveMotorProfileQualified =
+    kFlightMotorAQualified;
+#elif AVI_99L_MOTOR_PROFILE_ID == 2
+inline constexpr const MotorProfile &kActiveMotorProfile = kSpareMotorB;
+inline constexpr bool kActiveMotorProfileQualified =
+    kSpareMotorBQualified;
+#else
+#error "Unsupported AVI_99L_MOTOR_PROFILE_ID"
+#endif
+
+inline constexpr bool kMotorProfileValid =
+    kActiveMotorProfile.parameters_valid &&
+    kActiveMotorProfile.polarity != MotorPolarity::unconfigured &&
+    kActiveMotorProfileQualified;
 
 // TODO(HW_TEST): 動翼・stopper組付後の実測値でsoftware limitを確定する。
 // 機械上限±15 degに対し、暫定的に1 degのmarginを設ける。

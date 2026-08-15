@@ -12,6 +12,7 @@ enum class CommandCode : uint8_t {
   start_sequence = 0x01,
   cancel_sequence = 0x02,
   disable_fin_control = 0x03,
+  force_start_sequence = 0x04,
   fin_free = 0x10,
   set_fin_zero = 0x11,
   start_fin_zero_hold = 0x12,
@@ -42,8 +43,11 @@ enum class CommandDomain : uint8_t {
 
 struct CommandContext {
   protocol::MissionState state{protocol::MissionState::command_receive};
+  // sequence_configuredは旧API互換用。Startの7項目判定には使用しない。
   bool sequence_configured{};
   bool resources_preallocated{};
+  bool persistence_load_complete{true};
+  bool persistence_ready{true};
   bool fin_available{true};
   bool parachute_available{true};
   bool motor_test_busy{};

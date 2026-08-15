@@ -295,3 +295,21 @@ CANはstandard 11-bit、125 kbit/s、DLC 8以下、multi-byteはlittle-endianで
 - Deep SleepはRTC marker/wake causeを検証した専用task subsetで10秒周期wakeします。Internal Flash/SD log reader未接続のためlog dump要求は`SourceUnavailable`です。2秒command windowは`TODO(HW_TEST)`です。
 - 3基板実機でMission→ComBoard CAN、ComBoard↔Ground LoRa、Ground→Missionの安全なcommand round-tripは確認済みです。今回接続したproduction motor motion、STS収納保持/Open、差圧zero、Control遷移、5秒/25秒cutoffは未検証であり、成功扱いしません。
 - Mission基板上のmicroSDはbring-up `sd-test`で1 MiB write/read/CRCをPASSしていますが、Mission production loggerは未接続です。今回BLOCKEDとなった`CAN.CSV` logging/readbackはComBoard側microSDの初期化問題であり、Missionのbring-up microSD PASSを取り消す結果ではありません。
+
+## ForceStartSequence / パラシュート Stage 2
+
+Vault `CREATE/99L Mission Board/04c_ForceStartSequence詳細.md` のStage 2仕様に合わせ、次をproduction runtimeへ実装している。
+
+- `ForceStartSequence` (`0x04`) は通常Startの7項目readinessだけをbypassし、protocol/state/Busy/resource/persistence invariantはbypassしない。
+- 通常Start/ForceStartは同一の`PreflightReadinessSnapshot`を使用し、通常Startの不足は`Failed / NotConfigured / detail=missing mask`、Force成功時は`Completed.detail=missing mask`とする。
+- Open/Close endpointとflight snapshotは独立`std::optional`で、corrupt endpointを補正・既定値化しない。
+- half-turn判定は実際の`fresh current -> target`で行い、Open/Close相互が2048 count離れていること自体はStart拒否理由にしない。
+- ForceではSTS初期化・fresh angle・Holdをbest effortとし、STS unavailableだけではLiftoffDetectionへの遷移を失敗させない。
+- Open retryの約5秒deadlineはmove/retry終了だけに使用し、成功・失敗後も現在位置Holdとパラシュート電源要求を離床+25秒まで維持する。
+- `forced_start`、7項目missing mask、optional parachute snapshotはRTC checkpointへ保存し、software/watchdog reset recoveryで復元する。
+- `RunPreflightCalibration`はgyro bias、gravity reference、SSC zeroを最新attempt単位で更新し、SSC zeroはcalibration終了後にfreezeする。
+- active MotorProfileは`AVI_99L_MOTOR_PROFILE_ID`でbuild時固定し、未知/未指定profileはbuild errorとする。repository defaultへID=1を暗黙注入しない。
+
+Production build例: `pio run -e avi_99l_missionboard --project-option="build_flags=-DMISSION_BRINGUP_SHELL=0 -DAVI_99L_MOTOR_PROFILE_ID=1"`。profile 1は`TODO(HW_TEST)`のqualificationが残るため、現時点では`MotorProfileValid=false`であり、飛行sequenceを通す場合はForceStartを使用する。
+
+ForceStartの成立はflight qualificationを意味しない。`TODO(HW_TEST)` / `TODO(SIMULATION)`と審査書適合確認は独立して残る。

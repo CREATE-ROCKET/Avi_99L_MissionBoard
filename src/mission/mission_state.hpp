@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <limits>
 
+#include "mission/preflight_readiness.hpp"
 #include "protocol/can_protocol.hpp"
 
 namespace mission {
@@ -52,6 +53,8 @@ struct MissionSnapshot {
   bool reset_invalidated{};
   bool deployment_started{};
   bool deployment_power_cutoff_latched{};
+  bool forced_start{};
+  uint8_t preflight_missing_mask{};
   double control_roll_reference_unwrapped_rad{};
   uint64_t control_roll_reference_capture_tick{};
   uint64_t control_roll_reference_estimator_timestamp_us{};
@@ -68,10 +71,8 @@ enum class TransitionResult : uint8_t {
 };
 
 struct SequenceConfiguration {
-  bool fin_zero_configured{};
-  bool parachute_open_configured{};
-  bool parachute_close_configured{};
-  bool resources_preallocated{};
+  PreflightReadinessSnapshot readiness{};
+  bool force_start{};
 
   [[nodiscard]] bool ready() const;
 };
@@ -84,6 +85,8 @@ struct ResetCheckpoint {
   uint64_t elapsed_us{};
   bool deployment_started{};
   bool power_cutoff_latched{};
+  bool forced_start{};
+  uint8_t preflight_missing_mask{};
 };
 
 class MissionStateMachine {

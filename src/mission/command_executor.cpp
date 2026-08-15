@@ -27,15 +27,21 @@ bool allZero(const GenericCommandRequest &request, std::size_t first) {
 
 bool commandKnown(CommandCode code) {
   const uint8_t raw = static_cast<uint8_t>(code);
-  return (raw >= 0x01 && raw <= 0x03) ||
+  return (raw >= 0x01 && raw <= 0x04) ||
          (raw >= 0x10 && raw <= 0x13) ||
          (raw >= 0x20 && raw <= 0x26) ||
-         (raw >= 0x30 && raw <= 0x32);
+         (raw >= 0x30 && raw <= 0x31);
+}
+
+bool isStartCommand(CommandCode code) {
+  return code == CommandCode::start_sequence ||
+         code == CommandCode::force_start_sequence;
 }
 
 CommandDomain domainFor(CommandCode code) {
   switch (code) {
   case CommandCode::start_sequence:
+  case CommandCode::force_start_sequence:
   case CommandCode::cancel_sequence:
   case CommandCode::disable_fin_control:
     return CommandDomain::sequence;
@@ -88,6 +94,7 @@ bool argumentsValid(const GenericCommandRequest &request, CommandCode code) {
 bool stateValid(CommandCode code, MissionState state) {
   switch (code) {
   case CommandCode::start_sequence:
+  case CommandCode::force_start_sequence:
   case CommandCode::fin_free:
   case CommandCode::set_fin_zero:
   case CommandCode::start_fin_zero_hold:
@@ -145,16 +152,19 @@ CommandDecision CommandExecutor::begin(const GenericCommandRequest &request,
     rejection = CommandReason::invalid_argument;
   else if (!stateValid(code, context.state))
     rejection = CommandReason::invalid_state;
-  else if (code == CommandCode::start_sequence &&
+  else if (isStartCommand(code) &&
            (busy(CommandDomain::parachute) || busy(CommandDomain::fin) ||
             busy(CommandDomain::calibration) || context.motor_test_busy))
     rejection = CommandReason::busy;
   else if (domain == CommandDomain::parachute &&
            busy(CommandDomain::sequence))
     rejection = CommandReason::busy;
-  else if (code == CommandCode::start_sequence &&
-           (!context.sequence_configured || !context.resources_preallocated))
+  else if (isStartCommand(code) && !context.resources_preallocated)
     rejection = CommandReason::not_configured;
+  else if (isStartCommand(code) && !context.persistence_load_complete)
+    rejection = CommandReason::busy;
+  else if (isStartCommand(code) && !context.persistence_ready)
+    rejection = CommandReason::persistence_error;
   else if ((domain == CommandDomain::fin && !context.fin_available) ||
            (domain == CommandDomain::parachute &&
             !context.parachute_available))
@@ -171,7 +181,7 @@ CommandDecision CommandExecutor::begin(const GenericCommandRequest &request,
     rejection = CommandReason::not_supported;
   else if (busy(domain))
     rejection = CommandReason::busy;
-  else if (code == CommandCode::start_sequence && cachedCount() != 0 &&
+  else if (isStartCommand(code) && cachedCount() != 0 &&
            std::any_of(entries_.begin(), entries_.end(),
                        [](const Entry &entry) { return entry.pending; }))
     rejection = CommandReason::busy;
