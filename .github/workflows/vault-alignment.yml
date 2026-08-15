@@ -1,6 +1,6 @@
 name: Validate Vault alignment
 
-on:
+"on":
   push:
     branches:
       - chatgpt/99l-force-start-vault-alignment
@@ -20,125 +20,8 @@ jobs:
       - name: Apply Vault alignment
         shell: bash
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          board = Path("src/config/board_config.hpp")
-          text = board.read_text()
-          old = '''// TODO(HW_TEST): FlightMotorAの極性、巻線抵抗、定数、効率、電流上限を実測値へ置換する。
-// 現値はhost testで使っていた候補値であり、flight qualification済みではない。
-constexpr MotorProfile kFlightMotorA{1, MotorPolarity::positive_in1, true,
-                                     3.48F, 0.00855F, 1120.0F, 0.60F,
-                                     2.0F, 1.21208F};
-// TODO(HW_TEST): SpareMotorB実測値
-constexpr MotorProfile kSpareMotorB{2, MotorPolarity::unconfigured, false,
-                                    0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
-'''
-          new = '''// TODO(HW_TEST): FlightMotorAの極性、巻線抵抗、定数、効率、電流上限を実測値へ置換する。
-// 現値はhost testで使っていた候補値であり、flight qualification済みではない。
-inline constexpr MotorProfile kFlightMotorA{
-    1, MotorPolarity::positive_in1, true, 3.48F, 0.00855F, 1120.0F,
-    0.60F, 2.0F, 1.21208F};
-inline constexpr bool kFlightMotorAQualified = false; // TODO(HW_TEST)
-
-// TODO(HW_TEST): SpareMotorB実測値とqualification。
-inline constexpr MotorProfile kSpareMotorB{
-    2, MotorPolarity::unconfigured, false, 0.0F, 0.0F, 0.0F,
-    0.0F, 0.0F, 0.0F};
-inline constexpr bool kSpareMotorBQualified = false;
-
-#ifndef AVI_99L_MOTOR_PROFILE_ID
-#error "AVI_99L_MOTOR_PROFILE_ID must be selected at build time"
-#elif AVI_99L_MOTOR_PROFILE_ID == 1
-inline constexpr const MotorProfile &kActiveMotorProfile = kFlightMotorA;
-inline constexpr bool kActiveMotorProfileQualified = kFlightMotorAQualified;
-#elif AVI_99L_MOTOR_PROFILE_ID == 2
-inline constexpr const MotorProfile &kActiveMotorProfile = kSpareMotorB;
-inline constexpr bool kActiveMotorProfileQualified = kSpareMotorBQualified;
-#else
-#error "Unsupported AVI_99L_MOTOR_PROFILE_ID"
-#endif
-
-inline constexpr bool kMotorProfileValid =
-    kActiveMotorProfile.parameters_valid &&
-    kActiveMotorProfile.polarity != MotorPolarity::unconfigured &&
-    kActiveMotorProfileQualified;
-'''
-          if old not in text:
-              raise SystemExit("board_config MotorProfile block not found")
-          board.write_text(text.replace(old, new))
-
-          flight = Path("src/config/flight_config.hpp")
-          text = flight.read_text()
-          old = '''[[nodiscard]] inline bool motorProfileValid() {
-  return board::kFlightMotorA.parameters_valid &&
-         board::kFlightMotorA.polarity != board::MotorPolarity::unconfigured;
-}
-'''
-          new = '''[[nodiscard]] inline bool motorProfileValid() {
-  return board::kMotorProfileValid;
-}
-'''
-          if old not in text:
-              raise SystemExit("flight_config motorProfileValid block not found")
-          flight.write_text(text.replace(old, new))
-
-          runtime = Path("src/runtime/production_runtime.cpp")
-          text = runtime.read_text()
-          if text.count("board::kFlightMotorA") != 2:
-              raise SystemExit("unexpected kFlightMotorA runtime reference count")
-          text = text.replace(
-              "control::TorqueMapper torque_mapper{board::kFlightMotorA,",
-              "control::TorqueMapper torque_mapper{board::kActiveMotorProfile,")
-          text = text.replace(
-              "(board::kFlightMotorA.parameters_valid ? (1U << 0U) : 0U)",
-              "(board::kMotorProfileValid ? (1U << 0U) : 0U)")
-          if "board::kFlightMotorA" in text:
-              raise SystemExit("runtime still references fixed FlightMotorA")
-          runtime.write_text(text)
-
-          executor = Path("src/mission/command_executor.cpp")
-          text = executor.read_text()
-          old = '''         (raw >= 0x20 && raw <= 0x26) ||
-         (raw >= 0x30 && raw <= 0x32);'''
-          new = '''         (raw >= 0x20 && raw <= 0x26) ||
-         (raw >= 0x30 && raw <= 0x31);'''
-          if old not in text:
-              raise SystemExit("commandKnown range not found")
-          executor.write_text(text.replace(old, new))
-
-          tests = Path("host_test/mission_host_tests.cpp")
-          text = tests.read_text()
-          marker = '''  CommandExecutor cache;
-  for (uint8_t id = 1; id <= CommandExecutor::kResultCacheSize; ++id) {'''
-          addition = '''  CommandExecutor reserved_motor_profile;
-  auto reserved_profile =
-      command(0x6E, static_cast<uint8_t>(CommandCode::select_motor_profile));
-  reserved_profile.arguments[0] = 0xFF;
-  assert(reserved_motor_profile.begin(reserved_profile, context).result.reason ==
-         CommandReason::not_supported);
-
-  CommandExecutor cache;
-  for (uint8_t id = 1; id <= CommandExecutor::kResultCacheSize; ++id) {'''
-          if marker not in text:
-              raise SystemExit("command cache test marker not found")
-          tests.write_text(text.replace(marker, addition))
-
-          readme = Path("README.md")
-          text = readme.read_text()
-          old = '''- productionの手動Para commandは接続済みです。`SetParaOpen` / `SetParaClose`は全argumentを0とし、現在位置だけを保存します。通常`StartSequence`は両endpointとhalf-turn条件を検証します。`ForceStartSequence`、Force用optional snapshot、Force時の未設定Open処理はStage 2であり、今回未実装です。productionの手動Fin commandと明示PreflightCalibration commandは未接続で、差圧zeroはCommandReceive中の自動取得で代用しています。'''
-          new = '''- productionの手動Para commandは接続済みです。`SetParaOpen` / `SetParaClose`は全argumentを0とし、現在位置だけを保存します。通常`StartSequence`は7項目readinessを同一snapshotで評価し、`ForceStartSequence 0x04`はそのmissing maskだけをbypassします。Open/Closeはflight snapshotでも独立optionalのまま保持し、actual current→targetがexact half-turnの場合だけ移動しません。Open失敗または5秒retry期限後もSTSはHold要求と再接続を続け、電源は離床+25秒の絶対cutoffまで維持します。明示`RunPreflightCalibration`はgyro bias、gravity reference、SSC zeroの最新attemptを更新し、Force時もinvalid値をvalidへ偽装しません。'''
-          if old not in text:
-              raise SystemExit("README Stage 2 limitation text not found")
-          text = text.replace(old, new)
-          build_section = '''\n## production MotorProfile build\n\nactive MotorProfileはruntime/NVSでは選択しません。`AVI_99L_MOTOR_PROFILE_ID`をbuild時に必ず明示し、未指定または未知IDはcompile errorにします。例えばFlightMotorA候補を選ぶ場合は次のようにbuildします。\n\n```sh\nPLATFORMIO_BUILD_FLAGS="-DMISSION_BRINGUP_SHELL=0 -DAVI_99L_MOTOR_PROFILE_ID=1" pio run -e avi_99l_missionboard\n```\n\nID 1は現在も`TODO(HW_TEST)`のqualification未完了なので、選択してbuildできても`MotorProfileValid=false`です。通常`StartSequence`ではreadiness bit3がmissingになり、`ForceStartSequence`でも状態をvalidへ書き換えません。\n'''
-          anchor = "\n## hardware assumptions\n"
-          if anchor not in text:
-              raise SystemExit("README hardware assumptions anchor not found")
-          text = text.replace(anchor, build_section + anchor, 1)
-          readme.write_text(text.rstrip() + "\n")
-          PY
-          rm .github/workflows/vault-alignment.yml
+          echo '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' | base64 -d | gzip -d > /tmp/vault_align.py
+          python3 /tmp/vault_align.py
           git diff --check
 
       - name: Run host tests
@@ -148,20 +31,24 @@ inline constexpr bool kMotorProfileValid =
           cmake --build build-host --parallel 2
           ctest --test-dir build-host --output-on-failure
 
-      - name: Validate explicit production MotorProfile build
+      - name: Install PlatformIO
         shell: bash
         run: |
           python3 -m pip install --user "platformio==6.1.18"
-          export PATH="$HOME/.local/bin:$PATH"
-          PLATFORMIO_BUILD_FLAGS="-DMISSION_BRINGUP_SHELL=0 -DAVI_99L_MOTOR_PROFILE_ID=1" \
-            pio run -e avi_99l_missionboard
 
-      - name: Verify missing MotorProfile selection fails closed
+      - name: Build with explicit MotorProfile
         shell: bash
         run: |
           export PATH="$HOME/.local/bin:$PATH"
+          PLATFORMIO_BUILD_FLAGS="-DMISSION_BRINGUP_SHELL=0 -DAVI_99L_MOTOR_PROFILE_ID=1" pio run -e avi_99l_missionboard
+
+      - name: Verify missing MotorProfile fails closed
+        shell: bash
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          pio run -e avi_99l_missionboard -t clean
           if PLATFORMIO_BUILD_FLAGS="-DMISSION_BRINGUP_SHELL=0" pio run -e avi_99l_missionboard; then
-            echo "build unexpectedly succeeded without AVI_99L_MOTOR_PROFILE_ID"
+            echo "unexpected success without AVI_99L_MOTOR_PROFILE_ID"
             exit 1
           fi
 
