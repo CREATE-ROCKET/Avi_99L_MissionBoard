@@ -5,16 +5,10 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "sdkconfig.h"
 #include "sensors/as5047d_health.hpp"
 
 #include <algorithm>
 #include <limits>
-
-#if !defined(CONFIG_ESP_TIMER_SUPPORTS_ISR_DISPATCH_METHOD) ||                 \
-    !CONFIG_ESP_TIMER_SUPPORTS_ISR_DISPATCH_METHOD
-#error "characterization requires ESP timer ISR dispatch support"
-#endif
 
 namespace avi::characterization {
 namespace {
@@ -81,18 +75,19 @@ std::uint16_t EncoderSampler::statusFlags(
   return flags;
 }
 
-void EncoderSampler::timerCallback(void *context) {
+bool EncoderSampler::timerCallback(gptimer_handle_t,
+                                   const gptimer_alarm_event_data_t *,
+                                   void *context) {
   auto &sampler = *static_cast<EncoderSampler *>(context);
-  // ESP_TIMER_ISRから固定lifetimeのtask handleへ通知するだけに留める。
-  // SAFETY: task_はstatic taskで、EncoderSamplerのlifetime中に削除されない。
+  // GPTimer ISRから固定lifetimeのtaskへ通知するだけに留める。
+  // SAFETY: task_はstatic taskでEncoderSamplerのlifetime中に削除されない。
   // ISRではSPI、heap、file I/O、blocking APIを一切呼ばない。
   if (!sampler.running_.load(std::memory_order_acquire) ||
       sampler.task_ == nullptr)
-    return;
+    return false;
   BaseType_t task_awoken = pdFALSE;
   vTaskNotifyGiveFromISR(sampler.task_, &task_awoken);
-  if (task_awoken == pdTRUE)
-    esp_timer_isr_dispatch_need_yield();
+  return task_awoken == pdTRUE;
 }
 
 void EncoderSampler::taskEntry(void *context) {
@@ -279,28 +274,18 @@ esp_err_t EncoderSampler::begin(EncoderRate rate,
   (void)xTaskNotifyStateClear(task_);
   (void)ulTaskNotifyValueClear(task_,
                                std::numeric_limits<std::uint32_t>::max());
-  if (timer_ == nullptr) {
-    esp_timer_create_args_t arguments{};
-    arguments.callback = timerCallback;
-    arguments.arg = this;
-    arguments.dispatch_method = ESP_TIMER_ISR;
-    arguments.name = "char_encoder";
-    arguments.skip_unhandled_events = true;
-    result = esp_timer_create(&arguments, &timer_);
+  if (!timer_.initialized()) {
+    result = timer_.initialize(timerCallback, this);
     if (result != ESP_OK) {
       (void)stop();
       return result;
     }
   }
 
-  const std::int64_t timer_start_us =
-      static_cast<std::int64_t>(first_sample_us_ - period_us_);
-  while (esp_timer_get_time() + 2'000 < timer_start_us)
-    vTaskDelay(1U);
-  while (esp_timer_get_time() < timer_start_us)
-    taskYIELD();
+  // GPTimerのfirst alarmをslot中心の絶対時刻へ直接設定する。
+  // 相対start APIの呼出し遅延をsampling phaseへ混入させない。
   running_.store(true, std::memory_order_release);
-  result = esp_timer_start_periodic(timer_, period_us_);
+  result = timer_.start(first_sample_us_, period_us_);
   if (result != ESP_OK) {
     running_.store(false, std::memory_order_release);
     (void)stop();
@@ -312,8 +297,7 @@ esp_err_t EncoderSampler::stop() {
   esp_err_t diagnostic_error = first_error_.load();
   esp_err_t cleanup_error = ESP_OK;
   running_.store(false, std::memory_order_release);
-  if (timer_ != nullptr && esp_timer_is_active(timer_))
-    rememberOperation(esp_timer_stop(timer_), cleanup_error);
+  rememberOperation(timer_.stop(), cleanup_error);
   if (task_ != nullptr && stop_ack_ != nullptr) {
     while (xSemaphoreTake(stop_ack_, 0U) == pdTRUE) {
     }
