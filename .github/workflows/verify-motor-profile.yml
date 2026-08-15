@@ -1,0 +1,65 @@
+name: verify-motor-profile
+
+on:
+  push:
+    branches:
+      - fix/vault-recovery-profile-20260816
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/vault-recovery-profile-20260816
+          submodules: recursive
+      - name: Apply documentation patch
+        run: python3 tools/apply_profile_docs_patch.py
+      - name: Check whitespace
+        run: git diff --check
+      - name: Configure host tests
+        run: cmake -S host_test -B build/host -DCMAKE_BUILD_TYPE=Debug
+      - name: Build host tests
+        run: cmake --build build/host --parallel 2
+      - name: Run host tests
+        run: ctest --test-dir build/host --output-on-failure
+      - name: Install PlatformIO
+        run: python3 -m pip install platformio
+      - name: Reject missing motor profile
+        shell: bash
+        run: |
+          set +e
+          env -u AVI_99L_MOTOR_PROFILE_ID pio run -e avi_99l_missionboard >/tmp/missing-profile.log 2>&1
+          status=$?
+          set -e
+          cat /tmp/missing-profile.log
+          test "$status" -ne 0
+          grep -q "AVI_99L_MOTOR_PROFILE_ID must be explicitly set to 1 or 2" /tmp/missing-profile.log
+      - name: Reject unknown motor profile
+        shell: bash
+        run: |
+          set +e
+          AVI_99L_MOTOR_PROFILE_ID=3 pio run -e avi_99l_missionboard >/tmp/unknown-profile.log 2>&1
+          status=$?
+          set -e
+          cat /tmp/unknown-profile.log
+          test "$status" -ne 0
+          grep -q "AVI_99L_MOTOR_PROFILE_ID must be explicitly set to 1 or 2" /tmp/unknown-profile.log
+      - name: Build profile 1 production firmware
+        run: AVI_99L_MOTOR_PROFILE_ID=1 pio run -e avi_99l_missionboard
+      - name: Clean production firmware
+        run: AVI_99L_MOTOR_PROFILE_ID=1 pio run -e avi_99l_missionboard -t clean
+      - name: Build profile 2 production firmware
+        run: AVI_99L_MOTOR_PROFILE_ID=2 pio run -e avi_99l_missionboard
+      - name: Commit verified documentation
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git rm tools/apply_profile_docs_patch.py .github/workflows/verify-motor-profile.yml
+          git add README.md docs/01_コマンド受信モード.md docs/04_通信仕様.md
+          git commit -m "docs(mission): document build-time motor profile"
+          git push origin HEAD:fix/vault-recovery-profile-20260816
