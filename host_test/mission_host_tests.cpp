@@ -2,6 +2,7 @@
 #include "control/control_pipeline.hpp"
 #include "mission/command_executor.hpp"
 #include "mission/mission_state.hpp"
+#include "mission/preflight_readiness.hpp"
 #include "mission/recovery.hpp"
 #include "protocol/can_protocol.hpp"
 #include "protocol/quantization.hpp"
@@ -337,7 +338,16 @@ void testMissionStateMachine() {
   using mission::TransitionResult;
   using protocol::MissionState;
 
-  const SequenceConfiguration ready{true, true, true, true};
+  mission::PreflightReadinessSnapshot ready_snapshot{};
+  ready_snapshot.fin_zero_configured = true;
+  ready_snapshot.parachute_open_configured = true;
+  ready_snapshot.parachute_close_configured = true;
+  ready_snapshot.motor_profile_valid = true;
+  ready_snapshot.gyro_bias_valid = true;
+  ready_snapshot.gravity_reference_valid = true;
+  ready_snapshot.ssc_zero_valid = true;
+  ready_snapshot.resources_preallocated = true;
+  const SequenceConfiguration ready{ready_snapshot, false};
   MissionStateMachine cancelled;
   assert(cancelled.startSequence(0, ready) == TransitionResult::completed);
   const uint32_t first_epoch = cancelled.snapshot().flight_epoch;
@@ -646,11 +656,15 @@ void testCommandExecutor() {
                     wrong_state)
              .result.reason == CommandReason::invalid_state);
 
-  assert(executor.begin(
-             command(11, static_cast<uint8_t>(
-                             CommandCode::run_preflight_calibration)),
-             context)
-             .result.reason == CommandReason::not_supported);
+  CommandContext calibration_context = context;
+  calibration_context.calibration_supported = true;
+  const auto calibration = executor.begin(
+      command(11, static_cast<uint8_t>(
+                      CommandCode::run_preflight_calibration)),
+      calibration_context);
+  assert(calibration.execute &&
+         calibration.result.phase == CommandPhase::accepted);
+  (void)executor.finish(11, CommandPhase::completed);
 
   CommandExecutor cache;
   for (uint8_t id = 1; id <= CommandExecutor::kResultCacheSize; ++id) {
@@ -1016,7 +1030,7 @@ void testParachuteAndRecovery() {
   assert(parachute.tick({2'000'000, true, 30, false}) ==
          ParachuteAction::none);
   assert(parachute.tick({6'000'000, false, 0, false}) ==
-         ParachuteAction::cut_power);
+         ParachuteAction::hold_position);
   assert(parachute.status().state == ParachuteOpenState::retry_exhausted);
 
   ParachuteController positive_wrap;
@@ -1037,7 +1051,7 @@ void testParachuteAndRecovery() {
   ParachuteController confirmed;
   assert(confirmed.startOpen(0, 0) == ParachuteAction::command_open);
   assert(confirmed.tick({100'000, true, 30, true}) ==
-         ParachuteAction::cut_power);
+         ParachuteAction::hold_position);
   assert(confirmed.status().servo_open_confirmed);
   confirmed.notifyPowerCutoff();
   assert(confirmed.status().state == ParachuteOpenState::powered_off);
@@ -1091,12 +1105,152 @@ void testRuntimeQueue() {
 
 } // 無名名前空間
 
+
+void testForceStartReadinessAndState() {
+  using mission::CommandCode;
+  using mission::CommandContext;
+  using mission::CommandExecutor;
+  using mission::MissionStateMachine;
+  using mission::PreflightReadinessBit;
+  using mission::PreflightReadinessSnapshot;
+  using mission::SequenceConfiguration;
+  using protocol::CommandPhase;
+  using protocol::CommandReason;
+  using protocol::MissionState;
+
+  PreflightReadinessSnapshot readiness{};
+  readiness.generation = 7;
+  readiness.captured_at_us = 1234;
+  readiness.resources_preallocated = true;
+  readiness.motor_profile_valid = true;
+  readiness.gyro_bias_valid = true;
+  readiness.gravity_reference_valid = true;
+  readiness.ssc_zero_valid = true;
+  readiness.parachute_open_configured = true;
+  readiness.parachute_close_configured = true;
+  assert(readiness.missingMask() ==
+         mission::preflightReadinessBit(
+             PreflightReadinessBit::fin_zero_configured));
+  assert(!readiness.ready());
+
+  CommandContext context{};
+  context.resources_preallocated = true;
+  context.persistence_load_complete = true;
+  context.persistence_ready = true;
+  CommandExecutor executor;
+  const auto normal = executor.begin(
+      command(40, static_cast<uint8_t>(CommandCode::start_sequence)), context);
+  assert(normal.execute && normal.result.phase == CommandPhase::accepted);
+  (void)executor.finish(40, CommandPhase::failed,
+                        CommandReason::not_configured,
+                        readiness.missingMask());
+
+  const auto force = executor.begin(
+      command(41, static_cast<uint8_t>(CommandCode::force_start_sequence)),
+      context);
+  assert(force.execute && force.result.phase == CommandPhase::accepted);
+  (void)executor.finish(41, CommandPhase::completed, CommandReason::none,
+                        readiness.missingMask());
+
+  auto malformed =
+      command(42, static_cast<uint8_t>(CommandCode::force_start_sequence));
+  malformed.arguments[0] = 1;
+  assert(executor.begin(malformed, context).result.reason ==
+         CommandReason::invalid_argument);
+
+  CommandContext loading = context;
+  loading.persistence_load_complete = false;
+  CommandExecutor loading_executor;
+  assert(loading_executor
+             .begin(command(43, static_cast<uint8_t>(
+                                    CommandCode::force_start_sequence)),
+                    loading)
+             .result.reason == CommandReason::busy);
+  CommandContext broken_persistence = context;
+  broken_persistence.persistence_ready = false;
+  CommandExecutor persistence_executor;
+  assert(persistence_executor
+             .begin(command(44, static_cast<uint8_t>(
+                                    CommandCode::force_start_sequence)),
+                    broken_persistence)
+             .result.reason == CommandReason::persistence_error);
+
+  MissionStateMachine normal_state;
+  const SequenceConfiguration normal_configuration{readiness, false};
+  assert(normal_state.startSequence(0, normal_configuration) ==
+         mission::TransitionResult::not_configured);
+
+  MissionStateMachine forced_state;
+  const SequenceConfiguration forced_configuration{readiness, true};
+  assert(forced_state.startSequence(0, forced_configuration) ==
+         mission::TransitionResult::completed);
+  assert(forced_state.snapshot().state == MissionState::liftoff_detection);
+  assert(forced_state.snapshot().forced_start);
+  assert(forced_state.snapshot().preflight_missing_mask ==
+         readiness.missingMask());
+  assert(forced_state.cancelSequence() == mission::TransitionResult::completed);
+  assert(!forced_state.snapshot().forced_start &&
+         forced_state.snapshot().preflight_missing_mask == 0);
+
+  MissionStateMachine emergency_state;
+  PreflightReadinessSnapshot ready = readiness;
+  ready.fin_zero_configured = true;
+  assert(emergency_state.startSequence(0, {ready, true}) ==
+         mission::TransitionResult::completed);
+  mission::MissionTickInput liftoff{};
+  liftoff.monotonic_us = 2'000'000;
+  liftoff.liftoff_detected = true;
+  emergency_state.tick(liftoff);
+  assert(emergency_state.snapshot().state == MissionState::engine_burn);
+  assert(emergency_state.liftoffDetectionEmergencyStop() ==
+         mission::TransitionResult::completed);
+  assert(emergency_state.snapshot().forced_start);
+
+  mission::ResetCheckpoint checkpoint{};
+  checkpoint.valid = true;
+  checkpoint.state = MissionState::liftoff_detection;
+  checkpoint.flight_epoch = emergency_state.snapshot().flight_epoch;
+  checkpoint.elapsed_valid = false;
+  checkpoint.forced_start = true;
+  checkpoint.preflight_missing_mask = readiness.missingMask();
+  MissionStateMachine restored;
+  assert(restored.restoreAfterReset(5'000'000, checkpoint) ==
+         mission::TransitionResult::completed);
+  assert(restored.snapshot().state == MissionState::liftoff_detection);
+  assert(restored.snapshot().forced_start);
+  assert(restored.snapshot().preflight_missing_mask ==
+         readiness.missingMask());
+}
+
+void testParachuteDeadlineKeepsPowerPolicySeparate() {
+  actuators::ParachuteController controller;
+  assert(controller.startOpen(1'000, 100) ==
+         actuators::ParachuteAction::command_open);
+  const auto deadline = controller.tick({5'001'000, true, 100, false});
+  assert(deadline == actuators::ParachuteAction::hold_position);
+  assert(controller.status().state ==
+         actuators::ParachuteOpenState::retry_exhausted);
+  assert(controller.status().open_attempt_finished);
+  assert(!controller.status().servo_open_confirmed);
+
+  actuators::ParachuteController success;
+  assert(success.startOpen(10'000, 100) ==
+         actuators::ParachuteAction::command_open);
+  assert(success.tick({20'000, true, 200, true}) ==
+         actuators::ParachuteAction::hold_position);
+  assert(success.status().servo_open_confirmed);
+  success.notifyPowerCutoff();
+  assert(success.status().state == actuators::ParachuteOpenState::powered_off);
+}
+
 int main() {
   const auto golden = readGolden();
   testCanGolden(golden);
   testQuantization(golden);
   testMissionStateMachine();
   testCommandExecutor();
+  testForceStartReadinessAndState();
+  testParachuteDeadlineKeepsPowerPolicySeparate();
   testSensors();
   testAttitudeContinuity();
   testControlPipeline();

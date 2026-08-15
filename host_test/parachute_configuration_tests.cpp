@@ -217,54 +217,86 @@ void testTransactionAndRebootLoad() {
 
 void testFlightSnapshot() {
   ParachuteConfigurationState state;
-  require(state.freezeFlightSnapshot(angle(0)).error ==
+  require(state.freezeNormalFlightSnapshot(angle(0)).error ==
               FlightParachutePreparationError::open_not_configured,
-          "missing open must reject Start");
+          "missing open must reject normal Start");
+
   ParachuteConfiguration partial{};
   partial.open = angle(100);
   state.replaceLoadedConfiguration(partial);
-  require(state.freezeFlightSnapshot(angle(0)).error ==
+  require(state.freezeNormalFlightSnapshot(angle(0)).error ==
               FlightParachutePreparationError::close_not_configured,
-          "missing close must reject Start");
+          "missing close must reject normal Start");
+
+  // Open/Close相互がhalf-turnでも、それ自体はStart拒否理由にしない。
   partial.close = angle(2148);
   state.replaceLoadedConfiguration(partial);
-  require(state.freezeFlightSnapshot(angle(0)).error ==
-              FlightParachutePreparationError::
-                  open_close_exactly_half_turn,
-          "half-turn endpoints must reject Start");
-  partial.close = angle(200);
+  require(state.freezeNormalFlightSnapshot(angle(0)).ready(),
+          "open/close half-turn relation must not reject Start");
+  state.discardFlightSnapshot();
+
   partial.open = angle(2048);
+  partial.close = angle(100);
   state.replaceLoadedConfiguration(partial);
-  require(state.freezeFlightSnapshot(angle(0)).error ==
+  require(state.freezeNormalFlightSnapshot(angle(0)).error ==
               FlightParachutePreparationError::
                   current_open_exactly_half_turn,
-          "half-turn current-to-open must reject Start");
+          "current-to-open exact half-turn must reject normal Start");
+
+  ParachuteConfiguration open_only{};
+  open_only.open = angle(300);
+  state.replaceLoadedConfiguration(open_only);
+  state.freezeForcedFlightSnapshot();
+  require(state.flightSnapshotValid() &&
+              state.flightSnapshot()->open.has_value() &&
+              !state.flightSnapshot()->close.has_value(),
+          "Force snapshot must preserve open-only optional state");
+  require(state.flightSnapshot()->open->count() == 300,
+          "Force snapshot must preserve open target");
+
+  ParachuteConfiguration close_only{};
+  close_only.close = angle(700);
+  state.replaceLoadedConfiguration(close_only);
+  state.freezeForcedFlightSnapshot();
+  require(!state.flightSnapshot()->open.has_value() &&
+              state.flightSnapshot()->close.has_value() &&
+              state.flightSnapshot()->close->count() == 700,
+          "Force snapshot must preserve close-only optional state");
+
+  state.replaceLoadedConfiguration({});
+  state.freezeForcedFlightSnapshot();
+  require(!state.flightSnapshot()->open.has_value() &&
+              !state.flightSnapshot()->close.has_value(),
+          "Force snapshot must preserve both-missing state");
 
   ParachuteConfiguration valid{};
   valid.open = angle(300);
   valid.close = angle(100);
   state.replaceLoadedConfiguration(valid);
-  require(state.freezeFlightSnapshot(angle(200)).ready(),
-          "valid endpoints must prepare Start");
-  require(state.flightSnapshot()->open.count() == 300,
+  require(state.freezeNormalFlightSnapshot(angle(200)).ready(),
+          "valid endpoints must prepare normal Start");
+  require(state.flightSnapshot()->open->count() == 300,
           "snapshot must contain Start-time open");
   state.activatePersistedCandidate(
       state.candidateWith(ParachuteEndpoint::open, angle(700)));
   require(state.active().open->count() == 700 &&
-              state.flightSnapshot()->open.count() == 300,
+              state.flightSnapshot()->open->count() == 300,
           "active changes must not alter the flight snapshot");
   state.discardFlightSnapshot();
   require(!state.flightSnapshotValid() && state.active().open->count() == 700,
           "Cancel must discard only the snapshot");
 
-  state.restoreFlightSnapshot({angle(300), angle(100)});
+  actuators::FlightParachuteConfiguration restored{};
+  restored.open = angle(300);
+  state.restoreFlightSnapshot(restored);
   ParachuteConfiguration reloaded{};
   reloaded.open = angle(900);
   reloaded.close = angle(800);
   state.replaceLoadedConfiguration(reloaded);
-  require(state.flightSnapshot()->open.count() == 300 &&
+  require(state.flightSnapshot()->open->count() == 300 &&
+              !state.flightSnapshot()->close.has_value() &&
               state.active().open->count() == 900,
-          "startup active load must not replace a restored flight snapshot");
+          "startup active load must not replace restored optional snapshot");
 }
 
 } // 無名名前空間
