@@ -84,8 +84,9 @@ private:
   bool pipeline_running_{false};
   std::atomic<bool> stop_waiting_{false};
   std::atomic<TaskHandle_t> failure_notification_task_{nullptr};
-  std::atomic<std::uint32_t> last_alarm_lateness_us_{0U};
-  std::atomic<std::uint32_t> max_alarm_lateness_us_{0U};
+  mutable portMUX_TYPE timing_lock_ = portMUX_INITIALIZER_UNLOCKED;
+  std::uint32_t last_alarm_lateness_us_{0U};
+  std::uint32_t max_alarm_lateness_us_{0U};
   std::atomic<std::uint32_t> max_isr_to_task_us_{0U};
   std::atomic<std::uint32_t> max_capture_lateness_us_{0U};
   SamplerStatistics statistics_{};

@@ -13,9 +13,6 @@
 namespace avi::characterization {
 namespace {
 
-static_assert(std::atomic<std::uint32_t>::is_always_lock_free,
-              "characterization ISR diagnostics require lock-free u32 atomics");
-
 std::uint32_t periodUs(EncoderRate rate) noexcept {
   return 1'000'000U / static_cast<std::uint32_t>(rate);
 }
@@ -110,9 +107,11 @@ bool EncoderSampler::timerCallback(gptimer_handle_t,
             ? event->count_value - event->alarm_value
             : 0U;
     const std::uint32_t lateness_us = saturateU32(lateness);
-    sampler.last_alarm_lateness_us_.store(lateness_us,
-                                          std::memory_order_release);
-    updateAtomicMaximum(sampler.max_alarm_lateness_us_, lateness_us);
+    portENTER_CRITICAL_ISR(&sampler.timing_lock_);
+    sampler.last_alarm_lateness_us_ = lateness_us;
+    sampler.max_alarm_lateness_us_ =
+        std::max(sampler.max_alarm_lateness_us_, lateness_us);
+    portEXIT_CRITICAL_ISR(&sampler.timing_lock_);
   }
 
   BaseType_t task_awoken = pdFALSE;
@@ -172,8 +171,10 @@ void EncoderSampler::taskLoop() {
     if (now_us >= next_scheduled_us_) {
       const std::uint32_t task_wake_lateness_us =
           saturateU32(now_us - next_scheduled_us_);
-      const std::uint32_t alarm_lateness_us =
-          last_alarm_lateness_us_.load(std::memory_order_acquire);
+      std::uint32_t alarm_lateness_us = 0U;
+      portENTER_CRITICAL(&timing_lock_);
+      alarm_lateness_us = last_alarm_lateness_us_;
+      portEXIT_CRITICAL(&timing_lock_);
       const std::uint32_t isr_to_task_us =
           task_wake_lateness_us >= alarm_lateness_us
               ? task_wake_lateness_us - alarm_lateness_us
@@ -260,8 +261,10 @@ esp_err_t EncoderSampler::begin(EncoderRate rate,
   statistics_ = {};
   first_error_.store(ESP_OK);
   stop_cleanup_error_.store(ESP_OK);
-  last_alarm_lateness_us_.store(0U, std::memory_order_relaxed);
-  max_alarm_lateness_us_.store(0U, std::memory_order_relaxed);
+  portENTER_CRITICAL(&timing_lock_);
+  last_alarm_lateness_us_ = 0U;
+  max_alarm_lateness_us_ = 0U;
+  portEXIT_CRITICAL(&timing_lock_);
   max_isr_to_task_us_.store(0U, std::memory_order_relaxed);
   max_capture_lateness_us_.store(0U, std::memory_order_relaxed);
   generation_ = 0U;
@@ -403,8 +406,9 @@ SamplerStatistics EncoderSampler::statistics() const {
 
 EncoderTimingDiagnostics EncoderSampler::timingDiagnostics() const noexcept {
   EncoderTimingDiagnostics diagnostics{};
-  diagnostics.max_alarm_lateness_us =
-      max_alarm_lateness_us_.load(std::memory_order_relaxed);
+  portENTER_CRITICAL(&timing_lock_);
+  diagnostics.max_alarm_lateness_us = max_alarm_lateness_us_;
+  portEXIT_CRITICAL(&timing_lock_);
   diagnostics.max_isr_to_task_us =
       max_isr_to_task_us_.load(std::memory_order_relaxed);
   diagnostics.max_capture_lateness_us =

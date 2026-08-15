@@ -47,11 +47,9 @@ constexpr std::uint32_t kApproachPulsePeriodEpochs = 20U;
 constexpr std::uint32_t kApproachPulseOnEpochs = 8U;
 constexpr std::int32_t kApproachDeadbandMilliDeg = 20;
 
-static_assert(std::atomic<std::uint32_t>::is_always_lock_free,
-              "characterization ISR diagnostics require lock-free u32 atomics");
-
-std::atomic<std::uint32_t> g_consumer_last_alarm_lateness_us{0U};
-std::atomic<std::uint32_t> g_consumer_max_alarm_lateness_us{0U};
+portMUX_TYPE g_consumer_timing_lock = portMUX_INITIALIZER_UNLOCKED;
+std::uint32_t g_consumer_last_alarm_lateness_us{0U};
+std::uint32_t g_consumer_max_alarm_lateness_us{0U};
 
 std::uint64_t nowUs() noexcept {
   return static_cast<std::uint64_t>(
@@ -61,16 +59,6 @@ std::uint64_t nowUs() noexcept {
 std::uint32_t saturateU32(std::uint64_t value) noexcept {
   return static_cast<std::uint32_t>(std::min<std::uint64_t>(
       value, std::numeric_limits<std::uint32_t>::max()));
-}
-
-void updateAtomicMaximum(std::atomic<std::uint32_t> &target,
-                         std::uint32_t candidate) noexcept {
-  std::uint32_t current = target.load(std::memory_order_relaxed);
-  while (current < candidate &&
-         !target.compare_exchange_weak(current, candidate,
-                                       std::memory_order_relaxed,
-                                       std::memory_order_relaxed)) {
-  }
 }
 
 const char *stageName(AssemblyStage stage) noexcept {
@@ -271,9 +259,11 @@ bool ProfileRunner::consumerTimerCallback(
             ? event->count_value - event->alarm_value
             : 0U;
     const std::uint32_t lateness_us = saturateU32(lateness);
-    g_consumer_last_alarm_lateness_us.store(lateness_us,
-                                            std::memory_order_release);
-    updateAtomicMaximum(g_consumer_max_alarm_lateness_us, lateness_us);
+    portENTER_CRITICAL_ISR(&g_consumer_timing_lock);
+    g_consumer_last_alarm_lateness_us = lateness_us;
+    g_consumer_max_alarm_lateness_us =
+        std::max(g_consumer_max_alarm_lateness_us, lateness_us);
+    portEXIT_CRITICAL_ISR(&g_consumer_timing_lock);
   }
 
   BaseType_t task_awoken = pdFALSE;
@@ -788,8 +778,10 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
   std::uint64_t previous_release_us = 0U;
   bool have_previous_release = false;
 
-  g_consumer_last_alarm_lateness_us.store(0U, std::memory_order_relaxed);
-  g_consumer_max_alarm_lateness_us.store(0U, std::memory_order_relaxed);
+  portENTER_CRITICAL(&g_consumer_timing_lock);
+  g_consumer_last_alarm_lateness_us = 0U;
+  g_consumer_max_alarm_lateness_us = 0U;
+  portEXIT_CRITICAL(&g_consumer_timing_lock);
 
   const auto stopForFatal = [&](esp_err_t cause, AbortReason reason,
                                 std::uint64_t timestamp_us) noexcept {
@@ -1005,8 +997,10 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
     const std::uint64_t release_us = nowUs();
     const std::uint32_t release_lateness_us =
         release_us > epoch_end ? saturateU32(release_us - epoch_end) : 0U;
-    const std::uint32_t alarm_lateness_us =
-        g_consumer_last_alarm_lateness_us.load(std::memory_order_acquire);
+    std::uint32_t alarm_lateness_us = 0U;
+    portENTER_CRITICAL(&g_consumer_timing_lock);
+    alarm_lateness_us = g_consumer_last_alarm_lateness_us;
+    portEXIT_CRITICAL(&g_consumer_timing_lock);
     const std::uint32_t isr_to_task_us =
         release_lateness_us >= alarm_lateness_us
             ? release_lateness_us - alarm_lateness_us
@@ -1382,6 +1376,10 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
         static_cast<unsigned long long>(statistics.encoder_status_faults),
         static_cast<unsigned long long>(statistics.vbus_invalid_samples),
         esp_err_to_name(first_error));
+    std::uint32_t consumer_alarm_lateness_max_us = 0U;
+    portENTER_CRITICAL(&g_consumer_timing_lock);
+    consumer_alarm_lateness_max_us = g_consumer_max_alarm_lateness_us;
+    portEXIT_CRITICAL(&g_consumer_timing_lock);
     std::printf(
         "CHAR_RATE_TIMING rate=%u consumer-alarm-late-max-us=%u "
         "consumer-isr-task-max-us=%u consumer-work-max-us=%u "
@@ -1390,8 +1388,7 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
         "encoder-alarm-late-max-us=%u encoder-isr-task-max-us=%u "
         "encoder-capture-late-max-us=%u diagnostic-continued=%llu\n",
         static_cast<unsigned>(rate),
-        static_cast<unsigned>(g_consumer_max_alarm_lateness_us.load(
-            std::memory_order_relaxed)),
+        static_cast<unsigned>(consumer_alarm_lateness_max_us),
         static_cast<unsigned>(max_consumer_isr_to_task_us),
         static_cast<unsigned>(max_consumer_work_us),
         static_cast<unsigned>(max_wait_entry_lateness_us),
