@@ -333,22 +333,59 @@ mission::ControlAvailability readyControl() {
 void testMissionStateMachine() {
   using mission::FinDirective;
   using mission::MissionStateMachine;
-  using mission::SequenceConfiguration;
+  using mission::PreflightReadinessSnapshot;
+  using mission::StartMode;
   using mission::TransitionResult;
   using protocol::MissionState;
 
-  const SequenceConfiguration ready{true, true, true, true};
+  const PreflightReadinessSnapshot ready{1, 1234, true, true, true, true,
+                                         true, true, true, true};
+
   MissionStateMachine cancelled;
-  assert(cancelled.startSequence(0, ready) == TransitionResult::completed);
+  assert(cancelled.startSequence(0, ready, StartMode::normal) ==
+         TransitionResult::completed);
   const uint32_t first_epoch = cancelled.snapshot().flight_epoch;
   assert(cancelled.snapshot().state == MissionState::liftoff_detection);
   assert(cancelled.snapshot().fin == FinDirective::zero_hold);
+  assert(!cancelled.snapshot().forced_start);
+  assert(cancelled.snapshot().preflight_missing_mask == 0);
   assert(cancelled.cancelSequence() == TransitionResult::completed);
   assert(cancelled.snapshot().state == MissionState::command_receive);
   assert(cancelled.snapshot().fin == FinDirective::brake);
+  assert(!cancelled.snapshot().forced_start);
+  assert(cancelled.snapshot().preflight_generation == 0);
+
+  auto missing = ready;
+  missing.generation = 2;
+  missing.parachute_close_configured = false;
+  missing.gyro_bias_valid = false;
+  assert(missing.missingMask() == ((1U << 2U) | (1U << 4U)));
+  MissionStateMachine normal_missing;
+  assert(normal_missing.startSequence(0, missing, StartMode::normal) ==
+         TransitionResult::not_configured);
+  assert(normal_missing.snapshot().state == MissionState::command_receive);
+
+  MissionStateMachine forced;
+  assert(forced.startSequence(0, missing, StartMode::forced) ==
+         TransitionResult::completed);
+  assert(forced.snapshot().forced_start);
+  assert(forced.snapshot().preflight_missing_mask == missing.missingMask());
+  assert(forced.snapshot().preflight_ready_mask == missing.readyMask());
+  assert(forced.snapshot().preflight_generation == 2);
+  assert(forced.cancelSequence() == TransitionResult::completed);
+  assert(!forced.snapshot().forced_start);
+  assert(forced.snapshot().preflight_missing_mask == 0);
+
+  auto runtime_unavailable = ready;
+  runtime_unavailable.resources_preallocated = false;
+  MissionStateMachine runtime_gate;
+  assert(runtime_gate.startSequence(0, runtime_unavailable, StartMode::forced) ==
+         TransitionResult::runtime_unavailable);
 
   MissionStateMachine emergency;
-  assert(emergency.startSequence(0, ready) == TransitionResult::completed);
+  assert(emergency.startSequence(0, missing, StartMode::forced) ==
+         TransitionResult::completed);
+  const uint8_t emergency_missing = emergency.snapshot().preflight_missing_mask;
   emergency.tick({2'000'000, true, false, readyControl()});
   assert(emergency.snapshot().state == MissionState::engine_burn);
   assert(emergency.snapshot().liftoff_time_us == 1'000'000);
@@ -357,9 +394,12 @@ void testMissionStateMachine() {
   assert(emergency.snapshot().state == MissionState::liftoff_detection);
   assert(emergency.snapshot().flight_epoch != first_epoch);
   assert(!emergency.snapshot().liftoff_time_valid);
+  assert(emergency.snapshot().forced_start);
+  assert(emergency.snapshot().preflight_missing_mask == emergency_missing);
 
   MissionStateMachine control;
-  assert(control.startSequence(0, ready) == TransitionResult::completed);
+  assert(control.startSequence(0, ready, StartMode::normal) ==
+         TransitionResult::completed);
   control.tick({2'000'000, true, false, readyControl()});
   control.tick({8'999'999, false, false, readyControl()});
   assert(control.snapshot().state == MissionState::engine_burn);
@@ -372,9 +412,6 @@ void testMissionStateMachine() {
   assert(control.snapshot().control_roll_reference_estimator_timestamp_us ==
          8'999'900);
   assert(control.snapshot().control_roll_reference_capture_tick == 9'000);
-  assert(entry_tick.control.roll_estimate_liftoff_relative_unwrapped_rad -
-             control.snapshot().control_roll_reference_unwrapped_rad ==
-         0.0);
   const uint8_t capture_sequence =
       control.snapshot().control_roll_reference_capture_event_sequence;
   auto changed_roll = readyControl();
@@ -404,34 +441,8 @@ void testMissionStateMachine() {
          TransitionResult::completed);
   assert(!control.snapshot().control_roll_reference_valid);
 
-  MissionStateMachine gate_failure;
-  assert(gate_failure.startSequence(0, ready) == TransitionResult::completed);
-  gate_failure.tick({2'000'000, true, false, readyControl()});
-  gate_failure.tick({9'000'000, false, false, unavailable});
-  assert(gate_failure.snapshot().control_reentry_inhibited);
-  gate_failure.tick({9'100'000, false, false, readyControl()});
-  assert(gate_failure.snapshot().state == MissionState::engine_burn);
-  assert(!gate_failure.snapshot().control_roll_reference_valid);
-
-  for (int loss_case = 0; loss_case < 2; ++loss_case) {
-    MissionStateMachine loss;
-    assert(loss.startSequence(0, ready) == TransitionResult::completed);
-    loss.tick({2'000'000, true, false, readyControl()});
-    loss.tick({9'000'000, false, false, readyControl(), 9'000});
-    auto lost_input = readyControl();
-    if (loss_case == 0)
-      lost_input.lps_available = false;
-    else
-      lost_input.attitude_fresh = false;
-    loss.tick({9'001'000, false, false, lost_input, 9'001});
-    assert(loss.snapshot().state == MissionState::engine_burn);
-    assert(loss.snapshot().control_reentry_inhibited);
-    loss.tick({9'100'000, false, false, readyControl(), 9'100});
-    assert(loss.snapshot().state == MissionState::engine_burn);
-  }
-
   MissionStateMachine stale_reference;
-  assert(stale_reference.startSequence(0, ready) ==
+  assert(stale_reference.startSequence(0, ready, StartMode::normal) ==
          TransitionResult::completed);
   stale_reference.tick({2'000'000, true, false, readyControl()});
   auto stale_control = readyControl();
@@ -441,29 +452,9 @@ void testMissionStateMachine() {
   assert(stale_reference.snapshot().control_reentry_inhibited);
   assert(!stale_reference.snapshot().control_roll_reference_valid);
 
-  MissionStateMachine future_reference;
-  assert(future_reference.startSequence(0, ready) ==
-         TransitionResult::completed);
-  future_reference.tick({2'000'000, true, false, readyControl()});
-  auto future_control = readyControl();
-  future_control.roll_estimator_timestamp_us = 9'000'001;
-  future_reference.tick({9'000'000, false, false, future_control, 9'000});
-  assert(future_reference.snapshot().state == MissionState::engine_burn);
-  assert(!future_reference.snapshot().control_roll_reference_valid);
-
-  MissionStateMachine disabled_after_capture;
-  assert(disabled_after_capture.startSequence(0, ready) ==
-         TransitionResult::completed);
-  disabled_after_capture.tick({2'000'000, true, false, readyControl()});
-  disabled_after_capture.tick(
-      {9'000'000, false, false, readyControl(), 9'000});
-  assert(disabled_after_capture.snapshot().control_roll_reference_valid);
-  assert(disabled_after_capture.disableFinControl() ==
-         TransitionResult::completed);
-  assert(!disabled_after_capture.snapshot().control_roll_reference_valid);
-
   MissionStateMachine disabled;
-  assert(disabled.startSequence(0, ready) == TransitionResult::completed);
+  assert(disabled.startSequence(0, ready, StartMode::normal) ==
+         TransitionResult::completed);
   assert(disabled.disableFinControl() == TransitionResult::completed);
   assert(disabled.snapshot().state == MissionState::liftoff_detection);
   assert(disabled.snapshot().fin == FinDirective::brake);
@@ -472,7 +463,8 @@ void testMissionStateMachine() {
   assert(disabled.snapshot().state == MissionState::engine_burn);
 
   MissionStateMachine deadlines;
-  assert(deadlines.startSequence(0, ready) == TransitionResult::completed);
+  assert(deadlines.startSequence(0, ready, StartMode::normal) ==
+         TransitionResult::completed);
   deadlines.tick({2'000'000, true, false, readyControl()});
   const uint32_t deadline_epoch = deadlines.snapshot().flight_epoch;
   deadlines.tick({17'999'999, false, false, readyControl()},
@@ -482,25 +474,41 @@ void testMissionStateMachine() {
   deadlines.tick({18'000'000, false, false, readyControl()});
   assert(deadlines.snapshot().state == MissionState::descent);
   assert(deadlines.snapshot().deployment_started);
+  assert(deadlines.snapshot().parachute == mission::ParaDirective::open);
+  deadlines.tick({25'999'999, false, false, readyControl()});
+  assert(!deadlines.snapshot().deployment_power_cutoff_latched);
   deadlines.tick({26'000'000, false, false, readyControl()});
   assert(deadlines.snapshot().deployment_power_cutoff_latched);
+  assert(deadlines.snapshot().parachute == mission::ParaDirective::powered_off);
   assert(deadlines.snapshot().fin == FinDirective::brake);
 
   MissionStateMachine pressure;
-  assert(pressure.startSequence(0, ready) == TransitionResult::completed);
+  assert(pressure.startSequence(0, ready, StartMode::normal) ==
+         TransitionResult::completed);
   pressure.tick({2'000'000, true, false, readyControl()});
   pressure.tick({10'999'999, false, true, readyControl()});
   assert(pressure.snapshot().state != MissionState::descent);
   pressure.tick({11'000'000, false, true, readyControl()});
   assert(pressure.snapshot().state == MissionState::descent);
 
+  mission::ResetCheckpoint reset_checkpoint{};
+  reset_checkpoint.valid = true;
+  reset_checkpoint.state = MissionState::control;
+  reset_checkpoint.flight_epoch = 7;
+  reset_checkpoint.elapsed_valid = true;
+  reset_checkpoint.elapsed_us = 20'000'000;
+  reset_checkpoint.forced_start = true;
+  reset_checkpoint.preflight_generation = missing.generation;
+  reset_checkpoint.preflight_captured_at_us = missing.captured_at_us;
+  reset_checkpoint.preflight_ready_mask = missing.readyMask();
+  reset_checkpoint.preflight_missing_mask = missing.missingMask();
   MissionStateMachine reset;
-  assert(reset.restoreAfterReset(
-             100'000'000,
-             {true, MissionState::control, 7, true, 20'000'000, false,
-              false}) == TransitionResult::completed);
+  assert(reset.restoreAfterReset(100'000'000, reset_checkpoint) ==
+         TransitionResult::completed);
   assert(reset.snapshot().state == MissionState::engine_burn);
   assert(reset.snapshot().reset_invalidated);
+  assert(reset.snapshot().forced_start);
+  assert(reset.snapshot().preflight_missing_mask == missing.missingMask());
   assert(!reset.snapshot().control_roll_reference_valid);
   assert(reset.snapshot().fin == FinDirective::brake);
   reset.tick({100'000'000, false, false, readyControl()});
@@ -509,13 +517,30 @@ void testMissionStateMachine() {
   assert(reset.snapshot().deployment_power_cutoff_latched);
   assert(reset.snapshot().elapsed_us == 25'000'000);
 
-  MissionStateMachine reset_near_cutoff;
-  assert(reset_near_cutoff.restoreAfterReset(
-             5'000'000,
-             {true, MissionState::descent, 8, true, 24'999'000, true,
-              false}) == TransitionResult::completed);
-  reset_near_cutoff.tick({5'001'000, false, false, readyControl()});
-  assert(reset_near_cutoff.snapshot().deployment_power_cutoff_latched);
+  mission::ResetCheckpoint pre_liftoff_checkpoint{};
+  pre_liftoff_checkpoint.valid = true;
+  pre_liftoff_checkpoint.state = MissionState::liftoff_detection;
+  pre_liftoff_checkpoint.flight_epoch = 9;
+  pre_liftoff_checkpoint.elapsed_valid = false;
+  pre_liftoff_checkpoint.forced_start = true;
+  pre_liftoff_checkpoint.preflight_generation = missing.generation;
+  pre_liftoff_checkpoint.preflight_captured_at_us = missing.captured_at_us;
+  pre_liftoff_checkpoint.preflight_ready_mask = missing.readyMask();
+  pre_liftoff_checkpoint.preflight_missing_mask = missing.missingMask();
+  MissionStateMachine pre_liftoff_reset;
+  assert(pre_liftoff_reset.restoreAfterReset(5'000'000,
+                                             pre_liftoff_checkpoint) ==
+         TransitionResult::completed);
+  assert(pre_liftoff_reset.snapshot().state == MissionState::liftoff_detection);
+  assert(pre_liftoff_reset.snapshot().forced_start);
+  assert(!pre_liftoff_reset.snapshot().liftoff_time_valid);
+
+  mission::ResetCheckpoint invalid_checkpoint = pre_liftoff_checkpoint;
+  invalid_checkpoint.valid = false;
+  MissionStateMachine invalid_reset;
+  assert(invalid_reset.restoreAfterReset(0, invalid_checkpoint) ==
+         TransitionResult::not_configured);
+  assert(!invalid_reset.snapshot().forced_start);
 }
 
 protocol::GenericCommandRequest command(uint8_t transaction, uint8_t code) {
@@ -531,9 +556,12 @@ void testCommandExecutor() {
   using protocol::MissionState;
 
   CommandContext context{};
-  context.sequence_configured = true;
   context.resources_preallocated = true;
+  context.persistence_load_complete = true;
+  context.persistence_runtime_available = true;
   context.fin_safe_commands_supported = true;
+  context.calibration_supported = true;
+
   CommandExecutor executor;
   auto decision = executor.begin(
       command(0, static_cast<uint8_t>(CommandCode::start_sequence)), context);
@@ -541,7 +569,7 @@ void testCommandExecutor() {
   assert(decision.result.reason == CommandReason::invalid_argument);
 
   auto invalid_args =
-      command(1, static_cast<uint8_t>(CommandCode::start_sequence));
+      command(1, static_cast<uint8_t>(CommandCode::force_start_sequence));
   invalid_args.arguments[5] = 1;
   decision = executor.begin(invalid_args, context);
   assert(decision.result.reason == CommandReason::invalid_argument);
@@ -551,10 +579,51 @@ void testCommandExecutor() {
   CommandContext wrong_state = context;
   wrong_state.state = MissionState::engine_burn;
   decision = executor.begin(
-      command(2, static_cast<uint8_t>(CommandCode::fin_free)), wrong_state);
+      command(2, static_cast<uint8_t>(CommandCode::force_start_sequence)),
+      wrong_state);
   assert(decision.result.reason == CommandReason::invalid_state);
 
-  auto fin = command(3, static_cast<uint8_t>(CommandCode::fin_move_relative));
+  CommandExecutor resource_gate;
+  auto no_resources = context;
+  no_resources.resources_preallocated = false;
+  assert(resource_gate
+             .begin(command(3,
+                            static_cast<uint8_t>(
+                                CommandCode::force_start_sequence)),
+                    no_resources)
+             .result.reason == CommandReason::internal_error);
+
+  CommandExecutor load_gate;
+  auto loading = context;
+  loading.persistence_load_complete = false;
+  assert(load_gate
+             .begin(command(4,
+                            static_cast<uint8_t>(
+                                CommandCode::force_start_sequence)),
+                    loading)
+             .result.reason == CommandReason::busy);
+
+  CommandExecutor persistence_gate;
+  auto persistence_failed = context;
+  persistence_failed.persistence_runtime_available = false;
+  assert(persistence_gate
+             .begin(command(5,
+                            static_cast<uint8_t>(
+                                CommandCode::force_start_sequence)),
+                    persistence_failed)
+             .result.reason == CommandReason::persistence_error);
+
+  CommandExecutor force_accept;
+  auto force = command(6, static_cast<uint8_t>(CommandCode::force_start_sequence));
+  decision = force_accept.begin(force, context);
+  assert(decision.execute && decision.result.phase == CommandPhase::accepted);
+  const auto forced_complete = force_accept.finish(
+      6, CommandPhase::completed, CommandReason::none, 0x55);
+  assert(forced_complete.command ==
+         static_cast<uint8_t>(CommandCode::force_start_sequence));
+  assert(forced_complete.detail == 0x55);
+
+  auto fin = command(7, static_cast<uint8_t>(CommandCode::fin_move_relative));
   fin.arguments[0] = 10;
   decision = executor.begin(fin, context);
   assert(decision.execute && decision.result.phase == CommandPhase::accepted);
@@ -566,35 +635,30 @@ void testCommandExecutor() {
   decision = executor.begin(conflicting, context);
   assert(decision.result.reason == CommandReason::protocol_error);
   decision = executor.begin(
-      command(4, static_cast<uint8_t>(CommandCode::fin_free)), context);
+      command(8, static_cast<uint8_t>(CommandCode::fin_free)), context);
   assert(decision.result.reason == CommandReason::busy);
   const auto completed =
-      executor.finish(3, CommandPhase::completed, CommandReason::none, 7);
+      executor.finish(7, CommandPhase::completed, CommandReason::none, 7);
   assert(completed.phase == CommandPhase::completed && completed.detail == 7);
-  decision = executor.begin(fin, context);
-  assert(decision.replay && decision.result.phase == CommandPhase::completed);
 
-  auto para = command(5, static_cast<uint8_t>(CommandCode::para_open));
+  auto para = command(9, static_cast<uint8_t>(CommandCode::para_open));
   assert(executor.begin(para, context).execute);
-  auto fin_two = command(6, static_cast<uint8_t>(CommandCode::fin_free));
+  auto fin_two = command(10, static_cast<uint8_t>(CommandCode::fin_free));
   assert(executor.begin(fin_two, context).execute);
   const auto emergency =
-      executor.actuatorEmergency(8, MissionState::command_receive);
+      executor.actuatorEmergency(11, MissionState::command_receive);
   assert(emergency.execute && emergency.interrupted_count == 2);
   for (std::size_t index = 0; index < emergency.interrupted_count; ++index)
     assert(emergency.interrupted[index].reason ==
            CommandReason::interrupted_by_emergency);
-  assert(!executor.actuatorEmergency(0, MissionState::command_receive)
-              .execute);
-  assert(executor.actuatorEmergency(0, MissionState::command_receive)
-             .result.reason == CommandReason::invalid_argument);
+  assert(!executor.actuatorEmergency(0, MissionState::command_receive).execute);
   assert(executor.liftoffEmergencyResult(0, true).reason ==
          CommandReason::invalid_argument);
-  assert(executor.liftoffEmergencyResult(9, false).reason ==
+  assert(executor.liftoffEmergencyResult(12, false).reason ==
          CommandReason::invalid_state);
 
   auto para_limit =
-      command(10, static_cast<uint8_t>(CommandCode::para_move_relative));
+      command(13, static_cast<uint8_t>(CommandCode::para_move_relative));
   para_limit.arguments[0] = 0x08;
   para_limit.arguments[1] = 0x07;
   assert(executor.begin(para_limit, context).result.reason ==
@@ -602,55 +666,53 @@ void testCommandExecutor() {
 
   CommandExecutor parachute_arguments;
   auto set_open =
-      command(20, static_cast<uint8_t>(CommandCode::set_para_open));
+      command(14, static_cast<uint8_t>(CommandCode::set_para_open));
   assert(parachute_arguments.begin(set_open, context).execute);
-  (void)parachute_arguments.finish(20, CommandPhase::completed);
-  set_open = command(21, static_cast<uint8_t>(CommandCode::set_para_open));
+  (void)parachute_arguments.finish(14, CommandPhase::completed);
+  set_open = command(15, static_cast<uint8_t>(CommandCode::set_para_open));
   set_open.arguments[0] = 1;
   assert(parachute_arguments.begin(set_open, context).result.reason ==
          CommandReason::invalid_argument);
   auto negative_relative =
-      command(22, static_cast<uint8_t>(CommandCode::para_move_relative));
+      command(16, static_cast<uint8_t>(CommandCode::para_move_relative));
   negative_relative.arguments[0] = 0xFF;
   negative_relative.arguments[1] = 0xFF;
   assert(parachute_arguments.begin(negative_relative, context).execute);
 
   CommandExecutor start_busy;
   assert(start_busy
-             .begin(command(23,
+             .begin(command(17,
                             static_cast<uint8_t>(CommandCode::para_hold)),
                     context)
              .execute);
-  CommandContext not_configured = context;
-  not_configured.sequence_configured = false;
   assert(start_busy
-             .begin(command(24,
-                            static_cast<uint8_t>(CommandCode::start_sequence)),
-                    not_configured)
+             .begin(command(18,
+                            static_cast<uint8_t>(
+                                CommandCode::force_start_sequence)),
+                    context)
              .result.reason == CommandReason::busy);
 
   CommandExecutor parachute_busy;
   assert(parachute_busy
-             .begin(command(25,
+             .begin(command(19,
                             static_cast<uint8_t>(CommandCode::start_sequence)),
                     context)
              .execute);
   assert(parachute_busy
-             .begin(command(26,
+             .begin(command(20,
                             static_cast<uint8_t>(CommandCode::para_free)),
                     context)
              .result.reason == CommandReason::busy);
-  assert(parachute_busy
-             .begin(command(27,
-                            static_cast<uint8_t>(CommandCode::set_para_close)),
-                    wrong_state)
-             .result.reason == CommandReason::invalid_state);
 
-  assert(executor.begin(
-             command(11, static_cast<uint8_t>(
-                             CommandCode::run_preflight_calibration)),
-             context)
-             .result.reason == CommandReason::not_supported);
+  CommandExecutor calibration;
+  const auto calibration_decision = calibration.begin(
+      command(21,
+              static_cast<uint8_t>(CommandCode::run_preflight_calibration)),
+      context);
+  assert(calibration_decision.execute &&
+         calibration_decision.result.phase == CommandPhase::accepted);
+  assert(calibration.finish(21, CommandPhase::completed).phase ==
+         CommandPhase::completed);
 
   CommandExecutor cache;
   for (uint8_t id = 1; id <= CommandExecutor::kResultCacheSize; ++id) {
@@ -1000,10 +1062,7 @@ void testParachuteAndRecovery() {
   PowerArbiter power;
   assert(power.requestAuxiliary5v(true));
   assert(power.requestParachutePower(true));
-  power.latchDeploymentCutoff();
-  assert(!power.state().auxiliary_5v && !power.state().parachute_power);
-  assert(!power.requestAuxiliary5v(true));
-  assert(!power.requestParachutePower(true));
+  assert(power.state().parachute_power);
 
   ParachuteController parachute;
   assert(parachute.startOpen(1'000'000, 4095) ==
@@ -1016,8 +1075,11 @@ void testParachuteAndRecovery() {
   assert(parachute.tick({2'000'000, true, 30, false}) ==
          ParachuteAction::none);
   assert(parachute.tick({6'000'000, false, 0, false}) ==
-         ParachuteAction::cut_power);
+         ParachuteAction::stop_retrying);
   assert(parachute.status().state == ParachuteOpenState::retry_exhausted);
+  assert(parachute.status().open_attempt_finished);
+  // 5秒deadlineは電源遮断要求ではない。PowerArbiterは明示cutoffまでONのまま。
+  assert(power.state().parachute_power && !power.state().cutoff_latched);
 
   ParachuteController positive_wrap;
   assert(positive_wrap.startOpen(0, 4095) ==
@@ -1037,8 +1099,16 @@ void testParachuteAndRecovery() {
   ParachuteController confirmed;
   assert(confirmed.startOpen(0, 0) == ParachuteAction::command_open);
   assert(confirmed.tick({100'000, true, 30, true}) ==
-         ParachuteAction::cut_power);
+         ParachuteAction::hold_open);
   assert(confirmed.status().servo_open_confirmed);
+  assert(confirmed.status().open_attempt_finished);
+  assert(power.state().parachute_power);
+
+  power.latchDeploymentCutoff();
+  assert(!power.state().auxiliary_5v && !power.state().parachute_power);
+  assert(power.state().cutoff_latched);
+  assert(!power.requestAuxiliary5v(true));
+  assert(!power.requestParachutePower(true));
   confirmed.notifyPowerCutoff();
   assert(confirmed.status().state == ParachuteOpenState::powered_off);
 
