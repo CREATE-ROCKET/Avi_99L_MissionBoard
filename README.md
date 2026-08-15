@@ -305,3 +305,5 @@ CANはstandard 11-bit、125 kbit/s、DLC 8以下、multi-byteはlittle-endianで
 - ForceStartではSTS unavailable/read/Hold failureだけでLiftoffDetection遷移を失敗させず、Healthを正常へ偽装しません。
 - Open retryの約5秒deadlineはretry終了期限であり電源遮断期限ではありません。Hold/reconnectとパラシュート電源は離床+25秒まで維持し、+25秒で絶対cutoffします。
 - `forced_start`とpreflight snapshot/missing mask、optional parachute snapshotはsoftware/watchdog reset時にRTC checkpointから復元します。
+- Start/Force受理時の同一`PreflightReadinessSnapshot`はRTC auditにも保存し、software/watchdog reset後に検証して内部logへ復元します。
+- `PowerTimeTelemetry.persistence_flags`のbit0/1/2でparachute NVS load完了/runtime ready/corruptを公開します。

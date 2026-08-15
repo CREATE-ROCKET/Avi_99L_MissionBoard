@@ -1639,6 +1639,7 @@ void missionRealtimeTask(void *) {
       if (code == mission::CommandCode::cancel_sequence) {
         transition = state_machine.cancelSequence();
         if (transition == mission::TransitionResult::completed) {
+          recovery_boot::clearStartReadinessAudit();
           post_transition_para = {ParaRequest::Kind::discard_snapshot,
                                   before_transition.flight_epoch, false};
           post_transition_para_valid = true;
@@ -1667,6 +1668,16 @@ void missionRealtimeTask(void *) {
         readiness.resources_preallocated =
             flight_config::nonBypassFlightConfigurationReady();
         command_envelope.readiness = readiness;
+        const bool forced_start =
+            code == mission::CommandCode::force_start_sequence;
+        recovery_boot::storeStartReadinessAudit(readiness, forced_start);
+        std::printf(
+            "preflight readiness accepted: forced=%u generation=%lu captured_us=%llu ready=0x%02X missing=0x%02X\n",
+            forced_start ? 1U : 0U,
+            static_cast<unsigned long>(readiness.generation),
+            static_cast<unsigned long long>(readiness.captured_at_us),
+            static_cast<unsigned>(readiness.readyMask()),
+            static_cast<unsigned>(readiness.missingMask()));
         const ParachuteCommandRequest preparation{
             ParachuteCommandRequest::Kind::start_preparation,
             command_envelope.request, readiness};
@@ -2833,6 +2844,15 @@ void canTask(void *) {
         telemetry.para_mode = latest.para_mode;
         telemetry.parachute_angle_raw = 0xFF;
         (void)writeFrame(can, protocol::encode(telemetry));
+        uint8_t persistence_flags = 0;
+        if (parachute_config_load_complete.load(std::memory_order_acquire))
+          persistence_flags |= 1U << 0U;
+        if (parachute_persistence_ready.load(std::memory_order_acquire))
+          persistence_flags |= 1U << 1U;
+        if (parachute_persistence_corrupt.load(std::memory_order_acquire))
+          persistence_flags |= 1U << 2U;
+        if (result_queue_overflow.load(std::memory_order_relaxed) != 0)
+          persistence_flags |= 1U << 7U;
         const protocol::PowerTimeTelemetry power{
             sequences.next(protocol::CanId::power_time_telemetry), 0xFF, 0xFF,
             latest.state == protocol::MissionState::descent
@@ -2843,11 +2863,7 @@ void canTask(void *) {
                       0xFFF0U |
                       static_cast<uint8_t>(
                           protocol::quantization::TimeError::pre_liftoff)),
-            0xFFF1,
-            static_cast<uint8_t>(result_queue_overflow.load(
-                                     std::memory_order_relaxed) != 0
-                                     ? 0x80
-                                     : 0)};
+            0xFFF1, persistence_flags};
         (void)writeFrame(can, protocol::encode(power));
         if (!recovery_only) {
           const protocol::AttitudeTiltTelemetry tilt{
@@ -3369,6 +3385,16 @@ esp_err_t ProductionRuntime::start() {
   recovery_only_mode.store(recovery_only_, std::memory_order_release);
   recovery_wake_valid.store(recovery_wake_valid_, std::memory_order_release);
   if (!recovery_only_) {
+    recovery_boot::StartReadinessAudit readiness_audit{};
+    if (recovery_boot::loadStartReadinessAudit(readiness_audit)) {
+      std::printf(
+          "RTC preflight audit restored: forced=%u generation=%lu captured_us=%llu ready=0x%02X missing=0x%02X\n",
+          readiness_audit.forced ? 1U : 0U,
+          static_cast<unsigned long>(readiness_audit.generation),
+          static_cast<unsigned long long>(readiness_audit.captured_at_us),
+          static_cast<unsigned>(readiness_audit.ready_mask),
+          static_cast<unsigned>(readiness_audit.missing_mask));
+    }
     mission::ResetCheckpoint checkpoint{};
     if (recovery_boot::loadFlightCheckpoint(checkpoint)) {
       if (xSemaphoreTake(state_mutex, pdMS_TO_TICKS(2)) == pdTRUE) {

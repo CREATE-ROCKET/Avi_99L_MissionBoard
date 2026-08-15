@@ -45,6 +45,46 @@ struct ParachuteCheckpointRecord {
 };
 RTC_DATA_ATTR ParachuteCheckpointRecord parachute_checkpoint{};
 
+constexpr uint32_t kStartReadinessAuditMagic = 0x39395341;
+constexpr uint8_t kStartReadinessAuditVersion = 1;
+struct StartReadinessAuditRecord {
+  uint32_t magic{};
+  uint8_t version{};
+  uint8_t ready_mask{};
+  uint8_t missing_mask{};
+  bool forced{};
+  uint32_t generation{};
+  uint64_t captured_at_us{};
+  uint16_t checksum{};
+};
+RTC_DATA_ATTR StartReadinessAuditRecord start_readiness_audit{};
+
+uint16_t startReadinessAuditChecksum(
+    const StartReadinessAuditRecord &record) {
+  uint64_t value = record.magic ^
+                   (static_cast<uint32_t>(record.version) << 24U) ^
+                   (static_cast<uint32_t>(record.ready_mask) << 16U) ^
+                   (static_cast<uint32_t>(record.missing_mask) << 8U) ^
+                   record.generation ^ record.captured_at_us ^
+                   (record.captured_at_us >> 32U) ^
+                   (record.forced ? 0x5AA5U : 0xA55AU);
+  value ^= value >> 32U;
+  value ^= value >> 16U;
+  return static_cast<uint16_t>(value);
+}
+
+bool validStartReadinessAudit(const StartReadinessAuditRecord &record) {
+  const uint8_t masks = static_cast<uint8_t>(
+      (record.ready_mask | record.missing_mask) &
+      mission::kPreflightReadinessMask);
+  return record.magic == kStartReadinessAuditMagic &&
+         record.version == kStartReadinessAuditVersion &&
+         record.generation != 0 &&
+         masks == mission::kPreflightReadinessMask &&
+         (record.ready_mask & record.missing_mask) == 0 &&
+         record.checksum == startReadinessAuditChecksum(record);
+}
+
 uint16_t parachuteCheckpointChecksum(const ParachuteCheckpointRecord &record) {
   uint32_t value = record.magic ^
                    (static_cast<uint32_t>(record.version) << 24U) ^
@@ -103,6 +143,36 @@ bool resetPreservesRtcMemory() {
   return reason != ESP_RST_POWERON && reason != ESP_RST_DEEPSLEEP;
 }
 } // 無名名前空間
+
+bool loadStartReadinessAudit(StartReadinessAudit &audit) {
+  audit = {};
+  if (!resetPreservesRtcMemory() ||
+      !validStartReadinessAudit(start_readiness_audit))
+    return false;
+  audit.valid = true;
+  audit.forced = start_readiness_audit.forced;
+  audit.generation = start_readiness_audit.generation;
+  audit.captured_at_us = start_readiness_audit.captured_at_us;
+  audit.ready_mask = start_readiness_audit.ready_mask;
+  audit.missing_mask = start_readiness_audit.missing_mask;
+  return true;
+}
+
+void storeStartReadinessAudit(
+    const mission::PreflightReadinessSnapshot &readiness, bool forced) {
+  StartReadinessAuditRecord record{};
+  record.magic = kStartReadinessAuditMagic;
+  record.version = kStartReadinessAuditVersion;
+  record.ready_mask = readiness.readyMask();
+  record.missing_mask = readiness.missingMask();
+  record.forced = forced;
+  record.generation = readiness.generation;
+  record.captured_at_us = readiness.captured_at_us;
+  record.checksum = startReadinessAuditChecksum(record);
+  start_readiness_audit = record;
+}
+
+void clearStartReadinessAudit() { start_readiness_audit = {}; }
 
 bool markerValid() { return mission::validRecoveryMarker(recovery_marker); }
 bool wakeCauseValid() {
