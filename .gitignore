@@ -6,3 +6,4 @@
 data/bringup/
 sdkconfig.avi_99l_missionboard_bringup
 sdkconfig.avi_99l_missionboard_can_diag
+sdkconfig.avi_99l_missionboard_characterization

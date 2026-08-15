@@ -1,5 +1,11 @@
 #include <cstdio>
 
+#ifndef AVI_99L_CHARACTERIZATION
+#define AVI_99L_CHARACTERIZATION 0
+#endif
+
+#if !AVI_99L_CHARACTERIZATION
+
 #include "bringup/bringup_shell.hpp"
 #include "bringup/safe_outputs.hpp"
 #include "bringup/stream_protocol.hpp"
@@ -132,3 +138,5 @@ extern "C" void app_main() {
   vTaskDelete(nullptr);
 #endif
 }
+
+#endif

@@ -80,6 +80,9 @@ public:
   [[nodiscard]] esp_err_t getStatus(AS5047D::Status &status);
   [[nodiscard]] esp_err_t
   readAndClearErrorFlags(AS5047D::ErrorFlags &flags);
+  [[nodiscard]] AS5047D::ErrorFlags lastErrorFlags() const {
+    return encoder_.lastErrorFlags();
+  }
   [[nodiscard]] esp_err_t end();
 
   [[nodiscard]] esp_err_t test(SpiBringup &spi, EncoderTestResult &result);

@@ -121,6 +121,44 @@ python3 tools/capture_bringup.py --self-test
 
 project-local board manifestは`boards/avi_99l_missionboard.json`、partition tableは`partitions.csv`です。設定はESP32-S3、Flash 16 MiB、Octal PSRAM 8 MiB、QIO 80 MHzです。
 
+## FV / FH+ / FH− / M0 characterization
+
+実機data取得専用buildはproductionと別entry pointです。起動時は必ずmotor coast/disarmで、profileを自動開始しません。
+
+```sh
+pio run -e avi_99l_missionboard_characterization
+pio test -e native
+python3 tools/capture_characterization.py --self-test
+python3 tools/verify_characterization.py --self-test
+python3 tools/package_spica_characterization.py --self-test
+```
+
+対象board・portを確認し、人間がcharacterization firmwareのuploadを明示許可した場合に限り、専用environmentを指定します。
+
+```sh
+pio run -e avi_99l_missionboard_characterization -t upload \
+  --upload-port "$MISSION_PORT"
+```
+
+campaign順序、console command、M0のcold-power gate、abort条件、V5 wire contract、取得・検証・package手順は[docs/characterization_campaign.md](docs/characterization_campaign.md)を参照してください。1000 Hz fullは全stageで必須、2/5 kHzは先に静止rate-checkを行い、unsupportedの場合も理由と分母をraw logへ残します。
+
+2026-08-15時点では、搭載計器審査書のAS5048A/20 kHzと現行code・実機記録のAS5047D/30 kHzが衝突し、motor極性も未確定です。buildと非駆動確認はできますが、この衝突をoperatorが解消するまで`char arm`と`char run full`を実行してはいけません。upload、motor arm、stage変更、fin取り外しは自動化しません。
+
+drive gateの既定値はhardware approval `0`、command-to-fin sign `0`です。両方を実機確認済みの値へ明示設定しない限り、firmwareはarmを拒否します。
+
+raw `.bin`を検証してから、全stageのUART logとconditionsをまとめます。
+
+```sh
+python3 tools/verify_characterization.py capture.bin --integrity integrity.json
+python3 tools/package_spica_characterization.py captures \
+  "99l_characterization_<session-id>" \
+  --conditions conditions.json --operator-label "<operator-label>" \
+  --uart FV=FV_uart.log --uart FH_positive=FH_positive_uart.log \
+  --uart FH_negative=FH_negative_uart.log --uart M0=M0_uart.log --csv
+```
+
+binaryが正本で、CSVはlosslessな確認用です。validator/importerがrejectした値を手修正せず、writerまたはreaderの契約違反を直して新しいartifactを取得します。model fitとparameter採用は今回の範囲外です。
+
 ## port確認、upload、monitor
 
 `/dev/ttyACM<N>`の`N`を推測せず、接続のたびに候補とchipを確認します。以下の`MISSION_PORT`には、その場で確認したdevice pathを入力してください。
@@ -133,10 +171,22 @@ test -c "$MISSION_PORT"
 pio pkg exec -p tool-esptoolpy -c "esptool.py --chip esp32s3 --port $MISSION_PORT chip_id"
 ```
 
-確認後に同じ変数を使います。`upload_port`はrepositoryへ固定しません。
+確認後に同じ変数を使います。`upload_port`はrepositoryへ固定しません。次はproduction専用であり、characterization firmwareには使いません。
 
 ```sh
 pio run -t upload --upload-port "$MISSION_PORT"
+```
+
+次はhardware reviewとoperatorの明示許可後だけ使うcharacterization専用uploadです。
+
+```sh
+pio run -e avi_99l_missionboard_characterization -t upload \
+  --upload-port "$MISSION_PORT"
+```
+
+uploadしたenvironmentに対応するmonitorを開始します。
+
+```sh
 pio device monitor --port "$MISSION_PORT" --baud 115200 --eol LF
 ```
 
