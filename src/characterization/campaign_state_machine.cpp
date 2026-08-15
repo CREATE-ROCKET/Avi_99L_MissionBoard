@@ -42,6 +42,10 @@ bool CampaignStateMachine::validSessionId(
 
 void CampaignStateMachine::resetStageRuns() noexcept {
   rate_results_ = {};
+  // M0完了前だけCharacterizationRuntime側に旧3-slot resolved checkが残る。
+  // 5 kHzは新規取得対象外なので、M0ではlegacy slotを最初からunsupported扱いにする。
+  if (stage_ == AssemblyStage::M0)
+    rate_results_[2] = RateResult::Unsupported;
   full_completed_ = {};
   active_run_kind_ = RunKind::None;
 }
