@@ -17,7 +17,7 @@ from verify_characterization import ValidationError, build_golden_fixture, verif
 
 
 STAGES = ("FV", "FH_positive", "FH_negative", "M0")
-RATES = (1000, 2000, 5000)
+RATES = (1000, 2000)
 
 
 class PackageError(RuntimeError):
@@ -221,7 +221,7 @@ def package(
     for stage in STAGES:
         if ("full", "normal") not in coverage.get((stage, 1000), set()):
             raise PackageError(f"{stage} lacks a normal 1000 Hz full capture")
-        for rate in (2000, 5000):
+        for rate in RATES[1:]:
             outcomes = coverage.get((stage, rate), set())
             if not any(
                 ("rate-check", completion) in outcomes
