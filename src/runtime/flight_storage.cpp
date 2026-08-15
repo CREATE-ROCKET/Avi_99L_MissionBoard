@@ -16,6 +16,7 @@ namespace {
 
 constexpr char kMountPoint[] = "/sdcard";
 constexpr char kLatestFlightPath[] = "/sdcard/avi_99l_latest.bin";
+constexpr char kRawFlashExportPath[] = "/sdcard/avi_99l_flash_raw.bin";
 constexpr auto kFlightLogSubtype = static_cast<esp_partition_subtype_t>(0x40);
 constexpr uint32_t kMinimumFlightLogBytes = 2U * 1024U * 1024U;
 
@@ -42,6 +43,7 @@ esp_err_t InternalFlashLog::prepareForFlight() {
   if (erased != ESP_OK)
     return erased;
   write_offset_ = 0;
+  has_data_ = false;
   return ESP_OK;
 }
 
@@ -50,6 +52,8 @@ esp_err_t InternalFlashLog::openExisting() {
   if (locate != ESP_OK)
     return locate;
   write_offset_ = 0;
+  has_data_ = false;
+  bool valid_prefix = true;
   for (uint32_t block_offset = 0; block_offset < partition_->size;
        block_offset += static_cast<uint32_t>(scan_buffer_.size())) {
     const std::size_t block_size = std::min<std::size_t>(
@@ -58,14 +62,23 @@ esp_err_t InternalFlashLog::openExisting() {
                                               scan_buffer_.data(), block_size);
     if (read != ESP_OK)
       return read;
+    has_data_ = has_data_ ||
+                std::any_of(scan_buffer_.begin(),
+                            scan_buffer_.begin() + block_size,
+                            [](uint8_t value) { return value != 0xFFU; });
+    if (!valid_prefix)
+      continue;
     for (std::size_t local = 0;
          local + flight_log::kSerializedRecordBytes <= block_size;
          local += flight_log::kSerializedRecordBytes) {
       flight_log::SerializedRecord record{};
       std::memcpy(record.data(), scan_buffer_.data() + local, record.size());
-      if (flight_log::erased(record) || !flight_log::validate(record))
-        return ESP_OK;
-      write_offset_ = block_offset + static_cast<uint32_t>(local + record.size());
+      if (flight_log::erased(record) || !flight_log::validate(record)) {
+        valid_prefix = false;
+        break;
+      }
+      write_offset_ =
+          block_offset + static_cast<uint32_t>(local + record.size());
     }
   }
   return ESP_OK;
@@ -82,8 +95,10 @@ InternalFlashLog::append(const flight_log::SerializedRecord &record) {
     return ESP_ERR_NO_MEM;
   const esp_err_t written =
       esp_partition_write(partition_, write_offset_, record.data(), record.size());
-  if (written == ESP_OK)
+  if (written == ESP_OK) {
     write_offset_ += static_cast<uint32_t>(record.size());
+    has_data_ = true;
+  }
   return written;
 }
 
@@ -103,6 +118,22 @@ esp_err_t InternalFlashLog::read(uint32_t offset, uint8_t *destination,
   return result;
 }
 
+esp_err_t InternalFlashLog::readRaw(uint32_t offset, uint8_t *destination,
+                                    std::size_t requested,
+                                    std::size_t &read_size) const {
+  read_size = 0;
+  if (partition_ == nullptr || destination == nullptr)
+    return ESP_ERR_INVALID_STATE;
+  if (requested == 0 || offset >= partition_->size)
+    return ESP_OK;
+  read_size = std::min<std::size_t>(requested, partition_->size - offset);
+  const esp_err_t result =
+      esp_partition_read(partition_, offset, destination, read_size);
+  if (result != ESP_OK)
+    read_size = 0;
+  return result;
+}
+
 esp_err_t InternalFlashLog::erase() {
   if (partition_ == nullptr) {
     const esp_err_t locate = locatePartition();
@@ -111,8 +142,10 @@ esp_err_t InternalFlashLog::erase() {
   }
   const esp_err_t result =
       esp_partition_erase_range(partition_, 0, partition_->size);
-  if (result == ESP_OK)
+  if (result == ESP_OK) {
     write_offset_ = 0;
+    has_data_ = false;
+  }
   return result;
 }
 
@@ -233,6 +266,67 @@ esp_err_t SdFlightLog::read(uint32_t offset, uint8_t *destination,
     return ESP_FAIL;
   }
   return ESP_OK;
+}
+
+esp_err_t SdFlightLog::exportRawFlashAndErase(InternalFlashLog &flash) {
+  if (!mounted_ || !flash.ready() || flash.capacity() == 0)
+    return ESP_ERR_INVALID_STATE;
+  if (writable_ && flush() != ESP_OK)
+    return ESP_FAIL;
+
+  FILE *raw = std::fopen(kRawFlashExportPath, "wb+");
+  if (raw == nullptr)
+    return ESP_FAIL;
+  auto closeWith = [&](esp_err_t result) {
+    if (std::fclose(raw) != 0 && result == ESP_OK)
+      return ESP_FAIL;
+    return result;
+  };
+
+  std::array<uint8_t, 4096> flash_bytes{};
+  std::array<uint8_t, 4096> sd_bytes{};
+  const uint32_t capacity = flash.capacity();
+  for (uint32_t offset = 0; offset < capacity;) {
+    const std::size_t requested =
+        std::min<std::size_t>(flash_bytes.size(), capacity - offset);
+    std::size_t read_size = 0;
+    const esp_err_t read =
+        flash.readRaw(offset, flash_bytes.data(), requested, read_size);
+    if (read != ESP_OK || read_size != requested)
+      return closeWith(read == ESP_OK ? ESP_FAIL : read);
+    if (std::fwrite(flash_bytes.data(), 1, read_size, raw) != read_size)
+      return closeWith(ESP_FAIL);
+    offset += static_cast<uint32_t>(read_size);
+  }
+  if (std::fflush(raw) != 0 || ::fsync(::fileno(raw)) != 0)
+    return closeWith(ESP_FAIL);
+  if (std::fseek(raw, 0, SEEK_END) != 0)
+    return closeWith(ESP_FAIL);
+  const long raw_size = std::ftell(raw);
+  if (raw_size < 0 || static_cast<uint32_t>(raw_size) != capacity)
+    return closeWith(ESP_ERR_INVALID_SIZE);
+  if (std::fseek(raw, 0, SEEK_SET) != 0)
+    return closeWith(ESP_FAIL);
+
+  for (uint32_t offset = 0; offset < capacity;) {
+    const std::size_t requested =
+        std::min<std::size_t>(flash_bytes.size(), capacity - offset);
+    if (std::fread(sd_bytes.data(), 1, requested, raw) != requested)
+      return closeWith(ESP_FAIL);
+    std::size_t read_size = 0;
+    const esp_err_t read =
+        flash.readRaw(offset, flash_bytes.data(), requested, read_size);
+    if (read != ESP_OK || read_size != requested)
+      return closeWith(read == ESP_OK ? ESP_FAIL : read);
+    if (!std::equal(sd_bytes.begin(), sd_bytes.begin() + requested,
+                    flash_bytes.begin()))
+      return closeWith(ESP_ERR_INVALID_CRC);
+    offset += static_cast<uint32_t>(requested);
+  }
+
+  if (std::fclose(raw) != 0)
+    return ESP_FAIL;
+  return flash.erase();
 }
 
 void SdFlightLog::close() {

@@ -69,9 +69,13 @@ inline constexpr AirDataConfig kAirData{
 #elif AVI_99L_MOTOR_PROFILE_ID == 1
 inline constexpr const board::MotorProfile &kActiveFlightMotorProfile =
     board::kFlightMotorA;
+inline constexpr bool kActiveFlightMotorProfileQualified =
+    board::kFlightMotorAFlightQualified;
 #elif AVI_99L_MOTOR_PROFILE_ID == 2
 inline constexpr const board::MotorProfile &kActiveFlightMotorProfile =
     board::kSpareMotorB;
+inline constexpr bool kActiveFlightMotorProfileQualified =
+    board::kSpareMotorBFlightQualified;
 #else
 #error "AVI_99L_MOTOR_PROFILE_ID must be 1 or 2"
 #endif
@@ -84,8 +88,9 @@ inline constexpr double kMotorBusVoltageV = 9.0;
 // silent clampされるため、専用buildだけdriver上限を35%へ広げる。
 inline constexpr double kProductionMotorMaximumDuty = 0.35;
 #else
-// TODO(HW_TEST): 初期HILではbring-upと同じ15%へ制限し、実機同定後に確定する。
-inline constexpr double kProductionMotorMaximumDuty = 0.15;
+// productionではTorqueMapperのcurrent/torque/angle制限を維持したまま、
+// PWM dutyだけを追加clampせず100%まで許可する。
+inline constexpr double kProductionMotorMaximumDuty = 1.0;
 #endif
 
 // TODO(SIMULATION): Spicaの同定結果から60～180 m/sのgain tableへ置換する。
@@ -102,7 +107,8 @@ inline constexpr control::RollGainSchedule kRollGainSchedule{
 
 [[nodiscard]] inline bool motorProfileValid() {
   return kActiveFlightMotorProfile.parameters_valid &&
-         kActiveFlightMotorProfile.polarity != board::MotorPolarity::unconfigured;
+         kActiveFlightMotorProfile.polarity != board::MotorPolarity::unconfigured &&
+         kActiveFlightMotorProfileQualified;
 }
 
 [[nodiscard]] inline bool nonBypassFlightConfigurationReady() {

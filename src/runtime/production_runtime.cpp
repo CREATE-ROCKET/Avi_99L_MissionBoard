@@ -193,6 +193,10 @@ struct RecoveryDumpCursor {
   uint8_t sequence{};
 };
 
+struct StorageExportRequest {
+  uint8_t transaction_id{};
+};
+
 struct TimeState {
   protocol::TimeSource source{protocol::TimeSource::invalid};
   uint32_t unix_seconds{};
@@ -239,6 +243,7 @@ StaticQueue_t recovery_queue_storage;
 StaticQueue_t recovery_status_queue_storage;
 StaticQueue_t recovery_log_data_queue_storage;
 StaticQueue_t sd_recovery_queue_storage;
+StaticQueue_t storage_export_queue_storage;
 StaticQueue_t flash_log_queue_storage;
 StaticQueue_t sd_log_queue_storage;
 StaticQueue_t event_queue_storage;
@@ -269,6 +274,8 @@ std::array<uint8_t, sizeof(protocol::RecoveryLogData) * 16>
     recovery_log_data_queue_buffer{};
 std::array<uint8_t, sizeof(protocol::RecoveryControl) * 4>
     sd_recovery_queue_buffer{};
+std::array<uint8_t, sizeof(StorageExportRequest) * 2>
+    storage_export_queue_buffer{};
 std::array<uint8_t, sizeof(flight_log::SerializedRecord) * 32>
     flash_log_queue_buffer{};
 std::array<uint8_t, sizeof(flight_log::SerializedRecord) * 64>
@@ -291,6 +298,7 @@ QueueHandle_t recovery_queue{};
 QueueHandle_t recovery_status_queue{};
 QueueHandle_t recovery_log_data_queue{};
 QueueHandle_t sd_recovery_queue{};
+QueueHandle_t storage_export_queue{};
 QueueHandle_t flash_log_queue{};
 QueueHandle_t sd_log_queue{};
 QueueHandle_t event_queue{};
@@ -340,6 +348,8 @@ std::atomic<bool> recovery_mode_command_sent{false};
 std::atomic<uint8_t> recovery_mode_reason{static_cast<uint8_t>(
     protocol::RecoveryModeReason::auto_elapsed_120)};
 std::atomic<uint32_t> pressure_deployment_epoch{};
+std::atomic<uint32_t> preflight_calibration_generation{};
+std::atomic<bool> preflight_calibration_active{false};
 TimeState time_state;
 SemaphoreHandle_t time_mutex{};
 StaticSemaphore_t time_mutex_storage;
@@ -1585,6 +1595,20 @@ void missionRealtimeTask(void *) {
   uint32_t attitude_epoch = 0;
   bool fin_angle_available = false;
   bool fin_zero_available = false;
+  enum class CommandFinMode : uint8_t {
+    free,
+    zero_hold,
+    position_hold,
+    relative_move,
+  };
+  CommandFinMode command_fin_mode = CommandFinMode::free;
+  double command_fin_target_rad = 0.0;
+  struct PendingFinMove {
+    bool active{};
+    uint8_t transaction_id{};
+    uint64_t deadline_us{};
+    double target_rad{};
+  } pending_fin_move;
   double previous_wrapped_fin_rad = 0.0;
   double unwrapped_fin_rad = 0.0;
   double fin_zero_reference_rad = 0.0;
@@ -1691,6 +1715,8 @@ void missionRealtimeTask(void *) {
         enqueueResult(decision.result, true);
         if (decision.execute) {
           actuator_output_inhibited.store(true, std::memory_order_release);
+          pending_fin_move = {};
+          command_fin_mode = CommandFinMode::free;
           (void)motor_driver.coast();
           // ActuatorEmergencyはmotor/ParaをFreeにするcommandであり、
           // 差圧系のGPIO40までpower cycleしない。
@@ -1818,6 +1844,84 @@ void missionRealtimeTask(void *) {
         }
       } else if (code == mission::CommandCode::disable_fin_control) {
         transition = state_machine.disableFinControl();
+      } else if (code == mission::CommandCode::fin_free) {
+        pending_fin_move = {};
+        command_fin_mode = CommandFinMode::free;
+        actuator_output_inhibited.store(false, std::memory_order_release);
+        transition = mission::TransitionResult::completed;
+      } else if (code == mission::CommandCode::set_fin_zero) {
+        if (!encoder_ready.load(std::memory_order_acquire) ||
+            !fin_angle_available) {
+          direct_reason = protocol::CommandReason::device_unavailable;
+        } else {
+          fin_zero_reference_rad = unwrapped_fin_rad;
+          fin_zero_available = true;
+          fin_angle_rad = 0.0;
+          fin_zero_configured.store(true, std::memory_order_release);
+          fin_zero_hold_valid.store(false, std::memory_order_release);
+          zero_hold_controller.resetValidity();
+          pending_fin_move = {};
+          command_fin_mode = CommandFinMode::free;
+          actuator_output_inhibited.store(false, std::memory_order_release);
+          transition = mission::TransitionResult::completed;
+        }
+      } else if (code == mission::CommandCode::start_fin_zero_hold) {
+        const bool usable =
+            fin_zero_available &&
+            fin_zero_configured.load(std::memory_order_acquire) &&
+            encoder_ready.load(std::memory_order_acquire) && fin_rate_valid &&
+            motor_ready.load(std::memory_order_acquire) &&
+            std::isfinite(fin_angle_rad) && std::isfinite(fin_rate_rad_s);
+        if (!fin_zero_available ||
+            !fin_zero_configured.load(std::memory_order_acquire)) {
+          direct_reason = protocol::CommandReason::not_configured;
+        } else if (!usable) {
+          direct_reason = protocol::CommandReason::device_unavailable;
+        } else {
+          pending_fin_move = {};
+          command_fin_target_rad = 0.0;
+          command_fin_mode = CommandFinMode::zero_hold;
+          actuator_output_inhibited.store(false, std::memory_order_release);
+          transition = mission::TransitionResult::completed;
+        }
+      } else if (code == mission::CommandCode::fin_move_relative) {
+        const bool usable =
+            fin_zero_available &&
+            fin_zero_configured.load(std::memory_order_acquire) &&
+            encoder_ready.load(std::memory_order_acquire) && fin_rate_valid &&
+            motor_ready.load(std::memory_order_acquire) &&
+            std::isfinite(fin_angle_rad) && std::isfinite(fin_rate_rad_s);
+        if (!fin_zero_available ||
+            !fin_zero_configured.load(std::memory_order_acquire)) {
+          direct_reason = protocol::CommandReason::not_configured;
+        } else if (!usable) {
+          direct_reason = protocol::CommandReason::device_unavailable;
+        } else {
+          const uint16_t raw =
+              static_cast<uint16_t>(command_envelope.request.arguments[0]) |
+              static_cast<uint16_t>(command_envelope.request.arguments[1]) << 8U;
+          const auto deci_degrees = static_cast<int16_t>(raw);
+          constexpr double kDeciDegreeToRad =
+              0.0017453292519943296;
+          const double target =
+              fin_angle_rad + static_cast<double>(deci_degrees) *
+                                  kDeciDegreeToRad;
+          if (!board::kFinSoftwareLimits.configured ||
+              target < board::kFinSoftwareLimits.minimum_rad ||
+              target > board::kFinSoftwareLimits.maximum_rad) {
+            direct_reason = protocol::CommandReason::invalid_argument;
+          } else {
+            command_fin_target_rad = target;
+            command_fin_mode = CommandFinMode::relative_move;
+            pending_fin_move =
+                {true, command_envelope.request.transaction_id,
+                 static_cast<uint64_t>(esp_timer_get_time()) + 10'000'000,
+                 target};
+            actuator_output_inhibited.store(false,
+                                             std::memory_order_release);
+            asynchronous_transition = true;
+          }
+        }
       } else if (code == mission::CommandCode::enter_recovery) {
         if (before_transition.state != protocol::MissionState::descent) {
           direct_reason = protocol::CommandReason::invalid_state;
@@ -1888,6 +1992,19 @@ void missionRealtimeTask(void *) {
           // 最新attemptだけを有効にする。途中失敗時に古い値へrollbackしない。
           preflight_gyro_bias_valid = false;
           gravity_reference_valid = false;
+          latest_air_data.ssc_zero_valid = false;
+          latest_air_data.airspeed_valid = false;
+          uint32_t next_generation =
+              preflight_calibration_generation.fetch_add(
+                  1, std::memory_order_acq_rel) +
+              1;
+          if (next_generation == 0) {
+            next_generation = 1;
+            preflight_calibration_generation.store(
+                next_generation, std::memory_order_release);
+          }
+          preflight_calibration_active.store(true,
+                                             std::memory_order_release);
           asynchronous_transition = true;
         } else {
           direct_reason = protocol::CommandReason::busy;
@@ -2054,6 +2171,7 @@ void missionRealtimeTask(void *) {
         const double norm = std::sqrt(x * x + y * y + z * z);
         gravity_reference_valid = std::isfinite(norm) && norm >= 0.8 && norm <= 1.2;
       }
+      preflight_calibration_active.store(false, std::memory_order_release);
       uint32_t detail = 0;
       if (!preflight_gyro_bias_valid)
         detail |= 1U << 4U;
@@ -2125,14 +2243,8 @@ void missionRealtimeTask(void *) {
           unwrapped_fin_rad += delta;
         }
         previous_wrapped_fin_rad = wrapped;
-        if (!fin_zero_available) {
-          // TODO(HW_TEST): 起動時の物理直進位置を0 degとみなす暫定zeroを、
-          // NVS値または明示calibrationへ置換する。
-          fin_zero_reference_rad = unwrapped_fin_rad;
-          fin_zero_available = true;
-          fin_zero_configured.store(true, std::memory_order_release);
-        }
-        fin_angle_rad = unwrapped_fin_rad - fin_zero_reference_rad;
+        if (fin_zero_available)
+          fin_angle_rad = unwrapped_fin_rad - fin_zero_reference_rad;
         fin_rate_valid = fin_velocity.update(sample.host_timestamp_us,
                                              fin_angle_rad,
                                              fin_rate_rad_s);
@@ -2149,6 +2261,34 @@ void missionRealtimeTask(void *) {
     const bool zero_hold_valid = zero_hold_controller.updateValidity(
         fin_angle_rad, fin_rate_rad_s, fin_sample_valid);
     fin_zero_hold_valid.store(zero_hold_valid, std::memory_order_release);
+
+    if (pending_fin_move.active) {
+      constexpr double kMoveToleranceRad = 0.008726646259971648;
+      constexpr double kMoveRateToleranceRadS = 0.03490658503988659;
+      const uint64_t now_us = static_cast<uint64_t>(esp_timer_get_time());
+      const bool reached =
+          fin_sample_valid &&
+          std::abs(fin_angle_rad - pending_fin_move.target_rad) <=
+              kMoveToleranceRad &&
+          std::abs(fin_rate_rad_s) <= kMoveRateToleranceRadS;
+      const bool timed_out = now_us >= pending_fin_move.deadline_us;
+      if (reached)
+        command_fin_mode = CommandFinMode::position_hold;
+      else if (timed_out)
+        command_fin_mode = CommandFinMode::free;
+      if ((reached || timed_out) &&
+          xSemaphoreTake(executor_mutex, 0) == pdTRUE) {
+        const auto result = command_executor.finish(
+            pending_fin_move.transaction_id,
+            reached ? protocol::CommandPhase::completed
+                    : protocol::CommandPhase::failed,
+            reached ? protocol::CommandReason::none
+                    : protocol::CommandReason::timeout);
+        xSemaphoreGive(executor_mutex);
+        enqueueResult(result, false);
+        pending_fin_move = {};
+      }
+    }
 
     AirDataSnapshot air_data{};
     if (xQueueReceive(air_data_queue, &air_data, 0) == pdTRUE) {
@@ -2285,12 +2425,32 @@ void missionRealtimeTask(void *) {
     esp_err_t motor_output_result = ESP_OK;
     bool motor_output_coasting = false;
     bool motor_output_braking = false;
-    if (output_inhibited ||
-        mission_snapshot.state == protocol::MissionState::command_receive) {
+    if (output_inhibited) {
       motor_output_result = motor_driver.coast();
       motor_output_coasting = true;
       if (mission_snapshot.reset_invalidated)
         torque_error = protocol::quantization::TorqueError::reset_invalidated;
+    } else if (mission_snapshot.state ==
+               protocol::MissionState::command_receive) {
+      if (command_fin_mode == CommandFinMode::free) {
+        motor_output_result = motor_driver.coast();
+        motor_output_coasting = true;
+      } else if (!motor_ready.load(std::memory_order_acquire) ||
+                 !motor_driver.initialized() || !fin_sample_valid) {
+        motor_output_result = motor_driver.brake();
+        motor_output_braking = true;
+        torque_error =
+            protocol::quantization::TorqueError::controller_input_invalid;
+      } else {
+        const double target =
+            command_fin_mode == CommandFinMode::zero_hold
+                ? 0.0
+                : command_fin_target_rad;
+        const auto request = zero_hold_controller.compute(
+            fin_angle_rad - target, fin_rate_rad_s);
+        motor_output_result = applyTorque(request);
+        motor_output_braking = !request.valid || !motor_command.valid;
+      }
     } else if (!motor_ready.load(std::memory_order_acquire) ||
                !motor_driver.initialized()) {
       motor_output_result = motor_driver.coast();
@@ -2350,6 +2510,15 @@ void missionRealtimeTask(void *) {
       status.fin_mode = protocol::FinMode::free;
     else if (motor_output_braking)
       status.fin_mode = protocol::FinMode::brake;
+    else if (mission_snapshot.state ==
+             protocol::MissionState::command_receive) {
+      if (command_fin_mode == CommandFinMode::zero_hold)
+        status.fin_mode = protocol::FinMode::zero_hold;
+      else if (command_fin_mode == CommandFinMode::position_hold)
+        status.fin_mode = protocol::FinMode::position_hold;
+      else if (command_fin_mode == CommandFinMode::relative_move)
+        status.fin_mode = protocol::FinMode::relative_move;
+    }
 
     const bool encoder_alive = encoder_ready.load(std::memory_order_acquire);
     constexpr double kRadiansToDegrees = 57.29577951308232;
@@ -2687,6 +2856,7 @@ void airDataTask(void *) {
   mission::MissionSnapshot mission_snapshot{};
   uint64_t last_ssc_us = 0;
   uint64_t last_lps_us = 0;
+  uint32_t calibration_generation = 0;
 
   auto updateMissionSnapshot = [&]() {
     if (xSemaphoreTake(state_mutex, 0) == pdTRUE) {
@@ -2726,6 +2896,17 @@ void airDataTask(void *) {
 
   for (;;) {
     const uint64_t now_us = static_cast<uint64_t>(esp_timer_get_time());
+    const bool calibration_active =
+        preflight_calibration_active.load(std::memory_order_acquire);
+    const uint32_t requested_generation =
+        preflight_calibration_generation.load(std::memory_order_acquire);
+    if (calibration_active && requested_generation != 0 &&
+        requested_generation != calibration_generation) {
+      pressure_conditioner.reset();
+      snapshot.ssc_zero_valid = false;
+      snapshot.airspeed_valid = false;
+      calibration_generation = requested_generation;
+    }
     if (now_us - last_ssc_us >= 2'500) {
       last_ssc_us = now_us;
       updateMissionSnapshot();
@@ -2736,12 +2917,13 @@ void airDataTask(void *) {
           snapshot.ssc_monotonic_us = now_us;
           snapshot.ssc_valid = true;
           snapshot.ssc_temperature_celsius = data.temperature_celsius;
-          // TODO(HW_TEST): 静止・無風のCommandReceive起動約1秒をzero取得に
-          // 使用する暫定実装を、明示PreflightCalibrationへ置換する。
+          const bool capture_zero =
+              preflight_calibration_active.load(std::memory_order_acquire) &&
+              calibration_generation != 0 &&
+              preflight_calibration_generation.load(
+                  std::memory_order_acquire) == calibration_generation;
           (void)pressure_conditioner.updateZero(
-              data.differential_pressure_pa,
-              mission_snapshot.state ==
-                  protocol::MissionState::command_receive);
+              data.differential_pressure_pa, capture_zero);
           snapshot.ssc_zero_valid = pressure_conditioner.zeroValid();
           snapshot.airspeed_valid = false;
 
@@ -3233,14 +3415,14 @@ void commandWorkerTask(void *) {
           parachute_config_load_complete.load(std::memory_order_acquire);
       context.persistence_runtime_available =
           parachute_persistence_ready.load(std::memory_order_acquire);
-      context.fin_available =
-          encoder_ready.load(std::memory_order_acquire) &&
-          motor_ready.load(std::memory_order_acquire) &&
-          fin_zero_configured.load(std::memory_order_acquire);
+      // FinFree/SetFinZeroはmotor/zero未準備でも意味を持つため、
+      // 個別device gateはMissionRealtimeTaskで判定する。
+      context.fin_available = true;
       // 入口ではSTS接続状態ではなく、owner taskへの経路だけを判定する。
       context.parachute_available = parachute_command_queue != nullptr;
-      context.fin_safe_commands_supported = false;
+      context.fin_safe_commands_supported = true;
       context.calibration_supported = true;
+      context.storage_export_supported = storage_export_queue != nullptr;
       if (xSemaphoreTake(executor_mutex, pdMS_TO_TICKS(2)) != pdTRUE) {
         const protocol::CommandResult busy{
             envelope.request.transaction_id, envelope.request.command,
@@ -3253,21 +3435,25 @@ void commandWorkerTask(void *) {
       envelope.decision = command_executor.begin(envelope.request, context);
       xSemaphoreGive(executor_mutex);
       enqueueResult(envelope.decision.result, false);
-      QueueHandle_t destination = transition_queue;
       ParachuteCommandRequest parachute_command{};
       const bool parachute_domain =
           envelope.decision.domain == mission::CommandDomain::parachute;
-      if (parachute_domain) {
+      const bool storage_domain =
+          envelope.decision.domain == mission::CommandDomain::storage;
+      if (parachute_domain)
         parachute_command = {ParachuteCommandRequest::Kind::generic,
                              envelope.request, {}};
-        destination = parachute_command_queue;
+      const StorageExportRequest storage_request{
+          envelope.request.transaction_id};
+      BaseType_t queued = pdTRUE;
+      if (envelope.decision.execute) {
+        if (parachute_domain)
+          queued = xQueueSend(parachute_command_queue, &parachute_command, 0);
+        else if (storage_domain)
+          queued = xQueueSend(storage_export_queue, &storage_request, 0);
+        else
+          queued = xQueueSend(transition_queue, &envelope, 0);
       }
-      const BaseType_t queued =
-          !envelope.decision.execute
-              ? pdTRUE
-              : (parachute_domain
-                     ? xQueueSend(destination, &parachute_command, 0)
-                     : xQueueSend(destination, &envelope, 0));
       if (envelope.decision.execute && queued != pdTRUE) {
         if (xSemaphoreTake(executor_mutex, pdMS_TO_TICKS(2)) == pdTRUE) {
           const auto failed = command_executor.finish(
@@ -3420,12 +3606,10 @@ void internalFlashTask(void *) {
   addWatchdog();
   ParachutePersistenceResponse load_response{};
   load_response.kind = ParachutePersistenceResponse::Kind::load;
-  const bool recovery_boot_mode =
-      recovery_only_mode.load(std::memory_order_acquire);
-  const esp_err_t flash_log_result =
-      recovery_boot_mode ? internal_flash_log.openExisting()
-                         : internal_flash_log.prepareForFlight();
-  flash_log_ready.store(flash_log_result == ESP_OK, std::memory_order_release);
+  const esp_err_t flash_log_result = internal_flash_log.openExisting();
+  flash_log_ready.store(
+      flash_log_result == ESP_OK && !internal_flash_log.hasData(),
+      std::memory_order_release);
   if (flash_log_result != ESP_OK) {
     flash_log_failed.store(true, std::memory_order_release);
     enqueueEvent(protocol::eventFlag(
@@ -3745,6 +3929,35 @@ void sdLogTask(void *) {
 
   RecoveryDumpCursor sd_dump{};
   for (;;) {
+    StorageExportRequest export_request{};
+    while (xQueueReceive(storage_export_queue, &export_request, 0) == pdTRUE) {
+      protocol::CommandReason reason = protocol::CommandReason::none;
+      esp_err_t export_result = ESP_ERR_INVALID_STATE;
+      if (!sd_flight_log.ready() || !internal_flash_log.ready()) {
+        reason = protocol::CommandReason::device_unavailable;
+      } else {
+        export_result =
+            sd_flight_log.exportRawFlashAndErase(internal_flash_log);
+        if (export_result != ESP_OK)
+          reason = protocol::CommandReason::persistence_error;
+      }
+      if (reason == protocol::CommandReason::none)
+        flash_log_ready.store(true, std::memory_order_release);
+      if (xSemaphoreTake(executor_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        const auto result = command_executor.finish(
+            export_request.transaction_id,
+            reason == protocol::CommandReason::none
+                ? protocol::CommandPhase::completed
+                : protocol::CommandPhase::failed,
+            reason, static_cast<uint32_t>(export_result));
+        xSemaphoreGive(executor_mutex);
+        enqueueResult(result, false);
+      } else {
+        (void)xQueueSendToFront(storage_export_queue, &export_request, 0);
+        break;
+      }
+    }
+
     flight_log::SerializedRecord record{};
     while (xQueueReceive(sd_log_queue, &record, 0) == pdTRUE) {
       if (sd_flight_log.append(record) != ESP_OK) {
@@ -3912,6 +4125,9 @@ esp_err_t ProductionRuntime::start() {
   sd_recovery_queue = xQueueCreateStatic(
       4, sizeof(protocol::RecoveryControl), sd_recovery_queue_buffer.data(),
       &sd_recovery_queue_storage);
+  storage_export_queue = xQueueCreateStatic(
+      2, sizeof(StorageExportRequest), storage_export_queue_buffer.data(),
+      &storage_export_queue_storage);
   flash_log_queue = xQueueCreateStatic(
       32, sizeof(flight_log::SerializedRecord), flash_log_queue_buffer.data(),
       &flash_log_queue_storage);
@@ -3937,7 +4153,8 @@ esp_err_t ProductionRuntime::start() {
       air_data_queue == nullptr ||
       recovery_queue == nullptr || recovery_status_queue == nullptr ||
       recovery_log_data_queue == nullptr || sd_recovery_queue == nullptr ||
-      flash_log_queue == nullptr || sd_log_queue == nullptr ||
+      storage_export_queue == nullptr || flash_log_queue == nullptr ||
+      sd_log_queue == nullptr ||
       event_queue == nullptr || persistence_queue == nullptr ||
       state_mutex == nullptr || executor_mutex == nullptr ||
       time_mutex == nullptr) {

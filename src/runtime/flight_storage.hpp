@@ -20,14 +20,22 @@ public:
   [[nodiscard]] esp_err_t read(uint32_t offset, uint8_t *destination,
                                std::size_t requested,
                                std::size_t &read_size) const;
+  [[nodiscard]] esp_err_t readRaw(uint32_t offset, uint8_t *destination,
+                                  std::size_t requested,
+                                  std::size_t &read_size) const;
   [[nodiscard]] esp_err_t erase();
   [[nodiscard]] uint32_t size() const { return write_offset_; }
+  [[nodiscard]] uint32_t capacity() const {
+    return partition_ == nullptr ? 0U : partition_->size;
+  }
   [[nodiscard]] bool ready() const { return partition_ != nullptr; }
+  [[nodiscard]] bool hasData() const { return has_data_; }
 
 private:
   [[nodiscard]] esp_err_t locatePartition();
   const esp_partition_t *partition_{};
   uint32_t write_offset_{};
+  bool has_data_{};
   std::array<uint8_t, 4096> scan_buffer_{};
 };
 
@@ -41,6 +49,7 @@ public:
   [[nodiscard]] esp_err_t read(uint32_t offset, uint8_t *destination,
                                std::size_t requested,
                                std::size_t &read_size);
+  [[nodiscard]] esp_err_t exportRawFlashAndErase(InternalFlashLog &flash);
   [[nodiscard]] uint32_t size() const { return file_size_; }
   [[nodiscard]] bool ready() const { return file_ != nullptr; }
   [[nodiscard]] bool writable() const { return writable_; }
