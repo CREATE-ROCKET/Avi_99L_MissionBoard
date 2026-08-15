@@ -2502,7 +2502,7 @@ void missionRealtimeTask(void *) {
       const auto serialized = flight_log::serialize(log_sample);
       if (xQueueSend(sd_log_queue, &serialized, 0) != pdTRUE)
         sd_log_drop_count.fetch_add(1, std::memory_order_relaxed);
-      if (++flash_decimation >= 10U) {
+      if (++flash_decimation >= 20U) {
         flash_decimation = 0;
         if (xQueueSend(flash_log_queue, &serialized, 0) != pdTRUE)
           flash_log_drop_count.fetch_add(1, std::memory_order_relaxed);
