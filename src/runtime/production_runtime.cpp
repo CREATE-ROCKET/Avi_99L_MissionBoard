@@ -321,6 +321,9 @@ std::atomic<bool> fin_zero_configured{false};
 std::atomic<bool> lps_ready{false};
 std::atomic<bool> ssc_ready{false};
 std::atomic<bool> sts_ready{false};
+std::atomic<uint8_t> parachute_angle_raw{
+    static_cast<uint8_t>(
+        protocol::quantization::ParachuteAngleError::unavailable)};
 // SafetyTaskがGPIO44へ最後に正常適用したPara電源状態。
 // queue投入完了と物理GPIO適用完了を同一視しない。
 std::atomic<bool> parachute_power_applied{false};
@@ -378,10 +381,27 @@ void addWatchdog() {
 void resetWatchdog() { (void)esp_task_wdt_reset(); }
 
 esp_err_t setTrackedParaPower(bool enabled) {
+  const bool was_applied =
+      parachute_power_applied.load(std::memory_order_acquire);
   const esp_err_t result = bringup::safe_outputs::setParaPower(enabled);
   // OFF失敗時もUART ownerは安全側に倒して「給電済み」と扱わない。
   parachute_power_applied.store(result == ESP_OK && enabled,
                                 std::memory_order_release);
+  if (result != ESP_OK) {
+    parachute_angle_raw.store(
+        static_cast<uint8_t>(protocol::quantization::ParachuteAngleError::unknown),
+        std::memory_order_release);
+  } else if (!enabled) {
+    parachute_angle_raw.store(
+        static_cast<uint8_t>(
+            protocol::quantization::ParachuteAngleError::powered_off),
+        std::memory_order_release);
+  } else if (!was_applied) {
+    parachute_angle_raw.store(
+        static_cast<uint8_t>(
+            protocol::quantization::ParachuteAngleError::not_initialized),
+        std::memory_order_release);
+  }
   return result;
 }
 
@@ -644,6 +664,8 @@ void parachuteTask(void *) {
   uint64_t next_initialization_attempt_us = 0;
   uint64_t next_power_request_us = 0;
   uint64_t open_requested_at_us = 0;
+  uint64_t last_position_read_attempt_us = 0;
+  uint64_t last_position_valid_us = 0;
   bool power_enabled = false;
   bool mode_prepared = false;
   bool controller_started = false;
@@ -655,6 +677,9 @@ void parachuteTask(void *) {
   constexpr uint32_t kDetailConfigurationLoad = 3;
   constexpr uint32_t kDetailQueueUnavailable = 4;
   constexpr uint32_t kDetailCurrentOpenHalfTurn = 5;
+  constexpr uint64_t kPositionTelemetryPollIntervalUs = 500'000;
+  constexpr uint64_t kPositionTelemetryStaleUs =
+      2 * kPositionTelemetryPollIntervalUs;
   const int16_t target_tolerance_count = static_cast<int16_t>(std::ceil(
       flight_config::kParachute.target_tolerance_deg /
       actuators::kParachuteDegreesPerCount));
@@ -846,16 +871,47 @@ void parachuteTask(void *) {
 
   auto readCurrent = [&](actuators::AbsoluteParachuteAngle &angle,
                          bool &moving) {
+    last_position_read_attempt_us =
+        static_cast<uint64_t>(esp_timer_get_time());
     STS3215::RawData data{};
     const esp_err_t result = servo.readRaw(data);
-    if (result != ESP_OK)
+    if (result != ESP_OK) {
+      // Vaultのsemantic方針に従い、freshなvalid値は単発errorで捨てない。
+      if (parachute_angle_raw.load(std::memory_order_acquire) > 240U) {
+        const auto error =
+            result == ESP_ERR_TIMEOUT
+                ? protocol::quantization::ParachuteAngleError::uart_timeout
+            : result == ESP_ERR_INVALID_STATE
+                ? protocol::quantization::ParachuteAngleError::not_initialized
+            : result == ESP_ERR_INVALID_RESPONSE
+                ? protocol::quantization::ParachuteAngleError::uart_protocol_error
+            : result == ESP_ERR_INVALID_ARG
+                ? protocol::quantization::ParachuteAngleError::position_invalid
+                : protocol::quantization::ParachuteAngleError::device_error_response;
+        parachute_angle_raw.store(static_cast<uint8_t>(error),
+                                  std::memory_order_release);
+      }
       return result;
+    }
     const auto current =
         actuators::AbsoluteParachuteAngle::fromCount(data.position);
-    if (!current.has_value())
+    if (!current.has_value()) {
+      parachute_angle_raw.store(
+          static_cast<uint8_t>(
+              protocol::quantization::ParachuteAngleError::position_out_of_range),
+          std::memory_order_release);
       return ESP_ERR_INVALID_RESPONSE;
+    }
     angle = *current;
     moving = data.moving;
+    const double degrees = static_cast<double>(current->count()) *
+                           actuators::kParachuteDegreesPerCount;
+    parachute_angle_raw.store(
+        protocol::quantization::encodeParachuteAngle(
+            degrees,
+            protocol::quantization::ParachuteAngleError::position_invalid),
+        std::memory_order_release);
+    last_position_valid_us = last_position_read_attempt_us;
     return ESP_OK;
   };
 
@@ -1538,6 +1594,33 @@ void parachuteTask(void *) {
         desired = DesiredState::holding;
         hold_established = false;
       }
+    }
+
+    // コマンド処理がSTSを読んでいない期間も、現在角を0.5秒周期で更新する。
+    // UARTへのアクセスはParachuteTaskだけが行い、CanTaskはatomic snapshotだけを読む。
+    if (servo.initialized() && mode_prepared &&
+        parachute_power_applied.load(std::memory_order_acquire) &&
+        (last_position_read_attempt_us == 0 ||
+         (now_us >= last_position_read_attempt_us &&
+          now_us - last_position_read_attempt_us >=
+              kPositionTelemetryPollIntervalUs))) {
+      auto current = *actuators::AbsoluteParachuteAngle::fromCount(0);
+      bool moving = false;
+      const esp_err_t read = readCurrent(current, moving);
+      sts_ready.store(read == ESP_OK, std::memory_order_release);
+      if (read != ESP_OK)
+        resetServoTransport();
+    }
+
+    const uint8_t angle_raw =
+        parachute_angle_raw.load(std::memory_order_acquire);
+    if (angle_raw <= 240U && last_position_valid_us != 0 &&
+        parachute_power_applied.load(std::memory_order_acquire) &&
+        now_us >= last_position_valid_us &&
+        now_us - last_position_valid_us >= kPositionTelemetryStaleUs) {
+      parachute_angle_raw.store(
+          static_cast<uint8_t>(protocol::quantization::ParachuteAngleError::stale),
+          std::memory_order_release);
     }
 
     finishPending();
@@ -3267,8 +3350,7 @@ void canTask(void *) {
           const protocol::DescentCoreTelemetry descent{
               sequences.next(protocol::CanId::descent_core_telemetry),
               static_cast<uint16_t>(failure | persistence_corrupt),
-              static_cast<uint8_t>(
-                  protocol::quantization::ParachuteAngleError::unavailable)};
+              parachute_angle_raw.load(std::memory_order_acquire)};
           (void)writeFrame(can, protocol::encode(descent));
         }
         if (!latest.deployment_power_cutoff) {
@@ -3327,7 +3409,8 @@ void canTask(void *) {
         telemetry.config_flags = latest.config_flags;
         telemetry.fin_mode = latest.fin_mode;
         telemetry.para_mode = latest.para_mode;
-        telemetry.parachute_angle_raw = 0xFF;
+        telemetry.parachute_angle_raw =
+            parachute_angle_raw.load(std::memory_order_acquire);
         (void)writeFrame(can, protocol::encode(telemetry));
         uint8_t persistence_flags = 0;
         if (parachute_config_load_complete.load(std::memory_order_acquire))
