@@ -32,7 +32,10 @@
 namespace avi::characterization {
 namespace {
 
-constexpr std::uint64_t kRunStartLeadUs = 250'000U;
+// storage preallocation完了後にepoch zeroを決める。header overwriteでSDが一時stallしても
+// sampler/timer開始前に十分な余裕を残すためcharacterizationだけ1.5 s leadを取る。
+constexpr std::uint64_t kRunStartLeadUs = 1'500'000U;
+constexpr std::uint32_t kMinimumPostHeaderLeadUs = 100'000U;
 constexpr std::uint32_t kZeroCaptureTimeoutMs = 1'000U;
 
 // 動作確認済みZeroHold（1024 scaleでKp=500, Kd=25）をpermilleへ概算移植する。
@@ -685,8 +688,6 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
 
   last_abort_reason_ = AbortReason::None;
   pseudo_random_state_ = campaign_.profileSeed();
-  const std::uint64_t epoch_zero = nowUs() + kRunStartLeadUs;
-  const LogHeaderV5 header = makeHeader(rate, run_kind, epoch_zero);
   char base_name[96]{};
   std::array<char, kSessionIdBytes> session_token{};
   makeSafeSessionToken(campaign_.sessionId(), session_token);
@@ -701,8 +702,25 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
     return ESP_ERR_INVALID_SIZE;
   }
 
-  esp_err_t first_error = writer_.open(header, base_name);
+  // FAT cluster allocationはmotor/encoder realtime開始前に全record分済ませる。
+  esp_err_t first_error = writer_.prepare(base_name, epochs);
   if (first_error != ESP_OK) {
+    (void)journal_.disarm(nowUs());
+    (void)campaign_.finishRun(RunOutcome::Failed);
+    return first_error;
+  }
+
+  const std::uint64_t epoch_zero = nowUs() + kRunStartLeadUs;
+  const LogHeaderV5 header = makeHeader(rate, run_kind, epoch_zero);
+  first_error = writer_.open(header);
+  if (first_error != ESP_OK ||
+      nowUs() + kMinimumPostHeaderLeadUs >= epoch_zero) {
+    if (first_error == ESP_OK) {
+      first_error = ESP_ERR_TIMEOUT;
+      LogFooterV5 footer{};
+      footer.statistics.first_error = first_error;
+      (void)writer_.abortAndClose(footer);
+    }
     (void)journal_.disarm(nowUs());
     (void)campaign_.finishRun(RunOutcome::Failed);
     return first_error;

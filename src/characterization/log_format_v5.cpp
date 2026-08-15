@@ -10,6 +10,24 @@
 namespace avi::characterization::wire_v5 {
 namespace {
 
+constexpr std::uint32_t crc32TableEntry(std::uint32_t value) noexcept {
+  for (std::uint8_t bit = 0U; bit < 8U; ++bit)
+    value = (value >> 1U) ^
+            (0xEDB88320U & (0U - (value & 1U)));
+  return value;
+}
+
+constexpr std::array<std::uint32_t, 256> makeCrc32Table() noexcept {
+  std::array<std::uint32_t, 256> table{};
+  for (std::size_t index = 0U; index < table.size(); ++index)
+    table[index] = crc32TableEntry(static_cast<std::uint32_t>(index));
+  return table;
+}
+
+constexpr auto kCrc32Table = makeCrc32Table();
+static_assert(kCrc32Table[0U] == 0x00000000U);
+static_assert(kCrc32Table[1U] == 0x77073096U);
+
 void putU16(std::uint8_t *destination, std::uint16_t value) noexcept {
   destination[0] = static_cast<std::uint8_t>(value);
   destination[1] = static_cast<std::uint8_t>(value >> 8U);
@@ -249,11 +267,10 @@ std::uint32_t crc32(const std::uint8_t *data, std::size_t size,
   if (data == nullptr && size != 0U)
     return 0U;
   std::uint32_t crc = previous_crc ^ 0xFFFFFFFFU;
-  for (std::size_t index = 0; index < size; ++index) {
-    crc ^= data[index];
-    for (std::uint8_t bit = 0; bit < 8U; ++bit)
-      crc = (crc >> 1U) ^
-            (0xEDB88320U & (0U - (crc & 1U)));
+  for (std::size_t index = 0U; index < size; ++index) {
+    const std::uint8_t table_index =
+        static_cast<std::uint8_t>(crc ^ data[index]);
+    crc = (crc >> 8U) ^ kCrc32Table[table_index];
   }
   return crc ^ 0xFFFFFFFFU;
 }

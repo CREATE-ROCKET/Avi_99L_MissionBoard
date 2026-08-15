@@ -21,11 +21,12 @@ namespace avi::characterization {
 class LogWriterV5 {
 public:
   static constexpr std::size_t kQueueDepth = 512U;
-  static constexpr std::size_t kBatchRecords = 16U;
+  static constexpr std::size_t kBatchRecords = 64U;
 
   [[nodiscard]] esp_err_t initialize();
-  [[nodiscard]] esp_err_t open(const LogHeaderV5 &header,
-                               const char *base_name);
+  [[nodiscard]] esp_err_t prepare(const char *base_name,
+                                  std::uint32_t expected_records);
+  [[nodiscard]] esp_err_t open(const LogHeaderV5 &header);
   [[nodiscard]] esp_err_t enqueue(const ImmutableLogRecord &record);
   [[nodiscard]] esp_err_t drainAndSync();
   [[nodiscard]] esp_err_t close(const LogFooterV5 &footer);
@@ -67,6 +68,8 @@ private:
   void processRecordBatch(ImmutableLogRecord first_record);
   void processControl(const ControlRequest &request);
   [[nodiscard]] esp_err_t submitControl(const ControlRequest &request);
+  void resetRunMetrics() noexcept;
+  void cleanupPreparedFile(bool remove_file) noexcept;
 
   StaticQueue_t queue_control_{};
   std::array<std::uint8_t,
@@ -101,6 +104,7 @@ private:
   std::atomic<std::uint32_t> total_validate_us_{0U};
   std::atomic<std::uint32_t> total_encode_us_{0U};
   std::atomic<std::uint32_t> total_fwrite_us_{0U};
+  std::atomic<std::uint32_t> preallocation_us_{0U};
 #endif
   FILE *file_{nullptr};
   std::array<char, 128> current_path_{};
@@ -111,7 +115,9 @@ private:
   std::atomic<std::uint64_t> first_sequence_{0U};
   std::atomic<std::uint64_t> last_sequence_{0U};
   std::atomic<std::uint64_t> queue_overflows_{0U};
+  std::uint64_t planned_file_bytes_{0U};
   std::uint32_t file_crc32_{0U};
+  bool prepared_{false};
   bool initialized_{false};
 };
 
