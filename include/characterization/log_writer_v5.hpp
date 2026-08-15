@@ -88,6 +88,11 @@ private:
   std::atomic<bool> control_pending_{false};
   std::atomic<esp_err_t> control_result_{ESP_OK};
   std::atomic<TaskHandle_t> failure_notification_task_{nullptr};
+  std::atomic<std::uint32_t> queue_high_water_{0U};
+  std::atomic<std::uint32_t> max_batch_records_{0U};
+  std::atomic<std::uint32_t> max_validate_us_{0U};
+  std::atomic<std::uint32_t> max_encode_us_{0U};
+  std::atomic<std::uint32_t> max_fwrite_us_{0U};
 #endif
   FILE *file_{nullptr};
   std::array<char, 128> current_path_{};

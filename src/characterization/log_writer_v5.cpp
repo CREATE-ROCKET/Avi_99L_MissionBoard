@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <limits>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -27,6 +28,28 @@ constexpr const char *kLogDirectory = "/sdcard/characterization_v5";
 void rememberOperation(esp_err_t operation, esp_err_t &first) noexcept {
   if (first == ESP_OK && operation != ESP_OK)
     first = operation;
+}
+
+std::uint32_t elapsedUs(std::int64_t started_at_us) noexcept {
+  const std::int64_t finished_at_us = esp_timer_get_time();
+  if (started_at_us < 0 || finished_at_us < started_at_us)
+    return 0U;
+  const std::uint64_t elapsed =
+      static_cast<std::uint64_t>(finished_at_us - started_at_us);
+  return static_cast<std::uint32_t>(
+      elapsed > std::numeric_limits<std::uint32_t>::max()
+          ? std::numeric_limits<std::uint32_t>::max()
+          : elapsed);
+}
+
+void updateAtomicMaximum(std::atomic<std::uint32_t> &target,
+                         std::uint32_t candidate) noexcept {
+  std::uint32_t current = target.load(std::memory_order_relaxed);
+  while (current < candidate &&
+         !target.compare_exchange_weak(current, candidate,
+                                       std::memory_order_relaxed,
+                                       std::memory_order_relaxed)) {
+  }
 }
 
 esp_err_t writeFile(void *context, const std::uint8_t *data,
@@ -73,18 +96,26 @@ void LogWriterV5::processRecordBatch(ImmutableLogRecord first_record) {
   while (count < batch_.size() &&
          xQueueReceive(queue_, &batch_[count], 0U) == pdTRUE)
     ++count;
+  updateAtomicMaximum(max_batch_records_, static_cast<std::uint32_t>(count));
 
   bool encoded = true;
   for (std::size_t index = 0U; index < count; ++index) {
     // full record validationはwriter taskだけで行う。char_runtime側はmotor safety、
     // epoch成立、queue失敗を直接監視し、重いwire整合性確認を1 kHz pathへ置かない。
-    if (hasError(validateRecordStrict(batch_[index]))) {
+    const std::int64_t validate_started_us = esp_timer_get_time();
+    const bool record_valid = !hasError(validateRecordStrict(batch_[index]));
+    updateAtomicMaximum(max_validate_us_, elapsedUs(validate_started_us));
+    if (!record_valid) {
       encoded = false;
       rememberFirst(ESP_ERR_INVALID_RESPONSE);
       break;
     }
+
     wire_v5::RecordBytes bytes{};
-    if (!wire_v5::encodeRecord(batch_[index], bytes)) {
+    const std::int64_t encode_started_us = esp_timer_get_time();
+    const bool record_encoded = wire_v5::encodeRecord(batch_[index], bytes);
+    updateAtomicMaximum(max_encode_us_, elapsedUs(encode_started_us));
+    if (!record_encoded) {
       encoded = false;
       rememberFirst(ESP_ERR_INVALID_RESPONSE);
       break;
@@ -95,8 +126,11 @@ void LogWriterV5::processRecordBatch(ImmutableLogRecord first_record) {
 
   if (encoded && file_ != nullptr) {
     const std::size_t byte_count = count * wire_v5::kRecordBytes;
-    if (std::fwrite(encoded_batch_.data(), 1U, byte_count, file_) !=
-        byte_count) {
+    const std::int64_t fwrite_started_us = esp_timer_get_time();
+    const std::size_t written =
+        std::fwrite(encoded_batch_.data(), 1U, byte_count, file_);
+    updateAtomicMaximum(max_fwrite_us_, elapsedUs(fwrite_started_us));
+    if (written != byte_count) {
       rememberFirst(ESP_FAIL);
     } else {
       for (std::size_t index = 0U; index < count; ++index)
@@ -229,9 +263,11 @@ esp_err_t LogWriterV5::initialize() {
   control_ack_ = xSemaphoreCreateBinaryStatic(&control_ack_storage_);
   if (control_queue_ == nullptr || control_ack_ == nullptr)
     return ESP_ERR_NO_MEM;
+  // Core 0はpriority 21のchar_runtime専用に近い状態へ保つ。
+  // char_writerはCore 1へ置き、同coreのchar_encoder(priority 23)を常に優先する。
   task_ = xTaskCreateStaticPinnedToCore(
       taskEntry, "char_writer", sizeof(task_stack_), this, 10,
-      task_stack_, &task_tcb_, 0);
+      task_stack_, &task_tcb_, 1);
   if (task_ == nullptr)
     return ESP_ERR_NO_MEM;
   initialized_ = true;
@@ -290,6 +326,11 @@ esp_err_t LogWriterV5::open(const LogHeaderV5 &header,
   first_sequence_.store(0U);
   last_sequence_.store(0U);
   queue_overflows_.store(0U);
+  queue_high_water_.store(0U);
+  max_batch_records_.store(0U);
+  max_validate_us_.store(0U);
+  max_encode_us_.store(0U);
+  max_fwrite_us_.store(0U);
   file_crc32_ = wire_v5::crc32(bytes.data(), bytes.size());
   synced_.store(false);
   accepting_.store(true);
@@ -306,10 +347,15 @@ esp_err_t LogWriterV5::enqueue(
   // strict validationはchar_writerのprocessRecordBatch()でencode直前に行う。
   RateCheckStageScope timing(RateCheckStage::WriterEnqueue);
   if (xQueueSend(queue_, &record, 0U) != pdTRUE) {
+    updateAtomicMaximum(queue_high_water_,
+                        static_cast<std::uint32_t>(kQueueDepth));
     queue_overflows_.fetch_add(1U);
     rememberFirst(ESP_ERR_NO_MEM);
     return ESP_ERR_NO_MEM;
   }
+  updateAtomicMaximum(
+      queue_high_water_,
+      static_cast<std::uint32_t>(uxQueueMessagesWaiting(queue_)));
   return ESP_OK;
 }
 
@@ -349,6 +395,17 @@ esp_err_t LogWriterV5::close(const LogFooterV5 &footer) {
         static_cast<unsigned>(diagnostics.record_validate_max_us),
         static_cast<unsigned>(diagnostics.writer_enqueue_max_us),
         static_cast<unsigned>(diagnostics.encoder_read_max_us));
+    std::printf(
+        "CHAR_WRITER_TIMING rate=%u queue-high-water=%u "
+        "max-batch-records=%u validate-max-us=%u encode-max-us=%u "
+        "fwrite-max-us=%u records-written=%llu\n",
+        static_cast<unsigned>(diagnostics.rate),
+        static_cast<unsigned>(queue_high_water_.load()),
+        static_cast<unsigned>(max_batch_records_.load()),
+        static_cast<unsigned>(max_validate_us_.load()),
+        static_cast<unsigned>(max_encode_us_.load()),
+        static_cast<unsigned>(max_fwrite_us_.load()),
+        static_cast<unsigned long long>(records_written_.load()));
   }
   endRateCheckStageDiagnostics();
   return result;
