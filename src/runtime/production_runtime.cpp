@@ -810,12 +810,17 @@ void parachuteTask(void *) {
         // Emergency後でもcommit済みならRAMをNVSへ合わせ、Completedは送らない。
         configuration.activatePersistedCandidate(pending.candidate);
         updateConfigurationMirrors();
-        if (!pending.interrupted)
-          powerOff(false, true, protocol::ParaMode::powered_off);
+        if (!pending.interrupted) {
+          desired = DesiredState::holding;
+          para_mode_actual.store(protocol::ParaMode::hold,
+                                 std::memory_order_release);
+        }
         requestFinish(protocol::CommandReason::none);
       } else {
-        if (!pending.interrupted)
-          powerOff(false, true, protocol::ParaMode::powered_off);
+        if (!pending.interrupted) {
+          desired = DesiredState::holding;
+          hold_established = false;
+        }
         requestFinish(protocol::CommandReason::persistence_error);
       }
     }
@@ -958,6 +963,24 @@ void parachuteTask(void *) {
                    code == mission::CommandCode::para_close &&
                    !configuration.active().closeConfigured()) {
           requestFinish(protocol::CommandReason::not_configured);
+        } else if (command_request.kind ==
+                       ParachuteCommandRequest::Kind::start_preparation &&
+                   !parachute_config_load_complete.load(
+                       std::memory_order_acquire)) {
+          requestFinish(protocol::CommandReason::busy,
+                        kDetailConfigurationLoad);
+        } else if (command_request.kind ==
+                       ParachuteCommandRequest::Kind::start_preparation &&
+                   !parachute_persistence_ready.load(
+                       std::memory_order_acquire)) {
+          requestFinish(protocol::CommandReason::persistence_error,
+                        kDetailConfigurationLoad);
+        } else if (command_request.kind ==
+                       ParachuteCommandRequest::Kind::start_preparation &&
+                   code == mission::CommandCode::start_sequence &&
+                   command_request.readiness.missingMask() != 0) {
+          requestFinish(protocol::CommandReason::not_configured,
+                        command_request.readiness.missingMask());
         } else if (!requestPower(pending.started_at_us)) {
           requestFinish(protocol::CommandReason::busy,
                         kDetailQueueUnavailable);
@@ -1240,11 +1263,15 @@ void parachuteTask(void *) {
                   flight_config::kParachute.torque_limit_percent)});
           sts_ready.store(hold == ESP_OK, std::memory_order_release);
           hold_established = hold == ESP_OK;
-          if (hold_established)
+          if (hold_established) {
             para_mode_actual.store(protocol::ParaMode::hold,
                                    std::memory_order_release);
-          else
-            recordParachuteFailure(ParachuteDeploymentFailure::hold_failed);
+          } else if (active_epoch != 0) {
+            recordParachuteFailure(
+                ParachuteDeploymentFailure::hold_failed);
+          } else {
+            std::printf("parachute hold failed outside deployment\n");
+          }
         }
       }
     }
