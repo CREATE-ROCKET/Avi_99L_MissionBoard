@@ -61,6 +61,18 @@ inline constexpr AirDataConfig kAirData{
     400,
     8};
 
+#if !defined(AVI_99L_MOTOR_PROFILE_ID)
+#error "AVI_99L_MOTOR_PROFILE_ID must be defined for every MissionBoard build"
+#elif AVI_99L_MOTOR_PROFILE_ID == 1
+inline constexpr const board::MotorProfile &kActiveFlightMotorProfile =
+    board::kFlightMotorA;
+#elif AVI_99L_MOTOR_PROFILE_ID == 2
+inline constexpr const board::MotorProfile &kActiveFlightMotorProfile =
+    board::kSpareMotorB;
+#else
+#error "AVI_99L_MOTOR_PROFILE_ID must be 1 or 2"
+#endif
+
 // TODO(HW_TEST): ADCによる実測値へ置換し、電圧低下時の制御停止条件を決定する。
 inline constexpr double kMotorBusVoltageV = 9.0;
 #if defined(AVI_99L_CHARACTERIZATION) && AVI_99L_CHARACTERIZATION
@@ -86,20 +98,19 @@ inline constexpr control::RollGainSchedule kRollGainSchedule{
     true};
 
 [[nodiscard]] inline bool motorProfileValid() {
-  return board::kFlightMotorA.parameters_valid &&
-         board::kFlightMotorA.polarity != board::MotorPolarity::unconfigured;
+  return kActiveFlightMotorProfile.parameters_valid &&
+         kActiveFlightMotorProfile.polarity != board::MotorPolarity::unconfigured;
 }
 
 [[nodiscard]] inline bool nonBypassFlightConfigurationReady() {
-  return
-         board::kFinSoftwareLimits.configured &&
+  return board::kFinSoftwareLimits.configured &&
          board::kFinSoftwareLimits.minimum_rad <
              board::kFinSoftwareLimits.maximum_rad &&
          kParachute.ready() && kAirData.ready() &&
          board::kControlAuthorityLimits.valid() &&
          board::kEncoderPipeline.valid() &&
-         kRollGainSchedule.configured &&
-         kMotorBusVoltageV > 0.0 && kProductionMotorMaximumDuty > 0.0 &&
+         kRollGainSchedule.configured && kMotorBusVoltageV > 0.0 &&
+         kProductionMotorMaximumDuty > 0.0 &&
          kProductionMotorMaximumDuty <= 1.0;
 }
 
@@ -107,4 +118,4 @@ inline constexpr control::RollGainSchedule kRollGainSchedule{
   return motorProfileValid() && nonBypassFlightConfigurationReady();
 }
 
-} // namespace flight_config
+} // 名前空間 flight_config
