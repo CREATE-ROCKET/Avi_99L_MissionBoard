@@ -959,22 +959,22 @@ void testParachuteAndRecovery() {
   assert(!power.requestParachutePower(true));
 
   ParachuteController parachute;
-  assert(parachute.startOpen(1'000'000, 10.0) ==
+  assert(parachute.startOpen(1'000'000, 4095) ==
          ParachuteAction::command_open);
-  assert(parachute.tick({1'499'999, true, 10.0, false}) ==
+  assert(parachute.tick({1'499'999, true, 4095, false}) ==
          ParachuteAction::none);
-  assert(parachute.tick({1'500'000, true, 10.0, false}) ==
+  assert(parachute.tick({1'500'000, true, 4095, false}) ==
          ParachuteAction::retry_open);
   assert(parachute.status().retry_count == 1);
-  assert(parachute.tick({2'000'000, true, 13.0, false}) ==
+  assert(parachute.tick({2'000'000, true, 30, false}) ==
          ParachuteAction::none);
-  assert(parachute.tick({6'000'000, false, 0.0, false}) ==
+  assert(parachute.tick({6'000'000, false, 0, false}) ==
          ParachuteAction::cut_power);
   assert(parachute.status().state == ParachuteOpenState::retry_exhausted);
 
   ParachuteController confirmed;
   assert(confirmed.startOpen(0, 0) == ParachuteAction::command_open);
-  assert(confirmed.tick({100'000, true, 30.0, true}) ==
+  assert(confirmed.tick({100'000, true, 30, true}) ==
          ParachuteAction::cut_power);
   assert(confirmed.status().servo_open_confirmed);
   confirmed.notifyPowerCutoff();

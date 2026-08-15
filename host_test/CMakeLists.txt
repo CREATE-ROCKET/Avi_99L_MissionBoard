@@ -26,3 +26,14 @@ target_compile_definitions(mission_host_tests PRIVATE
 )
 
 add_test(NAME mission_host_tests COMMAND mission_host_tests)
+
+add_executable(parachute_configuration_tests
+  parachute_configuration_tests.cpp
+)
+target_include_directories(parachute_configuration_tests PRIVATE ../src)
+target_compile_features(parachute_configuration_tests PRIVATE cxx_std_17)
+target_compile_options(parachute_configuration_tests PRIVATE
+  -Wall -Wextra -Wpedantic -Werror
+)
+
+add_test(NAME parachute_configuration_tests COMMAND parachute_configuration_tests)

@@ -2,6 +2,8 @@
 
 #include <cstdint>
 
+#include "actuators/parachute_configuration.hpp"
+
 namespace actuators {
 
 struct PowerState {
@@ -40,7 +42,7 @@ enum class ParachuteOpenState : uint8_t {
 struct ParachuteTick {
   uint64_t now_us{};
   bool position_valid{};
-  double position_deg{};
+  uint16_t position_count{};
   bool target_reached{};
 };
 
@@ -54,7 +56,7 @@ struct ParachuteStatus {
 class ParachuteController {
 public:
   [[nodiscard]] ParachuteAction startOpen(uint64_t now_us,
-                                         double initial_position_deg);
+                                         uint16_t initial_position_count);
   [[nodiscard]] ParachuteAction tick(const ParachuteTick &input);
   void notifyPowerCutoff();
   [[nodiscard]] const ParachuteStatus &status() const { return status_; }
@@ -63,12 +65,12 @@ private:
   // TODO(HW_TEST): STS3215 speed/torque、2 deg/0.5 s、5 s deadlineを確定する。
   static constexpr uint64_t kProgressWindowUs = 500'000;
   static constexpr uint64_t kGlobalDeadlineUs = 5'000'000;
-  static constexpr double kMinimumProgressDeg = 2.0;
+  static constexpr int16_t kMinimumProgressCount = 23;
 
   ParachuteStatus status_{};
   uint64_t started_at_us_{};
   uint64_t window_started_at_us_{};
-  double window_position_deg_{};
+  uint16_t window_position_count_{};
 };
 
 } // 名前空間 actuators

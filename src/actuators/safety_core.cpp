@@ -1,7 +1,5 @@
 #include "actuators/safety_core.hpp"
 
-#include <cmath>
-
 namespace actuators {
 
 bool PowerArbiter::requestAuxiliary5v(bool enabled) {
@@ -25,15 +23,16 @@ void PowerArbiter::latchDeploymentCutoff() {
 }
 
 ParachuteAction
-ParachuteController::startOpen(uint64_t now_us, double initial_position_deg) {
-  if (!std::isfinite(initial_position_deg) ||
+ParachuteController::startOpen(uint64_t now_us,
+                              uint16_t initial_position_count) {
+  if (!AbsoluteParachuteAngle::fromCount(initial_position_count).has_value() ||
       status_.state != ParachuteOpenState::idle)
     return ParachuteAction::none;
   status_ = {};
   status_.state = ParachuteOpenState::opening;
   started_at_us_ = now_us;
   window_started_at_us_ = now_us;
-  window_position_deg_ = initial_position_deg;
+  window_position_count_ = initial_position_count;
   return ParachuteAction::command_open;
 }
 
@@ -57,13 +56,20 @@ ParachuteAction ParachuteController::tick(const ParachuteTick &input) {
       input.now_us - window_started_at_us_ < kProgressWindowUs)
     return ParachuteAction::none;
 
-  const bool progressed = input.position_valid &&
-                          std::isfinite(input.position_deg) &&
-                          std::abs(input.position_deg - window_position_deg_) >=
-                              kMinimumProgressDeg;
+  bool progressed = false;
+  const auto previous =
+      AbsoluteParachuteAngle::fromCount(window_position_count_);
+  const auto current = AbsoluteParachuteAngle::fromCount(input.position_count);
+  if (input.position_valid && previous.has_value() && current.has_value()) {
+    const auto displacement =
+        shortestParachuteDisplacement(*previous, *current);
+    progressed = displacement.valid() &&
+                 (displacement.counts >= kMinimumProgressCount ||
+                  displacement.counts <= -kMinimumProgressCount);
+  }
   window_started_at_us_ = input.now_us;
-  if (input.position_valid && std::isfinite(input.position_deg))
-    window_position_deg_ = input.position_deg;
+  if (input.position_valid && current.has_value())
+    window_position_count_ = input.position_count;
   if (progressed)
     return ParachuteAction::none;
   status_.state = ParachuteOpenState::retrying;
