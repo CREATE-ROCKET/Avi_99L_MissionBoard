@@ -1,0 +1,35 @@
+Start testing: Aug 15 13:16 UTC
+----------------------------------------------------------
+1/2 Testing: mission_host_tests
+1/2 Test: mission_host_tests
+Command: "/home/runner/work/Avi_99L_MissionBoard/Avi_99L_MissionBoard/build-host/mission_host_tests"
+Directory: /home/runner/work/Avi_99L_MissionBoard/Avi_99L_MissionBoard/build-host
+"mission_host_tests" start time: Aug 15 13:16 UTC
+Output:
+----------------------------------------------------------
+mission host tests: PASS
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"mission_host_tests" end time: Aug 15 13:16 UTC
+"mission_host_tests" time elapsed: 00:00:00
+----------------------------------------------------------
+
+2/2 Testing: parachute_configuration_tests
+2/2 Test: parachute_configuration_tests
+Command: "/home/runner/work/Avi_99L_MissionBoard/Avi_99L_MissionBoard/build-host/parachute_configuration_tests"
+Directory: /home/runner/work/Avi_99L_MissionBoard/Avi_99L_MissionBoard/build-host
+"parachute_configuration_tests" start time: Aug 15 13:16 UTC
+Output:
+----------------------------------------------------------
+parachute configuration tests: PASS
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"parachute_configuration_tests" end time: Aug 15 13:16 UTC
+"parachute_configuration_tests" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Aug 15 13:16 UTC

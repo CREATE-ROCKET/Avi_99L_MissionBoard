@@ -86,8 +86,7 @@ inline constexpr control::RollGainSchedule kRollGainSchedule{
     true};
 
 [[nodiscard]] inline bool motorProfileValid() {
-  return board::kFlightMotorA.parameters_valid &&
-         board::kFlightMotorA.polarity != board::MotorPolarity::unconfigured;
+  return board::kMotorProfileValid;
 }
 
 [[nodiscard]] inline bool nonBypassFlightConfigurationReady() {

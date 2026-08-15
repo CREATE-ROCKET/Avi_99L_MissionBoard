@@ -27,7 +27,7 @@ bool commandKnown(CommandCode code) {
   return (raw >= 0x01 && raw <= 0x04) ||
          (raw >= 0x10 && raw <= 0x13) ||
          (raw >= 0x20 && raw <= 0x26) ||
-         (raw >= 0x30 && raw <= 0x32);
+         (raw >= 0x30 && raw <= 0x31);
 }
 
 CommandDomain domainFor(CommandCode code) {

@@ -1414,7 +1414,7 @@ void missionRealtimeTask(void *) {
               .zero_hold_requested_torque_limit_Nm,
           0.017453292519943295, 0.08726646259971647, 100}};
   control::RollController roll_controller{flight_config::kRollGainSchedule};
-  control::TorqueMapper torque_mapper{board::kFlightMotorA,
+  control::TorqueMapper torque_mapper{board::kActiveMotorProfile,
                                       board::kFinSoftwareLimits};
   actuators::ProductionMotorDriver motor_driver;
   bool liftoff_detected = false;
@@ -2340,7 +2340,7 @@ void missionRealtimeTask(void *) {
     // bit0 MotorProfile、bit1 Fin zero、bit2 Para設定、bit3 SSC zero、
     // bit7は未qualificationの暫定値を含むことを示す。
     status.config_flags =
-        (board::kFlightMotorA.parameters_valid ? (1U << 0U) : 0U) |
+        (board::kMotorProfileValid ? (1U << 0U) : 0U) |
         (fin_zero_configured.load(std::memory_order_acquire) ? (1U << 1U)
                                                              : 0U) |
         (parachute_open_configured.load(std::memory_order_acquire) &&

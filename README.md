@@ -272,6 +272,16 @@ CANはstandard 11-bit、125 kbit/s、DLC 8以下、multi-byteはlittle-endianで
 
 100 HzはKinematics/Control/AirspeedとDescent中のDescentCore、25 HzはLPS、10 HzはMissionStatus/PowerTime/Tiltです。AirData power cutoff後はLPS/Airspeedを停止します。未取得物理値は04aのsemantic error rawを送信し、0として偽装しません。
 
+## production MotorProfile build
+
+active MotorProfileはruntime/NVSでは選択しません。`AVI_99L_MOTOR_PROFILE_ID`をbuild時に必ず明示し、未指定または未知IDはcompile errorにします。例えばFlightMotorA候補を選ぶ場合は次のようにbuildします。
+
+```sh
+PLATFORMIO_BUILD_FLAGS="-DMISSION_BRINGUP_SHELL=0 -DAVI_99L_MOTOR_PROFILE_ID=1" pio run -e avi_99l_missionboard
+```
+
+ID 1は現在も`TODO(HW_TEST)`のqualification未完了なので、選択してbuildできても`MotorProfileValid=false`です。通常`StartSequence`ではreadiness bit3がmissingになり、`ForceStartSequence`でも状態をvalidへ書き換えません。
+
 ## hardware assumptions
 
 - ICM42688とAS5047Dは各独立SPI busで1 kHz acquisition候補
@@ -288,7 +298,7 @@ CANはstandard 11-bit、125 kbit/s、DLC 8以下、multi-byteはlittle-endianで
 - NVS para設定は`InternalFlashTask`を唯一ownerとして接続済みです。`SetParaOpen` / `SetParaClose`はfreshなSTS絶対角を保存・commit・readback検証した後だけactive設定を更新します。flight中はOpen target取得のためにNVSを読みません。Internal Flash append logとSD production loggerはowner taskの安全stubまでで、flight pathへ未接続です。software/watchdog reset用checkpointはversion/CRC付きRTC memoryで復旧し、POR後の絶対時刻復旧は未接続のため安全側に飛行再開しません。
 - production runtimeは暫定flight設定で有効ですが、値はsimulation/HIL/実機で未確定です。bit7が立っているbuildを飛行認定済みとして扱ってはいけません。
 - ICM history/replay、AS5047D unwrap、quadratic fin rate、ZeroHold/Roll、TorqueMapper、TB67H450 PWMは接続済みです。起動時AS5047D角をzeroとするため、電源投入時の翼角がずれていれば、そのずれを0°として制御します。
-- productionの手動Para commandは接続済みです。`SetParaOpen` / `SetParaClose`は全argumentを0とし、現在位置だけを保存します。通常`StartSequence`は両endpointとhalf-turn条件を検証します。`ForceStartSequence`、Force用optional snapshot、Force時の未設定Open処理はStage 2であり、今回未実装です。productionの手動Fin commandと明示PreflightCalibration commandは未接続で、差圧zeroはCommandReceive中の自動取得で代用しています。
+- productionの手動Para commandは接続済みです。`SetParaOpen` / `SetParaClose`は全argumentを0とし、現在位置だけを保存します。通常`StartSequence`は7項目readinessを同一snapshotで評価し、`ForceStartSequence 0x04`はそのmissing maskだけをbypassします。Open/Closeはflight snapshotでも独立optionalのまま保持し、actual current→targetがexact half-turnの場合だけ移動しません。Open失敗または5秒retry期限後もSTSはHold要求と再接続を続け、電源は離床+25秒の絶対cutoffまで維持します。明示`RunPreflightCalibration`はgyro bias、gravity reference、SSC zeroの最新attemptを更新し、Force時もinvalid値をvalidへ偽装しません。
 - ADCによるmotor/logic電圧監視とbattery present threshold/debounceはproduction flight gateへ未接続です。
 - AS5047DではDIAG/AGC/magnitudeが全て0の応答を一度確認しましたが、最終再試験では`offset_done=1`、AGC 61、magnitude 4616で正常化しました。bring-upとproduction startupは共通health判定でall-zeroを`ESP_ERR_INVALID_RESPONSE`とし、productionはpipelineを開始せずfin angle/rateをunavailable、motorをcoastに保ちます。角度0度そのものは故障条件ではありません。実機productionでは正常status時のpipeline開始と、一時診断buildでall-zeroを注入した際のstatus拒否/pipeline未開始を確認しました。確認を妨げていたMissionRealtimeTaskのstack overflowは、task専有の大型history/FIFO wrapperをstatic storageへ移して解消し、startup時点の最小空き2,504 byteを実測しています。このgateはstartupと明示reinitialize時だけで、1 kHz loopへ周期的なpipeline停止を追加していません。飛行中にMISOがstuck-lowへ遷移した場合のDIAG検出は残TODOです。
 - ESP-IDF 6.0.1のlocal `esp_twai_onchip.c`にはEspressif issue [#18803](https://github.com/espressif/esp-idf/issues/18803)の修正がありません。TX完了通知のevent-group更新がtimer taskへ遅延したままnodeを削除するuse-after-freeを実機で再現したため、Avi_ESP_Libsの`CANCREATE::test()`はESP-IDF 6以上を既知safe release確認まで`ESP_ERR_NOT_SUPPORTED`で拒否します。常駐ownerを使うproduction CANとはlifecycleが異なります。

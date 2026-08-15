@@ -714,6 +714,13 @@ void testCommandExecutor() {
   assert(calibration.finish(21, CommandPhase::completed).phase ==
          CommandPhase::completed);
 
+  CommandExecutor reserved_motor_profile;
+  auto reserved_profile =
+      command(0x6E, static_cast<uint8_t>(CommandCode::select_motor_profile));
+  reserved_profile.arguments[0] = 1;
+  assert(reserved_motor_profile.begin(reserved_profile, context).result.reason ==
+         CommandReason::not_supported);
+
   CommandExecutor cache;
   for (uint8_t id = 1; id <= CommandExecutor::kResultCacheSize; ++id) {
     const auto result = cache.begin(command(id, 0x7F), context);
