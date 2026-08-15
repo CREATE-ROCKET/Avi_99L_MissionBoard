@@ -36,14 +36,10 @@ public:
 
 private:
   explicit constexpr AbsoluteParachuteAngle(uint16_t count) : count_(count) {}
-
   uint16_t count_{};
 };
 
-enum class ParachutePathError : uint8_t {
-  none,
-  exactly_half_turn,
-};
+enum class ParachutePathError : uint8_t { none, exactly_half_turn };
 
 struct SignedParachuteDisplacement {
   int16_t counts{};
@@ -52,13 +48,12 @@ struct SignedParachuteDisplacement {
   [[nodiscard]] constexpr bool valid() const {
     return error == ParachutePathError::none;
   }
-
   [[nodiscard]] constexpr double degrees() const {
     return static_cast<double>(counts) * kParachuteDegreesPerCount;
   }
 };
 
-// 返値は -2048 < counts < 2048。ちょうど半回転は方向を選ばず拒否する。
+// freshな現在角からtargetへの最短変位を返す。exact half-turnでは方向を選ばない。
 [[nodiscard]] constexpr SignedParachuteDisplacement
 shortestParachuteDisplacement(AbsoluteParachuteAngle current,
                               AbsoluteParachuteAngle target) {
@@ -73,10 +68,7 @@ shortestParachuteDisplacement(AbsoluteParachuteAngle current,
   return {static_cast<int16_t>(delta), ParachutePathError::none};
 }
 
-enum class ParachuteEndpoint : uint8_t {
-  open = 1,
-  close = 2,
-};
+enum class ParachuteEndpoint : uint8_t { open = 1, close = 2 };
 
 struct ParachuteConfiguration {
   std::optional<AbsoluteParachuteAngle> open{};
@@ -85,40 +77,35 @@ struct ParachuteConfiguration {
   [[nodiscard]] constexpr bool openConfigured() const {
     return open.has_value();
   }
-
   [[nodiscard]] constexpr bool closeConfigured() const {
     return close.has_value();
   }
 };
 
+// 飛行中はactive NVS設定を再参照せず、このoptional snapshotだけを使用する。
 struct FlightParachuteConfiguration {
-  AbsoluteParachuteAngle open;
-  AbsoluteParachuteAngle close;
+  std::optional<AbsoluteParachuteAngle> open{};
+  std::optional<AbsoluteParachuteAngle> close{};
 };
 
 enum class FlightParachutePreparationError : uint8_t {
   none,
   open_not_configured,
   close_not_configured,
-  open_close_exactly_half_turn,
   current_open_exactly_half_turn,
 };
 
 struct FlightParachutePreparationResult {
   FlightParachutePreparationError error{
       FlightParachutePreparationError::none};
-
   [[nodiscard]] constexpr bool ready() const {
     return error == FlightParachutePreparationError::none;
   }
 };
 
-// CommandReceive用設定と飛行用snapshotを同じowner内で管理する。
 class ParachuteConfigurationState {
 public:
-  [[nodiscard]] const ParachuteConfiguration &active() const {
-    return active_;
-  }
+  [[nodiscard]] const ParachuteConfiguration &active() const { return active_; }
 
   [[nodiscard]] ParachuteConfiguration
   candidateWith(ParachuteEndpoint endpoint,
@@ -136,49 +123,52 @@ public:
     active_ = candidate;
   }
 
-  // 起動時load済みの有効endpointだけを渡す。破損endpointはnulloptとする。
+  // key missing/corruptはnulloptへ変換済みの値だけを受け取る。
   void replaceLoadedConfiguration(const ParachuteConfiguration &loaded) {
     active_ = loaded;
   }
 
-  // RTC checkpointから復元した飛行用snapshotだけを戻す。
+  // RTC checkpointはOpen/Closeを独立optionalのまま復元する。
   void restoreFlightSnapshot(const FlightParachuteConfiguration &snapshot) {
     flight_snapshot_ = snapshot;
     flight_snapshot_valid_ = true;
   }
 
+  // 通常Startは両endpointを要求し、fresh current->Openだけを事前検証する。
   [[nodiscard]] FlightParachutePreparationResult
   freezeFlightSnapshot(AbsoluteParachuteAngle current) {
     if (!active_.open.has_value())
       return {FlightParachutePreparationError::open_not_configured};
     if (!active_.close.has_value())
       return {FlightParachutePreparationError::close_not_configured};
-    if (!shortestParachuteDisplacement(*active_.close, *active_.open).valid())
-      return {
-          FlightParachutePreparationError::open_close_exactly_half_turn};
     if (!shortestParachuteDisplacement(current, *active_.open).valid())
       return {FlightParachutePreparationError::current_open_exactly_half_turn};
-
-    flight_snapshot_ = {*active_.open, *active_.close};
+    flight_snapshot_ = {active_.open, active_.close};
     flight_snapshot_valid_ = true;
     return {};
   }
 
-  void discardFlightSnapshot() { flight_snapshot_valid_ = false; }
+  // ForceStartではendpointを生成せず、独立optionalをそのままfreezeする。
+  void freezeFlightSnapshotForced() {
+    flight_snapshot_ = {active_.open, active_.close};
+    flight_snapshot_valid_ = true;
+  }
+
+  void discardFlightSnapshot() {
+    flight_snapshot_ = {};
+    flight_snapshot_valid_ = false;
+  }
 
   [[nodiscard]] bool flightSnapshotValid() const {
     return flight_snapshot_valid_;
   }
-
   [[nodiscard]] const FlightParachuteConfiguration *flightSnapshot() const {
     return flight_snapshot_valid_ ? &flight_snapshot_ : nullptr;
   }
 
 private:
   ParachuteConfiguration active_{};
-  FlightParachuteConfiguration flight_snapshot_{
-      *AbsoluteParachuteAngle::fromCount(0),
-      *AbsoluteParachuteAngle::fromCount(0)};
+  FlightParachuteConfiguration flight_snapshot_{};
   bool flight_snapshot_valid_{};
 };
 
@@ -201,7 +191,6 @@ enum class ParachuteBlobError : uint8_t {
 struct DecodedParachuteEndpoint {
   std::optional<AbsoluteParachuteAngle> angle{};
   ParachuteBlobError error{ParachuteBlobError::none};
-
   [[nodiscard]] bool valid() const {
     return error == ParachuteBlobError::none && angle.has_value();
   }
@@ -222,19 +211,16 @@ inline void writeLe16(uint8_t *destination, uint16_t value) {
   destination[0] = static_cast<uint8_t>(value & 0xFFU);
   destination[1] = static_cast<uint8_t>((value >> 8U) & 0xFFU);
 }
-
 inline void writeLe32(uint8_t *destination, uint32_t value) {
   destination[0] = static_cast<uint8_t>(value & 0xFFU);
   destination[1] = static_cast<uint8_t>((value >> 8U) & 0xFFU);
   destination[2] = static_cast<uint8_t>((value >> 16U) & 0xFFU);
   destination[3] = static_cast<uint8_t>((value >> 24U) & 0xFFU);
 }
-
 [[nodiscard]] inline uint16_t readLe16(const uint8_t *source) {
   return static_cast<uint16_t>(source[0]) |
          static_cast<uint16_t>(source[1]) << 8U;
 }
-
 [[nodiscard]] inline uint32_t readLe32(const uint8_t *source) {
   return static_cast<uint32_t>(source[0]) |
          static_cast<uint32_t>(source[1]) << 8U |
@@ -267,8 +253,7 @@ decodeParachuteEndpoint(const uint8_t *data, std::size_t size,
     return {std::nullopt, ParachuteBlobError::wrong_size};
   if (readLe32(data + 12) != parachuteCrc32(data, 12))
     return {std::nullopt, ParachuteBlobError::crc_mismatch};
-  if (data[0] != '9' || data[1] != '9' || data[2] != 'L' ||
-      data[3] != 'P')
+  if (data[0] != '9' || data[1] != '9' || data[2] != 'L' || data[3] != 'P')
     return {std::nullopt, ParachuteBlobError::wrong_magic};
   if (data[4] != 1)
     return {std::nullopt, ParachuteBlobError::wrong_schema};
@@ -278,7 +263,6 @@ decodeParachuteEndpoint(const uint8_t *data, std::size_t size,
     return {std::nullopt, ParachuteBlobError::wrong_payload_size};
   if (readLe16(data + 10) != 0)
     return {std::nullopt, ParachuteBlobError::reserved_nonzero};
-
   const auto angle = AbsoluteParachuteAngle::fromCount(readLe16(data + 8));
   if (!angle.has_value())
     return {std::nullopt, ParachuteBlobError::angle_out_of_range};

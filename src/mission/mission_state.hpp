@@ -9,6 +9,36 @@ namespace mission {
 
 enum class FinDirective : uint8_t { free, brake, zero_hold, roll_control };
 enum class ParaDirective : uint8_t { hold, open, powered_off };
+enum class StartMode : uint8_t { normal, forced };
+
+enum class PreflightReadinessBit : uint8_t {
+  fin_zero_configured = 0,
+  parachute_open_configured = 1,
+  parachute_close_configured = 2,
+  motor_profile_valid = 3,
+  gyro_bias_valid = 4,
+  gravity_reference_valid = 5,
+  ssc_zero_valid = 6,
+};
+
+constexpr uint8_t kPreflightReadinessMask = 0x7FU;
+
+struct PreflightReadinessSnapshot {
+  uint32_t generation{};
+  uint64_t captured_at_us{};
+  bool fin_zero_configured{};
+  bool parachute_open_configured{};
+  bool parachute_close_configured{};
+  bool motor_profile_valid{};
+  bool gyro_bias_valid{};
+  bool gravity_reference_valid{};
+  bool ssc_zero_valid{};
+  bool resources_preallocated{};
+
+  [[nodiscard]] uint8_t readyMask() const;
+  [[nodiscard]] uint8_t missingMask() const;
+  [[nodiscard]] bool normalReady() const;
+};
 
 struct ControlAvailability {
   bool fin_control_available{};
@@ -23,7 +53,6 @@ struct ControlAvailability {
       std::numeric_limits<double>::quiet_NaN()};
   uint64_t roll_estimator_timestamp_us{};
   bool attitude_fresh{};
-
   [[nodiscard]] bool ready() const;
 };
 
@@ -52,6 +81,11 @@ struct MissionSnapshot {
   bool reset_invalidated{};
   bool deployment_started{};
   bool deployment_power_cutoff_latched{};
+  bool forced_start{};
+  uint32_t preflight_generation{};
+  uint64_t preflight_captured_at_us{};
+  uint8_t preflight_ready_mask{};
+  uint8_t preflight_missing_mask{};
   double control_roll_reference_unwrapped_rad{};
   uint64_t control_roll_reference_capture_tick{};
   uint64_t control_roll_reference_estimator_timestamp_us{};
@@ -65,15 +99,7 @@ enum class TransitionResult : uint8_t {
   completed,
   invalid_state,
   not_configured,
-};
-
-struct SequenceConfiguration {
-  bool fin_zero_configured{};
-  bool parachute_open_configured{};
-  bool parachute_close_configured{};
-  bool resources_preallocated{};
-
-  [[nodiscard]] bool ready() const;
+  runtime_unavailable,
 };
 
 struct ResetCheckpoint {
@@ -84,18 +110,24 @@ struct ResetCheckpoint {
   uint64_t elapsed_us{};
   bool deployment_started{};
   bool power_cutoff_latched{};
+  bool forced_start{};
+  uint32_t preflight_generation{};
+  uint64_t preflight_captured_at_us{};
+  uint8_t preflight_ready_mask{};
+  uint8_t preflight_missing_mask{};
 };
 
 class MissionStateMachine {
 public:
   [[nodiscard]] const MissionSnapshot &snapshot() const { return snapshot_; }
   [[nodiscard]] TransitionResult
-  startSequence(uint64_t now_us, const SequenceConfiguration &configuration);
+  startSequence(uint64_t now_us, const PreflightReadinessSnapshot &readiness,
+                StartMode mode);
   [[nodiscard]] TransitionResult cancelSequence();
   [[nodiscard]] TransitionResult disableFinControl();
   [[nodiscard]] TransitionResult liftoffDetectionEmergencyStop();
-  [[nodiscard]] TransitionResult restoreAfterReset(uint64_t now_us,
-                                                   const ResetCheckpoint &checkpoint);
+  [[nodiscard]] TransitionResult
+  restoreAfterReset(uint64_t now_us, const ResetCheckpoint &checkpoint);
   void tick(const MissionTickInput &input,
             const SafetyRequest &safety = SafetyRequest{});
 
@@ -104,8 +136,8 @@ private:
   void updateDirectives(uint64_t now_us);
   void invalidateLiftoff();
   void invalidateControlRollReference();
-  [[nodiscard]] bool
-  captureControlRollReference(const MissionTickInput &input);
+  void clearFlightAttemptMetadata();
+  [[nodiscard]] bool captureControlRollReference(const MissionTickInput &input);
 
   MissionSnapshot snapshot_{};
   bool control_gate_evaluated_{};

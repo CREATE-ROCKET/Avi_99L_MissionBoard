@@ -1,11 +1,9 @@
 #include "mission/mission_state.hpp"
 
 #include <cmath>
-#include <limits>
 
 namespace mission {
 namespace {
-
 constexpr uint64_t kOneSecondUs = 1'000'000;
 constexpr uint64_t kControlGateUs = 8 * kOneSecondUs;
 constexpr uint64_t kPressureDeploymentGateUs = 10 * kOneSecondUs;
@@ -17,7 +15,37 @@ uint32_t nextEpoch(uint32_t current) {
   return current == 0 ? 1 : current;
 }
 
+constexpr uint8_t bit(PreflightReadinessBit value) {
+  return static_cast<uint8_t>(1U << static_cast<uint8_t>(value));
+}
 } // 無名名前空間
+
+uint8_t PreflightReadinessSnapshot::readyMask() const {
+  uint8_t result = 0;
+  if (fin_zero_configured)
+    result |= bit(PreflightReadinessBit::fin_zero_configured);
+  if (parachute_open_configured)
+    result |= bit(PreflightReadinessBit::parachute_open_configured);
+  if (parachute_close_configured)
+    result |= bit(PreflightReadinessBit::parachute_close_configured);
+  if (motor_profile_valid)
+    result |= bit(PreflightReadinessBit::motor_profile_valid);
+  if (gyro_bias_valid)
+    result |= bit(PreflightReadinessBit::gyro_bias_valid);
+  if (gravity_reference_valid)
+    result |= bit(PreflightReadinessBit::gravity_reference_valid);
+  if (ssc_zero_valid)
+    result |= bit(PreflightReadinessBit::ssc_zero_valid);
+  return result;
+}
+
+uint8_t PreflightReadinessSnapshot::missingMask() const {
+  return static_cast<uint8_t>((~readyMask()) & kPreflightReadinessMask);
+}
+
+bool PreflightReadinessSnapshot::normalReady() const {
+  return resources_preallocated && missingMask() == 0;
+}
 
 bool ControlAvailability::ready() const {
   return fin_control_available && fin_zero_hold_valid && attitude_valid &&
@@ -27,17 +55,15 @@ bool ControlAvailability::ready() const {
          roll_estimator_timestamp_us != 0;
 }
 
-bool SequenceConfiguration::ready() const {
-  return fin_zero_configured && parachute_open_configured &&
-         parachute_close_configured && resources_preallocated;
-}
-
 TransitionResult MissionStateMachine::startSequence(
-    uint64_t, const SequenceConfiguration &configuration) {
+    uint64_t, const PreflightReadinessSnapshot &readiness, StartMode mode) {
   if (snapshot_.state != protocol::MissionState::command_receive)
     return TransitionResult::invalid_state;
-  if (!configuration.ready())
+  if (!readiness.resources_preallocated)
+    return TransitionResult::runtime_unavailable;
+  if (mode == StartMode::normal && readiness.missingMask() != 0)
     return TransitionResult::not_configured;
+
   snapshot_.flight_epoch = nextEpoch(snapshot_.flight_epoch);
   snapshot_.state = protocol::MissionState::liftoff_detection;
   snapshot_.fin_control_disabled = false;
@@ -45,9 +71,14 @@ TransitionResult MissionStateMachine::startSequence(
   snapshot_.reset_invalidated = false;
   snapshot_.deployment_started = false;
   snapshot_.deployment_power_cutoff_latched = false;
+  snapshot_.forced_start = mode == StartMode::forced;
+  snapshot_.preflight_generation = readiness.generation;
+  snapshot_.preflight_captured_at_us = readiness.captured_at_us;
+  snapshot_.preflight_ready_mask = readiness.readyMask();
+  snapshot_.preflight_missing_mask = readiness.missingMask();
   snapshot_.parachute = ParaDirective::hold;
   control_gate_evaluated_ = false;
-  fin_control_available_ = configuration.fin_zero_configured;
+  fin_control_available_ = readiness.fin_zero_configured;
   elapsed_offset_us_ = 0;
   invalidateControlRollReference();
   invalidateLiftoff();
@@ -67,6 +98,7 @@ TransitionResult MissionStateMachine::cancelSequence() {
   elapsed_offset_us_ = 0;
   invalidateControlRollReference();
   invalidateLiftoff();
+  clearFlightAttemptMetadata();
   updateDirectives(0);
   return TransitionResult::completed;
 }
@@ -96,32 +128,54 @@ TransitionResult MissionStateMachine::liftoffDetectionEmergencyStop() {
   elapsed_offset_us_ = 0;
   invalidateControlRollReference();
   invalidateLiftoff();
+  // 同一flight attempt由来なのでforced_start/preflight snapshotは維持する。
   updateDirectives(0);
   return TransitionResult::completed;
 }
 
 TransitionResult MissionStateMachine::restoreAfterReset(
     uint64_t now_us, const ResetCheckpoint &checkpoint) {
-  if (!checkpoint.valid || !checkpoint.elapsed_valid ||
-      checkpoint.state == protocol::MissionState::command_receive ||
-      checkpoint.state == protocol::MissionState::liftoff_detection)
+  if (!checkpoint.valid || checkpoint.flight_epoch == 0)
+    return TransitionResult::not_configured;
+  if (checkpoint.state == protocol::MissionState::liftoff_detection &&
+      checkpoint.elapsed_valid)
+    return TransitionResult::not_configured;
+  if (checkpoint.state != protocol::MissionState::liftoff_detection &&
+      (!checkpoint.elapsed_valid ||
+       (checkpoint.state != protocol::MissionState::engine_burn &&
+        checkpoint.state != protocol::MissionState::control &&
+        checkpoint.state != protocol::MissionState::descent)))
     return TransitionResult::not_configured;
 
   snapshot_ = {};
+  snapshot_.flight_epoch = checkpoint.flight_epoch;
+  snapshot_.forced_start = checkpoint.forced_start;
+  snapshot_.preflight_generation = checkpoint.preflight_generation;
+  snapshot_.preflight_captured_at_us = checkpoint.preflight_captured_at_us;
+  snapshot_.preflight_ready_mask = checkpoint.preflight_ready_mask;
+  snapshot_.preflight_missing_mask = checkpoint.preflight_missing_mask;
+  snapshot_.control_reentry_inhibited = true;
+  snapshot_.reset_invalidated = true;
+  invalidateControlRollReference();
+
+  if (checkpoint.state == protocol::MissionState::liftoff_detection) {
+    snapshot_.state = protocol::MissionState::liftoff_detection;
+    snapshot_.parachute = ParaDirective::hold;
+    control_gate_evaluated_ = false;
+    fin_control_available_ = false;
+    elapsed_offset_us_ = 0;
+    invalidateLiftoff();
+    updateDirectives(now_us);
+    return TransitionResult::completed;
+  }
+
   snapshot_.state = checkpoint.deployment_started ||
                             checkpoint.state == protocol::MissionState::descent
                         ? protocol::MissionState::descent
                         : protocol::MissionState::engine_burn;
-  snapshot_.flight_epoch = checkpoint.flight_epoch == 0
-                               ? 1
-                               : checkpoint.flight_epoch;
   snapshot_.liftoff_time_valid = true;
-  snapshot_.liftoff_time_us =
-      now_us;
+  snapshot_.liftoff_time_us = now_us;
   snapshot_.elapsed_us = checkpoint.elapsed_us;
-  snapshot_.control_reentry_inhibited = true;
-  snapshot_.reset_invalidated = true;
-  invalidateControlRollReference();
   snapshot_.deployment_started = checkpoint.deployment_started;
   snapshot_.deployment_power_cutoff_latched = checkpoint.power_cutoff_latched;
   snapshot_.fin = FinDirective::brake;
@@ -139,9 +193,8 @@ TransitionResult MissionStateMachine::restoreAfterReset(
 
 void MissionStateMachine::tick(const MissionTickInput &input,
                                const SafetyRequest &safety) {
-  const bool current_safety =
-      safety.flight_epoch != 0 &&
-      safety.flight_epoch == snapshot_.flight_epoch;
+  const bool current_safety = safety.flight_epoch != 0 &&
+                              safety.flight_epoch == snapshot_.flight_epoch;
   if (current_safety && snapshot_.liftoff_time_valid &&
       safety.absolute_power_cutoff)
     snapshot_.deployment_power_cutoff_latched = true;
@@ -160,18 +213,15 @@ void MissionStateMachine::tick(const MissionTickInput &input,
   uint64_t elapsed_us{};
   if (snapshot_.liftoff_time_valid &&
       input.monotonic_us >= snapshot_.liftoff_time_us)
-    elapsed_us = elapsed_offset_us_ +
-                 input.monotonic_us - snapshot_.liftoff_time_us;
+    elapsed_us = elapsed_offset_us_ + input.monotonic_us - snapshot_.liftoff_time_us;
   snapshot_.elapsed_us = elapsed_us;
   fin_control_available_ = input.control.fin_control_available;
 
-  const bool flight_state =
-      snapshot_.state == protocol::MissionState::engine_burn ||
-      snapshot_.state == protocol::MissionState::control;
+  const bool flight_state = snapshot_.state == protocol::MissionState::engine_burn ||
+                            snapshot_.state == protocol::MissionState::control;
   if (flight_state &&
       ((current_safety && safety.deploy) ||
-       (input.deployment_pressure_condition &&
-        snapshot_.liftoff_time_valid &&
+       (input.deployment_pressure_condition && snapshot_.liftoff_time_valid &&
         elapsed_us >= kPressureDeploymentGateUs) ||
        (snapshot_.liftoff_time_valid && elapsed_us >= kDeploymentDeadlineUs)))
     enterDescent();
@@ -180,11 +230,10 @@ void MissionStateMachine::tick(const MissionTickInput &input,
       snapshot_.liftoff_time_valid && elapsed_us >= kControlGateUs &&
       !control_gate_evaluated_) {
     control_gate_evaluated_ = true;
-    if (!snapshot_.fin_control_disabled &&
-        !snapshot_.control_reentry_inhibited && input.control.ready() &&
-        captureControlRollReference(input)) {
+    if (!snapshot_.fin_control_disabled && !snapshot_.control_reentry_inhibited &&
+        input.control.ready() && captureControlRollReference(input))
       snapshot_.state = protocol::MissionState::control;
-    } else
+    else
       snapshot_.control_reentry_inhibited = true;
   }
 
@@ -210,6 +259,8 @@ void MissionStateMachine::updateDirectives(uint64_t now_us) {
     snapshot_.parachute = ParaDirective::powered_off;
   else if (snapshot_.deployment_started)
     snapshot_.parachute = ParaDirective::open;
+  else
+    snapshot_.parachute = ParaDirective::hold;
 
   if (snapshot_.reset_invalidated || snapshot_.fin_control_disabled) {
     snapshot_.fin = FinDirective::brake;
@@ -248,6 +299,14 @@ void MissionStateMachine::invalidateControlRollReference() {
   snapshot_.control_roll_reference_capture_event_sequence =
       control_roll_reference_capture_event_sequence_;
   snapshot_.control_roll_reference_valid = false;
+}
+
+void MissionStateMachine::clearFlightAttemptMetadata() {
+  snapshot_.forced_start = false;
+  snapshot_.preflight_generation = 0;
+  snapshot_.preflight_captured_at_us = 0;
+  snapshot_.preflight_ready_mask = 0;
+  snapshot_.preflight_missing_mask = 0;
 }
 
 bool MissionStateMachine::captureControlRollReference(

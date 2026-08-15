@@ -43,26 +43,24 @@ ParachuteAction ParachuteController::tick(const ParachuteTick &input) {
   if (input.now_us < started_at_us_ ||
       input.now_us - started_at_us_ >= kGlobalDeadlineUs) {
     status_.state = ParachuteOpenState::retry_exhausted;
-    status_.power_cutoff_requested = true;
-    return ParachuteAction::cut_power;
+    status_.open_attempt_finished = true;
+    return ParachuteAction::stop_retrying;
   }
   if (input.target_reached && input.position_valid) {
     status_.state = ParachuteOpenState::open_confirmed;
     status_.servo_open_confirmed = true;
-    status_.power_cutoff_requested = true;
-    return ParachuteAction::cut_power;
+    status_.open_attempt_finished = true;
+    return ParachuteAction::hold_open;
   }
   if (input.now_us < window_started_at_us_ ||
       input.now_us - window_started_at_us_ < kProgressWindowUs)
     return ParachuteAction::none;
 
   bool progressed = false;
-  const auto previous =
-      AbsoluteParachuteAngle::fromCount(window_position_count_);
+  const auto previous = AbsoluteParachuteAngle::fromCount(window_position_count_);
   const auto current = AbsoluteParachuteAngle::fromCount(input.position_count);
   if (input.position_valid && previous.has_value() && current.has_value()) {
-    const auto displacement =
-        shortestParachuteDisplacement(*previous, *current);
+    const auto displacement = shortestParachuteDisplacement(*previous, *current);
     progressed = displacement.valid() &&
                  (displacement.counts >= kMinimumProgressCount ||
                   displacement.counts <= -kMinimumProgressCount);
@@ -78,7 +76,6 @@ ParachuteAction ParachuteController::tick(const ParachuteTick &input) {
 }
 
 void ParachuteController::notifyPowerCutoff() {
-  status_.power_cutoff_requested = true;
   status_.state = ParachuteOpenState::powered_off;
 }
 

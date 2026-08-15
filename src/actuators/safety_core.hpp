@@ -27,7 +27,8 @@ enum class ParachuteAction : uint8_t {
   none,
   command_open,
   retry_open,
-  cut_power,
+  hold_open,
+  stop_retrying,
 };
 
 enum class ParachuteOpenState : uint8_t {
@@ -50,7 +51,7 @@ struct ParachuteStatus {
   ParachuteOpenState state{ParachuteOpenState::idle};
   uint32_t retry_count{};
   bool servo_open_confirmed{};
-  bool power_cutoff_requested{};
+  bool open_attempt_finished{};
 };
 
 class ParachuteController {

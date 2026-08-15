@@ -101,6 +101,7 @@ enum class MissionEventFlag : uint16_t {
   liftoff_emergency_rollback = 1U << 12U,
   actuator_emergency_stop = 1U << 13U,
   fin_control_disabled_by_ground = 1U << 14U,
+  parachute_deployment_failure = 1U << 15U,
 };
 
 [[nodiscard]] constexpr uint16_t eventFlag(MissionEventFlag flag) {

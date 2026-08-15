@@ -12,6 +12,7 @@ enum class CommandCode : uint8_t {
   start_sequence = 0x01,
   cancel_sequence = 0x02,
   disable_fin_control = 0x03,
+  force_start_sequence = 0x04,
   fin_free = 0x10,
   set_fin_zero = 0x11,
   start_fin_zero_hold = 0x12,
@@ -42,8 +43,9 @@ enum class CommandDomain : uint8_t {
 
 struct CommandContext {
   protocol::MissionState state{protocol::MissionState::command_receive};
-  bool sequence_configured{};
   bool resources_preallocated{};
+  bool persistence_load_complete{};
+  bool persistence_runtime_available{};
   bool fin_available{true};
   bool parachute_available{true};
   bool motor_test_busy{};
@@ -70,7 +72,6 @@ struct EmergencyDecision {
 class CommandExecutor {
 public:
   static constexpr std::size_t kResultCacheSize = 16;
-
   [[nodiscard]] CommandDecision
   begin(const protocol::GenericCommandRequest &request,
         const CommandContext &context);
@@ -94,14 +95,12 @@ private:
     protocol::CommandResult result{};
     CommandDomain domain{CommandDomain::sequence};
   };
-
   [[nodiscard]] Entry *find(uint8_t transaction_id);
   [[nodiscard]] const Entry *find(uint8_t transaction_id) const;
   [[nodiscard]] Entry *allocate();
   void remember(const protocol::GenericCommandRequest &request,
                 const protocol::CommandResult &result, bool pending,
                 CommandDomain domain);
-
   std::array<Entry, kResultCacheSize> entries_{};
   uint32_t age_{};
 };

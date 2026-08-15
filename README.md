@@ -295,3 +295,13 @@ CANはstandard 11-bit、125 kbit/s、DLC 8以下、multi-byteはlittle-endianで
 - Deep SleepはRTC marker/wake causeを検証した専用task subsetで10秒周期wakeします。Internal Flash/SD log reader未接続のためlog dump要求は`SourceUnavailable`です。2秒command windowは`TODO(HW_TEST)`です。
 - 3基板実機でMission→ComBoard CAN、ComBoard↔Ground LoRa、Ground→Missionの安全なcommand round-tripは確認済みです。今回接続したproduction motor motion、STS収納保持/Open、差圧zero、Control遷移、5秒/25秒cutoffは未検証であり、成功扱いしません。
 - Mission基板上のmicroSDはbring-up `sd-test`で1 MiB write/read/CRCをPASSしていますが、Mission production loggerは未接続です。今回BLOCKEDとなった`CAN.CSV` logging/readbackはComBoard側microSDの初期化問題であり、Missionのbring-up microSD PASSを取り消す結果ではありません。
+
+
+## ForceStartSequence / Parachute Stage 2
+
+- `ForceStartSequence`はcommand code `0x04`で、通常Startの7項目preflight missing gateだけをbypassします。
+- Open/Closeは独立optionalの1回転絶対角としてflight snapshotへfreezeし、Open/Close相互のhalf-turnはStart拒否理由にしません。
+- deploymentでは毎回fresh currentからsnapshot targetへのshortest pathを計算し、exact half-turnは動かしません。
+- ForceStartではSTS unavailable/read/Hold failureだけでLiftoffDetection遷移を失敗させず、Healthを正常へ偽装しません。
+- Open retryの約5秒deadlineはretry終了期限であり電源遮断期限ではありません。Hold/reconnectとパラシュート電源は離床+25秒まで維持し、+25秒で絶対cutoffします。
+- `forced_start`とpreflight snapshot/missing mask、optional parachute snapshotはsoftware/watchdog reset時にRTC checkpointから復元します。
