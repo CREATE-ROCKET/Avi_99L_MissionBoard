@@ -1,5 +1,6 @@
 #pragma once
 
+#include "characterization/absolute_periodic_timer.hpp"
 #include "characterization/campaign_state_machine.hpp"
 #include "characterization/command_journal.hpp"
 #include "characterization/encoder_sampler.hpp"
@@ -10,7 +11,6 @@
 
 #if defined(ESP_PLATFORM)
 #include "actuators/production_motor.hpp"
-#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #endif
@@ -49,7 +49,9 @@ private:
   static esp_err_t motorApply(void *context,
                               const MotorCommandRequest &request,
                               std::uint64_t &completed_at_us);
-  static void consumerTimerCallback(void *context);
+  static bool consumerTimerCallback(
+      gptimer_handle_t timer, const gptimer_alarm_event_data_t *event,
+      void *context);
   [[nodiscard]] esp_err_t startConsumerTimer(
       std::uint64_t epoch_zero_us);
   [[nodiscard]] esp_err_t stopConsumerTimer() noexcept;
@@ -66,7 +68,7 @@ private:
   EncoderSampler &sampler_;
   LogWriterV5 &writer_;
   PowerSampler power_sampler_{};
-  esp_timer_handle_t consumer_timer_{nullptr};
+  AbsolutePeriodicTimer consumer_timer_{};
   std::atomic<TaskHandle_t> consumer_task_{nullptr};
   std::atomic<bool> consumer_timer_running_{false};
 #endif
