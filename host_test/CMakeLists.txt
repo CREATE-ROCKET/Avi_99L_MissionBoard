@@ -37,3 +37,16 @@ target_compile_options(parachute_configuration_tests PRIVATE
 )
 
 add_test(NAME parachute_configuration_tests COMMAND parachute_configuration_tests)
+
+add_executable(mission_state_safety_regression_tests
+  mission_state_safety_regression_tests.cpp
+  ../src/mission/mission_state.cpp
+)
+target_include_directories(mission_state_safety_regression_tests PRIVATE ../src)
+target_compile_features(mission_state_safety_regression_tests PRIVATE cxx_std_17)
+target_compile_options(mission_state_safety_regression_tests PRIVATE
+  -Wall -Wextra -Wpedantic -Werror
+)
+
+add_test(NAME mission_state_safety_regression_tests
+         COMMAND mission_state_safety_regression_tests)
