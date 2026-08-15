@@ -1,5 +1,6 @@
 #pragma once
 
+#include "characterization/absolute_periodic_timer.hpp"
 #include "characterization/characterization_types.hpp"
 #include "characterization/platform_compat.hpp"
 #include "characterization/spsc_ring.hpp"
@@ -7,7 +8,6 @@
 #if defined(ESP_PLATFORM)
 #include "bringup/encoder_bringup.hpp"
 #include "bringup/spi_bringup.hpp"
-#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -46,7 +46,9 @@ public:
 
 private:
 #if defined(ESP_PLATFORM)
-  static void timerCallback(void *context);
+  static bool timerCallback(gptimer_handle_t timer,
+                            const gptimer_alarm_event_data_t *event,
+                            void *context);
   static void taskEntry(void *context);
   void taskLoop();
   void rememberFirst(esp_err_t error) noexcept;
@@ -57,7 +59,7 @@ private:
 
   bringup::SpiBringup spi_{};
   bringup::EncoderBringup encoder_{};
-  esp_timer_handle_t timer_{nullptr};
+  AbsolutePeriodicTimer timer_{};
   StaticTask_t task_tcb_{};
   StackType_t task_stack_[4096]{};
   TaskHandle_t task_{nullptr};
