@@ -1,5 +1,2 @@
-# Characterizationの高精度timer callbackをtask dispatchではなくISRから直接dispatchする。
-CONFIG_ESP_TIMER_SUPPORTS_ISR_DISPATCH_METHOD=y
-
-# timer ISRはESP-IDF既定と同じCPU0へ固定し、CPU1固定のrealtime taskへFromISR通知する。
-CONFIG_ESP_TIMER_ISR_AFFINITY_CPU0=y
+# Characterizationのepoch/sample clockはGPTimer ISRを使用する。
+CONFIG_GPTIMER_ISR_HANDLER_IN_IRAM=y
