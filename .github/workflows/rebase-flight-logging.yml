@@ -16,6 +16,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          submodules: recursive
       - name: Apply verified logging diff to current main
         run: |
           git fetch origin feat/flight-logging-recovery-20260816
