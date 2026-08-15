@@ -85,10 +85,13 @@ inline constexpr control::RollGainSchedule kRollGainSchedule{
       {180.0, {0.08, 2.32, 0.04, 0.296}}}},
     true};
 
-[[nodiscard]] inline bool productionFlightConfigurationReady() {
+[[nodiscard]] inline bool motorProfileValid() {
   return board::kFlightMotorA.parameters_valid &&
-         board::kFlightMotorA.polarity !=
-             board::MotorPolarity::unconfigured &&
+         board::kFlightMotorA.polarity != board::MotorPolarity::unconfigured;
+}
+
+[[nodiscard]] inline bool nonBypassFlightConfigurationReady() {
+  return
          board::kFinSoftwareLimits.configured &&
          board::kFinSoftwareLimits.minimum_rad <
              board::kFinSoftwareLimits.maximum_rad &&
@@ -98,6 +101,10 @@ inline constexpr control::RollGainSchedule kRollGainSchedule{
          kRollGainSchedule.configured &&
          kMotorBusVoltageV > 0.0 && kProductionMotorMaximumDuty > 0.0 &&
          kProductionMotorMaximumDuty <= 1.0;
+}
+
+[[nodiscard]] inline bool productionFlightConfigurationReady() {
+  return motorProfileValid() && nonBypassFlightConfigurationReady();
 }
 
 } // namespace flight_config
