@@ -84,9 +84,12 @@ constexpr uint32_t kImuInterpolatableMissingSamples = 1;
 constexpr MotorProfile kFlightMotorA{1, MotorPolarity::positive_in1, true,
                                      3.48F, 0.00855F, 1120.0F, 0.60F,
                                      2.0F, 1.21208F};
+// TODO(HW_TEST): flight用qualification完了時だけtrueへ変更する。
+constexpr bool kFlightMotorAFlightQualified = false;
 // TODO(HW_TEST): SpareMotorB実測値
 constexpr MotorProfile kSpareMotorB{2, MotorPolarity::unconfigured, false,
                                     0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
+constexpr bool kSpareMotorBFlightQualified = false;
 
 // TODO(HW_TEST): 動翼・stopper組付後の実測値でsoftware limitを確定する。
 // 機械上限±15 degに対し、暫定的に1 degのmarginを設ける。
