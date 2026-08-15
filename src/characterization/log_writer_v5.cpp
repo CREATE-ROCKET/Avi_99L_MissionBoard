@@ -2,15 +2,17 @@
 
 #if defined(AVI_99L_CHARACTERIZATION) && AVI_99L_CHARACTERIZATION
 
-#include "config/board_config.hpp"
 #include "characterization/best_effort_file_close.hpp"
+#include "characterization/rate_check_stage_diagnostics.hpp"
 #include "characterization/record_validation.hpp"
+#include "config/board_config.hpp"
 #include "driver/sdmmc_host.h"
 #include "esp_timer.h"
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
 
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -284,6 +286,7 @@ esp_err_t LogWriterV5::open(const LogHeaderV5 &header,
   file_crc32_ = wire_v5::crc32(bytes.data(), bytes.size());
   synced_.store(false);
   accepting_.store(true);
+  beginRateCheckStageDiagnostics(header.encoder_rate, header.run_kind);
   return ESP_OK;
 }
 
@@ -297,6 +300,7 @@ esp_err_t LogWriterV5::enqueue(
     return ESP_ERR_INVALID_RESPONSE;
   }
   // queueへ完成済みrecordを値コピーし、writerはlive motor stateを読まない。
+  RateCheckStageScope timing(RateCheckStage::WriterEnqueue);
   if (xQueueSend(queue_, &record, 0U) != pdTRUE) {
     queue_overflows_.fetch_add(1U);
     rememberFirst(ESP_ERR_NO_MEM);
@@ -315,20 +319,44 @@ esp_err_t LogWriterV5::drainAndSync() {
 }
 
 esp_err_t LogWriterV5::close(const LogFooterV5 &footer) {
-  if (file_ == nullptr)
+  if (file_ == nullptr) {
+    endRateCheckStageDiagnostics();
     return ESP_ERR_INVALID_STATE;
+  }
   accepting_.store(false);
   ControlRequest request{};
   request.kind = ControlKind::Finalize;
   request.footer = footer;
-  return submitControl(request);
+  const esp_err_t result = submitControl(request);
+
+  const RateCheckStageDiagnostics diagnostics =
+      rateCheckStageDiagnosticsSnapshot();
+  if (diagnostics.active) {
+    std::printf(
+        "CHAR_RATE_STAGE rate=%u power-latest-max-us=%u "
+        "encoder-drain-max-us=%u assembler-release-max-us=%u "
+        "angle-convert-max-us=%u record-validate-max-us=%u "
+        "writer-enqueue-max-us=%u encoder-read-max-us=%u\n",
+        static_cast<unsigned>(diagnostics.rate),
+        static_cast<unsigned>(diagnostics.power_latest_max_us),
+        static_cast<unsigned>(diagnostics.encoder_drain_max_us),
+        static_cast<unsigned>(diagnostics.assembler_release_max_us),
+        static_cast<unsigned>(diagnostics.angle_convert_max_us),
+        static_cast<unsigned>(diagnostics.record_validate_max_us),
+        static_cast<unsigned>(diagnostics.writer_enqueue_max_us),
+        static_cast<unsigned>(diagnostics.encoder_read_max_us));
+  }
+  endRateCheckStageDiagnostics();
+  return result;
 }
 
 esp_err_t LogWriterV5::abortAndClose(LogFooterV5 footer) {
   footer.completion = CompletionCode::Aborted;
   footer.unsupported_reason = UnsupportedReason::None;
-  if (file_ == nullptr)
+  if (file_ == nullptr) {
+    endRateCheckStageDiagnostics();
     return ESP_OK;
+  }
   esp_err_t result = drainAndSync();
   const esp_err_t close_result = close(footer);
   rememberOperation(close_result, result);

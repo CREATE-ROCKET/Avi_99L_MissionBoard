@@ -3,6 +3,7 @@
 #if defined(AVI_99L_CHARACTERIZATION) && AVI_99L_CHARACTERIZATION
 
 #include "bringup/power_bringup.hpp"
+#include "characterization/rate_check_stage_diagnostics.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -113,6 +114,7 @@ esp_err_t PowerSampler::stop() noexcept {
 
 bool PowerSampler::latest(std::uint64_t snapshot_us,
                           PowerEvidence &evidence) noexcept {
+  RateCheckStageScope timing(RateCheckStage::PowerLatest);
   PowerEvidence candidate{};
   while (queue_.pop(candidate)) {
     latest_ = candidate;

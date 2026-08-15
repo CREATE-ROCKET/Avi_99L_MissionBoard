@@ -1,4 +1,5 @@
 #include "characterization/record_validation.hpp"
+#include "characterization/rate_check_stage_diagnostics.hpp"
 
 namespace avi::characterization {
 namespace {
@@ -31,6 +32,7 @@ constexpr bool knownRunKind(RunKind kind) noexcept {
 
 RecordValidationError
 validateRecord(const ImmutableLogRecord &record) noexcept {
+  RateCheckStageScope timing(RateCheckStage::RecordValidate);
   RecordValidationError error = RecordValidationError::None;
   if (!isKnownStage(record.stage))
     error = error | RecordValidationError::InvalidStage;

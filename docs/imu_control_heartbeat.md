@@ -133,3 +133,21 @@ diagnostic-continued
 ```
 
 `consumer-alarm-late-max-us`はGPTimer alarm時刻からISR callback実行まで、`consumer-isr-task-max-us`はISRから`char_runtime`再開まで、`consumer-work-max-us`は前epoch releaseから次のnotification待機へ入るまでの最大処理時間を表す。encoder側もalarm、task wake、実captureまでを分離して記録し、5 kHzのslot越境原因を切り分ける。
+
+ESP-IDF 6.0.1のGPTimerはauto-reload時、alarm後にcounterをreload値へ戻した後の値をISRでcaptureする。そのため`AbsolutePeriodicTimer`は利用側callbackへ渡すeventを正規化し、`count_value - alarm_value`が1周期未満のalarm→ISR遅延を表すようにする。1周期以上ISRが遅れた場合は既存のnotification/schedule validationでqualification失敗とする。
+
+consumerの1 ms処理時間を切り分けるため、rate-checkではさらに`CHAR_RATE_STAGE`を出力する。
+
+```text
+power-latest-max-us
+encoder-drain-max-us
+assembler-release-max-us
+angle-convert-max-us
+record-validate-max-us
+writer-enqueue-max-us
+encoder-read-max-us
+```
+
+`encoder-read-max-us`はpriority 23のencoder taskで`readPipelined()`に要した最大wall-timeであり、sampler停止後にconsumer側diagnosticへ転記する。その他は`char_runtime`単独所有のdiagnostic stateへ記録するため、ISR共有lockを追加しない。stage profilerはrate-check時だけ有効で、full profileのrealtime pathには追加計測を入れない。
+
+`CHAR_RATE_STAGE`は診断用であり、`CHAR_RATE_RESULT`、V5 record/footer、100 us deadline、fixed epoch、capture timestampによるslot所属判定を変更しない。

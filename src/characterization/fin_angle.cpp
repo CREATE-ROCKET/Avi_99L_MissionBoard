@@ -1,6 +1,7 @@
 #include "characterization/fin_angle.hpp"
 
 #include "characterization/characterization_types.hpp"
+#include "characterization/rate_check_stage_diagnostics.hpp"
 
 #include <cmath>
 #include <limits>
@@ -10,6 +11,7 @@ namespace avi::characterization {
 bool finAngleMilliDegreesFromUnwrappedQ16(
     std::int64_t mean_unwrapped_counts_q16, std::uint16_t zero_raw,
     std::int32_t &fin_angle_millideg) noexcept {
+  RateCheckStageScope timing(RateCheckStage::AngleConvert);
   constexpr long double kCountsPerMotorTurn = 16'384.0L;
   constexpr long double kQ16Scale = 65'536.0L;
   const long double unwrapped_counts =

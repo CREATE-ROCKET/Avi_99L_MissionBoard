@@ -2,6 +2,7 @@
 
 #if defined(AVI_99L_CHARACTERIZATION) && AVI_99L_CHARACTERIZATION
 
+#include "characterization/rate_check_stage_diagnostics.hpp"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -187,7 +188,20 @@ void EncoderSampler::taskLoop() {
       continue;
     }
     bringup::EncoderSample captured{};
+    const bool timing_enabled =
+        rate_check_timing_enabled_.load(std::memory_order_acquire);
+    const std::int64_t read_started_us =
+        timing_enabled ? esp_timer_get_time() : 0;
     const esp_err_t read_result = encoder_.readPipelined(captured);
+    if (timing_enabled && read_started_us > 0) {
+      const std::int64_t read_finished_us = esp_timer_get_time();
+      if (read_finished_us >= read_started_us) {
+        max_read_duration_us_ = std::max(
+            max_read_duration_us_,
+            saturateU32(static_cast<std::uint64_t>(read_finished_us -
+                                                   read_started_us)));
+      }
+    }
 
     RawEncoderSample sample{};
     sample.generation = ++generation_;
@@ -267,6 +281,11 @@ esp_err_t EncoderSampler::begin(EncoderRate rate,
   portEXIT_CRITICAL(&timing_lock_);
   max_isr_to_task_us_.store(0U, std::memory_order_relaxed);
   max_capture_lateness_us_.store(0U, std::memory_order_relaxed);
+  drain_timing_started_us_ = 0U;
+  drain_timing_active_ = false;
+  rate_check_timing_enabled_.store(rateCheckStageDiagnosticsActive(),
+                                   std::memory_order_release);
+  max_read_duration_us_ = 0U;
   generation_ = 0U;
   period_us_ = period;
   samples_per_epoch_ = expectedSamplesPerEpoch(rate);
@@ -363,6 +382,13 @@ esp_err_t EncoderSampler::stop() {
       rememberOperation(ESP_FAIL, cleanup_error);
   }
 
+  if (rate_check_timing_enabled_.load(std::memory_order_acquire))
+    recordRateCheckStageDuration(RateCheckStage::EncoderRead,
+                                 max_read_duration_us_);
+  rate_check_timing_enabled_.store(false, std::memory_order_release);
+  drain_timing_active_ = false;
+  drain_timing_started_us_ = 0U;
+
   if (pipeline_running_) {
     const esp_err_t pipeline_result = encoder_.stopPipelinedRead();
     rememberOperation(pipeline_result, cleanup_error);
@@ -417,7 +443,29 @@ EncoderTimingDiagnostics EncoderSampler::timingDiagnostics() const noexcept {
 }
 
 bool EncoderSampler::pop(RawEncoderSample &sample) noexcept {
-  return queue_.pop(sample);
+  const bool popped = queue_.pop(sample);
+  if (!rate_check_timing_enabled_.load(std::memory_order_acquire) ||
+      !running_.load(std::memory_order_acquire)) {
+    drain_timing_active_ = false;
+    drain_timing_started_us_ = 0U;
+    return popped;
+  }
+
+  if (popped) {
+    if (!drain_timing_active_) {
+      drain_timing_started_us_ = rateCheckStageNowUs();
+      drain_timing_active_ = drain_timing_started_us_ != 0U;
+    }
+  } else if (drain_timing_active_) {
+    const std::uint64_t finished_us = rateCheckStageNowUs();
+    if (finished_us >= drain_timing_started_us_) {
+      recordRateCheckStageDuration(RateCheckStage::EncoderDrain,
+                                   finished_us - drain_timing_started_us_);
+    }
+    drain_timing_active_ = false;
+    drain_timing_started_us_ = 0U;
+  }
+  return popped;
 }
 
 } // 名前空間 avi::characterization

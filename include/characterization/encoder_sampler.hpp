@@ -76,8 +76,12 @@ private:
   std::uint64_t epoch_zero_us_{0};
   std::uint64_t first_sample_us_{0};
   std::uint64_t last_sampled_slot_{0};
+  std::uint64_t drain_timing_started_us_{0U};
   bool have_sampled_slot_{false};
+  bool drain_timing_active_{false};
+  std::atomic<bool> rate_check_timing_enabled_{false};
   std::uint32_t period_us_{0};
+  std::uint32_t max_read_duration_us_{0U};
   std::uint8_t samples_per_epoch_{0};
   std::uint64_t generation_{0};
   AS5047D::Status startup_status_{};

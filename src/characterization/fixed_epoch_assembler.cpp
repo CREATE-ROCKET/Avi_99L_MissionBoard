@@ -1,4 +1,5 @@
 #include "characterization/fixed_epoch_assembler.hpp"
+#include "characterization/rate_check_stage_diagnostics.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -153,6 +154,7 @@ AddSampleResult FixedEpochAssembler::add(
 bool FixedEpochAssembler::release(std::uint64_t epoch_index,
                                   std::uint64_t release_timestamp_us,
                                   EncoderEpochBlock &block) noexcept {
+  RateCheckStageScope timing(RateCheckStage::AssemblerRelease);
   if (!initialized_ || samples_per_epoch_ == 0U)
     return false;
   if ((!has_released_epoch_ && epoch_index != 0U) ||

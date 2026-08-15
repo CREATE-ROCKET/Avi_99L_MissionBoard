@@ -7,6 +7,7 @@
 #include "esp_timer.h"
 
 #include <cstdint>
+#include <limits>
 
 namespace avi::characterization {
 
@@ -23,8 +24,14 @@ public:
                                      void *user_context) noexcept {
     if (callback == nullptr)
       return ESP_ERR_INVALID_ARG;
-    if (timer_ != nullptr)
-      return ESP_OK;
+    if (timer_ != nullptr) {
+      return callback_ == callback && user_context_ == user_context
+                 ? ESP_OK
+                 : ESP_ERR_INVALID_STATE;
+    }
+
+    callback_ = callback;
+    user_context_ = user_context;
 
     gptimer_config_t config{};
     config.clk_src = GPTIMER_CLK_SRC_DEFAULT;
@@ -33,16 +40,20 @@ public:
     config.intr_priority = 0;
 
     esp_err_t result = gptimer_new_timer(&config, &timer_);
-    if (result != ESP_OK)
+    if (result != ESP_OK) {
+      callback_ = nullptr;
+      user_context_ = nullptr;
       return result;
+    }
 
     gptimer_event_callbacks_t callbacks{};
-    callbacks.on_alarm = callback;
-    result = gptimer_register_event_callbacks(timer_, &callbacks,
-                                              user_context);
+    callbacks.on_alarm = alarmCallback;
+    result = gptimer_register_event_callbacks(timer_, &callbacks, this);
     if (result != ESP_OK) {
       (void)gptimer_del_timer(timer_);
       timer_ = nullptr;
+      callback_ = nullptr;
+      user_context_ = nullptr;
       return result;
     }
 
@@ -50,6 +61,8 @@ public:
     if (result != ESP_OK) {
       (void)gptimer_del_timer(timer_);
       timer_ = nullptr;
+      callback_ = nullptr;
+      user_context_ = nullptr;
       return result;
     }
     enabled_ = true;
@@ -75,9 +88,12 @@ public:
     if (result != ESP_OK)
       return result;
 
+    period_us_ = period_us;
     result = gptimer_start(timer_);
-    if (result != ESP_OK)
+    if (result != ESP_OK) {
+      period_us_ = 0U;
       return result;
+    }
     running_ = true;
 
     result = synchronizeToEspTimer();
@@ -90,6 +106,7 @@ public:
     if (result != ESP_OK) {
       const esp_err_t stop_result = gptimer_stop(timer_);
       running_ = false;
+      period_us_ = 0U;
       return stop_result == ESP_OK ? result : stop_result;
     }
     return ESP_OK;
@@ -103,6 +120,7 @@ public:
       result = gptimer_stop(timer_);
       running_ = false;
     }
+    period_us_ = 0U;
     const esp_err_t alarm_result = gptimer_set_alarm_action(timer_, nullptr);
     return result == ESP_OK ? alarm_result : result;
   }
@@ -111,6 +129,41 @@ public:
   [[nodiscard]] bool running() const noexcept { return running_; }
 
 private:
+  static bool alarmCallback(gptimer_handle_t timer,
+                            const gptimer_alarm_event_data_t *event,
+                            void *context) noexcept {
+    auto &self = *static_cast<AbsolutePeriodicTimer *>(context);
+    if (self.callback_ == nullptr)
+      return false;
+    if (event == nullptr || self.period_us_ == 0U ||
+        event->alarm_value < self.period_us_) {
+      return self.callback_(timer, event, self.user_context_);
+    }
+
+    gptimer_alarm_event_data_t normalized = *event;
+    const std::uint64_t reload_value =
+        event->alarm_value - static_cast<std::uint64_t>(self.period_us_);
+    std::uint64_t lateness_us = 0U;
+
+    // ESP-IDF 6.0.1のGPTimerはauto-reload alarm発生後のcounterをISRでcaptureする。
+    // 通常はreload_valueからISR captureまで進んだcountがalarm遅延となる。
+    // countがalarm_value以上の場合はpre-reload captureとの両実装を許容し、
+    // その差を使用する。1周期以上のISR遅延は既存schedule validationで失敗扱いになる。
+    if (event->count_value >= event->alarm_value) {
+      lateness_us = event->count_value - event->alarm_value;
+    } else if (event->count_value >= reload_value) {
+      lateness_us = event->count_value - reload_value;
+    }
+
+    if (lateness_us >
+        std::numeric_limits<std::uint64_t>::max() - event->alarm_value) {
+      normalized.count_value = std::numeric_limits<std::uint64_t>::max();
+    } else {
+      normalized.count_value = event->alarm_value + lateness_us;
+    }
+    return self.callback_(timer, &normalized, self.user_context_);
+  }
+
   [[nodiscard]] esp_err_t synchronizeToEspTimer() noexcept {
     // set_raw_count() が長くpreemptされた場合はその試行を採用せず再同期する。
     // 5 kHz slot中心から境界まで100 usなので、25 us以内のclock offsetを要求する。
@@ -154,6 +207,9 @@ private:
 
   static constexpr std::uint32_t kResolutionHz = 1'000'000U;
   gptimer_handle_t timer_{nullptr};
+  gptimer_alarm_cb_t callback_{nullptr};
+  void *user_context_{nullptr};
+  std::uint32_t period_us_{0U};
   bool enabled_{false};
   bool running_{false};
 };
