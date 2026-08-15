@@ -5,10 +5,21 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "sdkconfig.h"
 #include "sensors/as5047d_health.hpp"
 
 #include <algorithm>
 #include <limits>
+
+#if !defined(CONFIG_ESP_TIMER_SUPPORTS_ISR_DISPATCH_METHOD) ||                 \
+    !CONFIG_ESP_TIMER_SUPPORTS_ISR_DISPATCH_METHOD
+#error "characterization requires ESP timer ISR dispatch support"
+#endif
+
+#if !defined(CONFIG_ESP_TIMER_ISR_AFFINITY_CPU1) ||                           \
+    !CONFIG_ESP_TIMER_ISR_AFFINITY_CPU1
+#error "characterization esp_timer ISR must be pinned to CPU1"
+#endif
 
 namespace avi::characterization {
 namespace {
@@ -77,9 +88,16 @@ std::uint16_t EncoderSampler::statusFlags(
 
 void EncoderSampler::timerCallback(void *context) {
   auto &sampler = *static_cast<EncoderSampler *>(context);
-  // callbackは固定lifetimeのtask handleへ通知するだけで、SPI/fileへ触れない。
-  if (sampler.running_.load() && sampler.task_ != nullptr)
-    xTaskNotifyGive(sampler.task_);
+  // ESP_TIMER_ISRから固定lifetimeのtask handleへ通知するだけに留める。
+  // SAFETY: task_はstatic taskで、EncoderSamplerのlifetime中に削除されない。
+  // ISRではSPI、heap、file I/O、blocking APIを一切呼ばない。
+  if (!sampler.running_.load(std::memory_order_acquire) ||
+      sampler.task_ == nullptr)
+    return;
+  BaseType_t task_awoken = pdFALSE;
+  vTaskNotifyGiveFromISR(sampler.task_, &task_awoken);
+  if (task_awoken == pdTRUE)
+    esp_timer_isr_dispatch_need_yield();
 }
 
 void EncoderSampler::taskEntry(void *context) {
@@ -270,7 +288,7 @@ esp_err_t EncoderSampler::begin(EncoderRate rate,
     esp_timer_create_args_t arguments{};
     arguments.callback = timerCallback;
     arguments.arg = this;
-    arguments.dispatch_method = ESP_TIMER_TASK;
+    arguments.dispatch_method = ESP_TIMER_ISR;
     arguments.name = "char_encoder";
     arguments.skip_unhandled_events = true;
     result = esp_timer_create(&arguments, &timer_);
@@ -286,10 +304,10 @@ esp_err_t EncoderSampler::begin(EncoderRate rate,
     vTaskDelay(1U);
   while (esp_timer_get_time() < timer_start_us)
     taskYIELD();
-  running_.store(true);
+  running_.store(true, std::memory_order_release);
   result = esp_timer_start_periodic(timer_, period_us_);
   if (result != ESP_OK) {
-    running_.store(false);
+    running_.store(false, std::memory_order_release);
     (void)stop();
   }
   return result;
@@ -298,7 +316,7 @@ esp_err_t EncoderSampler::begin(EncoderRate rate,
 esp_err_t EncoderSampler::stop() {
   esp_err_t diagnostic_error = first_error_.load();
   esp_err_t cleanup_error = ESP_OK;
-  running_.store(false);
+  running_.store(false, std::memory_order_release);
   if (timer_ != nullptr && esp_timer_is_active(timer_))
     rememberOperation(esp_timer_stop(timer_), cleanup_error);
   if (task_ != nullptr && stop_ack_ != nullptr) {

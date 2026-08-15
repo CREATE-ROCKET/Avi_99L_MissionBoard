@@ -235,10 +235,17 @@ ProfileRunner::ProfileRunner(CampaignStateMachine &campaign,
 
 void ProfileRunner::consumerTimerCallback(void *context) {
   auto &runner = *static_cast<ProfileRunner *>(context);
-  // timer callbackは固定lifetimeのconsumer taskへ通知するだけでI/Oを行わない。
-  const TaskHandle_t consumer = runner.consumer_task_.load();
-  if (runner.consumer_timer_running_.load() && consumer != nullptr)
-    xTaskNotifyGive(consumer);
+  // ESP_TIMER_ISRでは固定lifetimeのconsumer taskへ通知するだけに留める。
+  // SAFETY: consumerはchar_runtime taskでrun中に削除されず、ISRではI/Oを行わない。
+  const TaskHandle_t consumer =
+      runner.consumer_task_.load(std::memory_order_acquire);
+  if (!runner.consumer_timer_running_.load(std::memory_order_acquire) ||
+      consumer == nullptr)
+    return;
+  BaseType_t task_awoken = pdFALSE;
+  vTaskNotifyGiveFromISR(consumer, &task_awoken);
+  if (task_awoken == pdTRUE)
+    esp_timer_isr_dispatch_need_yield();
 }
 
 esp_err_t ProfileRunner::startConsumerTimer(
@@ -256,7 +263,7 @@ esp_err_t ProfileRunner::startConsumerTimer(
     esp_timer_create_args_t arguments{};
     arguments.callback = consumerTimerCallback;
     arguments.arg = this;
-    arguments.dispatch_method = ESP_TIMER_TASK;
+    arguments.dispatch_method = ESP_TIMER_ISR;
     arguments.name = "char_consumer";
     arguments.skip_unhandled_events = true;
     const esp_err_t create_result =
@@ -274,28 +281,27 @@ esp_err_t ProfileRunner::startConsumerTimer(
   while (nowUs() < epoch_zero_us)
     taskYIELD();
 
-  // scheduler都合でepoch zeroから100 us以上遅れただけでrun自体をFailedにしない。
-  // periodic timerを開始し、実際のcommand/release latenessを固定1 ms gridに対して
-  // 計測する。rate-checkならDeadlineMissとしてunsupported、fullなら安全停止する。
-  consumer_timer_running_.store(true);
+  // epoch zeroから固定1 ms gridでISR callbackを開始する。
+  // rate-checkでは100 us release deadlineを維持し、基準自体は緩和しない。
+  consumer_timer_running_.store(true, std::memory_order_release);
   const esp_err_t result =
       esp_timer_start_periodic(consumer_timer_, kEpochDurationUs);
   if (result != ESP_OK) {
-    consumer_timer_running_.store(false);
+    consumer_timer_running_.store(false, std::memory_order_release);
     (void)stopConsumerTimer();
   }
   return result;
 }
 
 esp_err_t ProfileRunner::stopConsumerTimer() noexcept {
-  consumer_timer_running_.store(false);
+  consumer_timer_running_.store(false, std::memory_order_release);
   esp_err_t result = ESP_OK;
   if (consumer_timer_ != nullptr && esp_timer_is_active(consumer_timer_))
     result = esp_timer_stop(consumer_timer_);
   writer_.setFailureNotificationTask(nullptr);
   sampler_.setFailureNotificationTask(nullptr);
   power_sampler_.setFailureNotificationTask(nullptr);
-  consumer_task_.store(nullptr);
+  consumer_task_.store(nullptr, std::memory_order_release);
   return result;
 }
 
