@@ -1,0 +1,41 @@
+name: verify-vault-recovery
+
+on:
+  push:
+    branches:
+      - fix/vault-recovery-profile-20260816
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/vault-recovery-profile-20260816
+          submodules: recursive
+      - name: Apply checked verification patch
+        run: python3 tools/apply_vault_verification_patch.py
+      - name: Check whitespace
+        run: git diff --check
+      - name: Configure host tests
+        run: cmake -S host_test -B build/host -DCMAKE_BUILD_TYPE=Debug
+      - name: Build host tests
+        run: cmake --build build/host --parallel 2
+      - name: Run host tests
+        run: ctest --test-dir build/host --output-on-failure
+      - name: Install PlatformIO
+        run: python3 -m pip install platformio
+      - name: Build production firmware
+        run: pio run -e avi_99l_missionboard
+      - name: Commit verified changes
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git rm tools/apply_vault_verification_patch.py .github/workflows/verify-vault-recovery.yml
+          git add src/runtime/production_runtime.cpp src/protocol/can_protocol.cpp host_test/mission_host_tests.cpp testdata/99l_protocol_golden_vectors.txt
+          git commit -m "fix(mission): finalize Vault recovery contracts"
+          git push origin HEAD:fix/vault-recovery-profile-20260816
