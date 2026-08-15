@@ -47,9 +47,30 @@ constexpr std::uint32_t kApproachPulsePeriodEpochs = 20U;
 constexpr std::uint32_t kApproachPulseOnEpochs = 8U;
 constexpr std::int32_t kApproachDeadbandMilliDeg = 20;
 
+static_assert(std::atomic<std::uint32_t>::is_always_lock_free,
+              "characterization ISR diagnostics require lock-free u32 atomics");
+
+std::atomic<std::uint32_t> g_consumer_last_alarm_lateness_us{0U};
+std::atomic<std::uint32_t> g_consumer_max_alarm_lateness_us{0U};
+
 std::uint64_t nowUs() noexcept {
   return static_cast<std::uint64_t>(
       std::max<std::int64_t>(esp_timer_get_time(), 0));
+}
+
+std::uint32_t saturateU32(std::uint64_t value) noexcept {
+  return static_cast<std::uint32_t>(std::min<std::uint64_t>(
+      value, std::numeric_limits<std::uint32_t>::max()));
+}
+
+void updateAtomicMaximum(std::atomic<std::uint32_t> &target,
+                         std::uint32_t candidate) noexcept {
+  std::uint32_t current = target.load(std::memory_order_relaxed);
+  while (current < candidate &&
+         !target.compare_exchange_weak(current, candidate,
+                                       std::memory_order_relaxed,
+                                       std::memory_order_relaxed)) {
+  }
 }
 
 const char *stageName(AssemblyStage stage) noexcept {
@@ -234,7 +255,7 @@ ProfileRunner::ProfileRunner(CampaignStateMachine &campaign,
       journal_(motorApply, &motor_) {}
 
 bool ProfileRunner::consumerTimerCallback(
-    gptimer_handle_t, const gptimer_alarm_event_data_t *, void *context) {
+    gptimer_handle_t, const gptimer_alarm_event_data_t *event, void *context) {
   auto &runner = *static_cast<ProfileRunner *>(context);
   // GPTimer ISRでは固定lifetimeのconsumer taskへ通知するだけに留める。
   // SAFETY: consumerはchar_runtime taskでrun中に削除されず、ISRではI/Oを行わない。
@@ -243,6 +264,18 @@ bool ProfileRunner::consumerTimerCallback(
   if (!runner.consumer_timer_running_.load(std::memory_order_acquire) ||
       consumer == nullptr)
     return false;
+
+  if (event != nullptr) {
+    const std::uint64_t lateness =
+        event->count_value >= event->alarm_value
+            ? event->count_value - event->alarm_value
+            : 0U;
+    const std::uint32_t lateness_us = saturateU32(lateness);
+    g_consumer_last_alarm_lateness_us.store(lateness_us,
+                                            std::memory_order_release);
+    updateAtomicMaximum(g_consumer_max_alarm_lateness_us, lateness_us);
+  }
+
   BaseType_t task_awoken = pdFALSE;
   vTaskNotifyGiveFromISR(consumer, &task_awoken);
   return task_awoken == pdTRUE;
@@ -745,6 +778,18 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
   std::uint64_t command_deadline_misses = 0U;
   std::uint64_t release_deadline_misses = 0U;
   std::uint64_t consumer_schedule_misses = 0U;
+  std::uint64_t diagnostic_continuations = 0U;
+  std::uint32_t first_release_lateness_us = 0U;
+  std::uint32_t max_release_lateness_us = 0U;
+  std::uint32_t max_steady_release_lateness_us = 0U;
+  std::uint32_t max_consumer_isr_to_task_us = 0U;
+  std::uint32_t max_consumer_work_us = 0U;
+  std::uint32_t max_wait_entry_lateness_us = 0U;
+  std::uint64_t previous_release_us = 0U;
+  bool have_previous_release = false;
+
+  g_consumer_last_alarm_lateness_us.store(0U, std::memory_order_relaxed);
+  g_consumer_max_alarm_lateness_us.store(0U, std::memory_order_relaxed);
 
   const auto stopForFatal = [&](esp_err_t cause, AbortReason reason,
                                 std::uint64_t timestamp_us) noexcept {
@@ -929,7 +974,7 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
       if (full)
         stopForFatal(ESP_ERR_TIMEOUT, AbortReason::Deadline, nowUs());
       else
-        stopForQualification();
+        ++diagnostic_continuations;
     } else if (apply_result != ESP_OK) {
       stopForFatal(apply_result, AbortReason::MotorApplyError, nowUs());
     }
@@ -941,11 +986,44 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
     const std::uint64_t epoch_end =
         epoch_zero + (static_cast<std::uint64_t>(epoch) + 1U) *
                          kEpochDurationUs;
+    const std::uint64_t wait_entry_us = nowUs();
+    if (have_previous_release && wait_entry_us >= previous_release_us) {
+      max_consumer_work_us =
+          std::max(max_consumer_work_us,
+                   saturateU32(wait_entry_us - previous_release_us));
+    }
+    if (wait_entry_us > epoch_end) {
+      max_wait_entry_lateness_us =
+          std::max(max_wait_entry_lateness_us,
+                   saturateU32(wait_entry_us - epoch_end));
+    }
+
     const std::uint32_t consumer_notifications =
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     if (stopForLatchedFailure())
       break;
     const std::uint64_t release_us = nowUs();
+    const std::uint32_t release_lateness_us =
+        release_us > epoch_end ? saturateU32(release_us - epoch_end) : 0U;
+    const std::uint32_t alarm_lateness_us =
+        g_consumer_last_alarm_lateness_us.load(std::memory_order_acquire);
+    const std::uint32_t isr_to_task_us =
+        release_lateness_us >= alarm_lateness_us
+            ? release_lateness_us - alarm_lateness_us
+            : 0U;
+    max_consumer_isr_to_task_us =
+        std::max(max_consumer_isr_to_task_us, isr_to_task_us);
+    if (epoch == 0U)
+      first_release_lateness_us = release_lateness_us;
+    max_release_lateness_us =
+        std::max(max_release_lateness_us, release_lateness_us);
+    if (epoch != 0U) {
+      max_steady_release_lateness_us =
+          std::max(max_steady_release_lateness_us, release_lateness_us);
+    }
+    previous_release_us = release_us;
+    have_previous_release = true;
+
     if (stop_requested_.load() &&
         last_abort_reason_ == AbortReason::None) {
       stopForFatal(ESP_ERR_INVALID_STATE, AbortReason::StopRequested,
@@ -960,10 +1038,17 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
       ++release_deadline_misses;
       if (!apply_deadline_missed)
         ++runtime_deadline_misses;
-      if (full)
+      if (full) {
         stopForFatal(ESP_ERR_TIMEOUT, AbortReason::Deadline, release_us);
-      else
+      } else if (consumer_notifications == 1U &&
+                 release_us < epoch_end + kEpochDurationUs) {
+        // rate-checkはmotor非駆動なので、1 epoch未満の単発latenessは証拠を残して継続する。
+        // 判定はfooterのDeadlineMissのままで、正常扱いにはしない。
+        ++diagnostic_continuations;
+      } else {
+        // notification coalescingや1 epoch以上の遅れは固定epoch順序を失うため継続しない。
         stopForQualification();
+      }
     }
     const bool consumer_schedule_invalid =
         !release_deadline_missed &&
@@ -1069,8 +1154,6 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
     }
     if ((block.flags & EpochDeadline) != 0U && full) {
       stopForFatal(ESP_ERR_TIMEOUT, AbortReason::Deadline, nowUs());
-    } else if ((block.flags & EpochDeadline) != 0U && !full) {
-      stopForQualification();
     }
     if (sampler_.firstError() != ESP_OK) {
       if (full) {
@@ -1171,6 +1254,7 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
   (void)shutdown.mark(ShutdownStep::Disarm);
   esp_err_t sampling_cleanup_result = stopConsumerTimer();
   const esp_err_t sampler_diagnostic_result = sampler_.stop();
+  const EncoderTimingDiagnostics encoder_timing = sampler_.timingDiagnostics();
   const esp_err_t power_diagnostic_result = power_sampler_.stop();
   rememberOperation(sampler_.stopCleanupError(), sampling_cleanup_result);
   markShutdown(sampling_cleanup_result);
@@ -1298,6 +1382,26 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
         static_cast<unsigned long long>(statistics.encoder_status_faults),
         static_cast<unsigned long long>(statistics.vbus_invalid_samples),
         esp_err_to_name(first_error));
+    std::printf(
+        "CHAR_RATE_TIMING rate=%u consumer-alarm-late-max-us=%u "
+        "consumer-isr-task-max-us=%u consumer-work-max-us=%u "
+        "consumer-wait-late-max-us=%u release-first-us=%u "
+        "release-max-us=%u release-steady-max-us=%u "
+        "encoder-alarm-late-max-us=%u encoder-isr-task-max-us=%u "
+        "encoder-capture-late-max-us=%u diagnostic-continued=%llu\n",
+        static_cast<unsigned>(rate),
+        static_cast<unsigned>(g_consumer_max_alarm_lateness_us.load(
+            std::memory_order_relaxed)),
+        static_cast<unsigned>(max_consumer_isr_to_task_us),
+        static_cast<unsigned>(max_consumer_work_us),
+        static_cast<unsigned>(max_wait_entry_lateness_us),
+        static_cast<unsigned>(first_release_lateness_us),
+        static_cast<unsigned>(max_release_lateness_us),
+        static_cast<unsigned>(max_steady_release_lateness_us),
+        static_cast<unsigned>(encoder_timing.max_alarm_lateness_us),
+        static_cast<unsigned>(encoder_timing.max_isr_to_task_us),
+        static_cast<unsigned>(encoder_timing.max_capture_lateness_us),
+        static_cast<unsigned long long>(diagnostic_continuations));
   }
 
   CampaignStatus finish_status = CampaignStatus::Ok;

@@ -109,3 +109,27 @@ TODO(HW_TEST): heartbeat timeout時にmotorが危険な継続commandを保持せ
 TODO(SIMULATION): 1000 Hz ICM sample timestampと1 kHz control updateの位相差をSpicaへ反映し、旧tick駆動との差を比較する。
 
 2 kHz ICMは第五版審査書の1000 Hz記載と異なるため、審査書・Vault仕様の変更、filter/検出器/姿勢推定の再評価、実機検証なしにproductionへ有効化しない。
+
+## 7. Rate-check timing診断
+
+rate-checkはmotorをarmせずCoastを維持するため、100 us consumer deadlineを1回超えただけでは診断runを打ち切らない。notificationが1回だけで、releaseが次epoch終端より前に収まっている場合は、そのepochへ`EpochDeadline`を残したままrunを継続する。最終判定では従来どおり1回でもdeadline missがあればunsupportedであり、正常扱いにはしない。
+
+notification coalescing、1 epoch以上のrelease遅延、queue overflow、sensor transport/error、writer/power faultは固定epoch順序または証拠保全を壊すため継続対象にしない。full profileでは従来どおり最初のdeadline/incompleteを安全停止条件とする。
+
+rate-check終了時は既存`CHAR_RATE_RESULT`とは別に`CHAR_RATE_TIMING`を出力する。V5 wire layoutは変更しない。
+
+```text
+consumer-alarm-late-max-us
+consumer-isr-task-max-us
+consumer-work-max-us
+consumer-wait-late-max-us
+release-first-us
+release-max-us
+release-steady-max-us
+encoder-alarm-late-max-us
+encoder-isr-task-max-us
+encoder-capture-late-max-us
+diagnostic-continued
+```
+
+`consumer-alarm-late-max-us`はGPTimer alarm時刻からISR callback実行まで、`consumer-isr-task-max-us`はISRから`char_runtime`再開まで、`consumer-work-max-us`は前epoch releaseから次のnotification待機へ入るまでの最大処理時間を表す。encoder側もalarm、task wake、実captureまでを分離して記録し、5 kHzのslot越境原因を切り分ける。

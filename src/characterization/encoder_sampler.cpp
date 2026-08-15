@@ -13,6 +13,9 @@
 namespace avi::characterization {
 namespace {
 
+static_assert(std::atomic<std::uint32_t>::is_always_lock_free,
+              "characterization ISR diagnostics require lock-free u32 atomics");
+
 std::uint32_t periodUs(EncoderRate rate) noexcept {
   return 1'000'000U / static_cast<std::uint32_t>(rate);
 }
@@ -38,6 +41,21 @@ void rememberOperation(esp_err_t operation, esp_err_t &first) noexcept {
 bool hasErrorFlags(const AS5047D::ErrorFlags &flags) noexcept {
   return flags.parity_error || flags.invalid_command ||
          flags.framing_error;
+}
+
+std::uint32_t saturateU32(std::uint64_t value) noexcept {
+  return static_cast<std::uint32_t>(std::min<std::uint64_t>(
+      value, std::numeric_limits<std::uint32_t>::max()));
+}
+
+void updateAtomicMaximum(std::atomic<std::uint32_t> &target,
+                         std::uint32_t candidate) noexcept {
+  std::uint32_t current = target.load(std::memory_order_relaxed);
+  while (current < candidate &&
+         !target.compare_exchange_weak(current, candidate,
+                                       std::memory_order_relaxed,
+                                       std::memory_order_relaxed)) {
+  }
 }
 
 } // 無名名前空間
@@ -76,7 +94,7 @@ std::uint16_t EncoderSampler::statusFlags(
 }
 
 bool EncoderSampler::timerCallback(gptimer_handle_t,
-                                   const gptimer_alarm_event_data_t *,
+                                   const gptimer_alarm_event_data_t *event,
                                    void *context) {
   auto &sampler = *static_cast<EncoderSampler *>(context);
   // GPTimer ISRから固定lifetimeのtaskへ通知するだけに留める。
@@ -85,6 +103,18 @@ bool EncoderSampler::timerCallback(gptimer_handle_t,
   if (!sampler.running_.load(std::memory_order_acquire) ||
       sampler.task_ == nullptr)
     return false;
+
+  if (event != nullptr) {
+    const std::uint64_t lateness =
+        event->count_value >= event->alarm_value
+            ? event->count_value - event->alarm_value
+            : 0U;
+    const std::uint32_t lateness_us = saturateU32(lateness);
+    sampler.last_alarm_lateness_us_.store(lateness_us,
+                                          std::memory_order_release);
+    updateAtomicMaximum(sampler.max_alarm_lateness_us_, lateness_us);
+  }
+
   BaseType_t task_awoken = pdFALSE;
   vTaskNotifyGiveFromISR(sampler.task_, &task_awoken);
   return task_awoken == pdTRUE;
@@ -139,6 +169,18 @@ void EncoderSampler::taskLoop() {
     }
     next_scheduled_us_ = first_sample_us_ + ideal_slot * period_us_;
 
+    if (now_us >= next_scheduled_us_) {
+      const std::uint32_t task_wake_lateness_us =
+          saturateU32(now_us - next_scheduled_us_);
+      const std::uint32_t alarm_lateness_us =
+          last_alarm_lateness_us_.load(std::memory_order_acquire);
+      const std::uint32_t isr_to_task_us =
+          task_wake_lateness_us >= alarm_lateness_us
+              ? task_wake_lateness_us - alarm_lateness_us
+              : 0U;
+      updateAtomicMaximum(max_isr_to_task_us_, isr_to_task_us);
+    }
+
     if (!running_.load()) {
       acknowledgeStop();
       continue;
@@ -154,6 +196,12 @@ void EncoderSampler::taskLoop() {
             ? captured.host_timestamp_us
             : static_cast<std::uint64_t>(
                   std::max<std::int64_t>(esp_timer_get_time(), 0));
+    if (sample.capture_timestamp_us >= sample.scheduled_timestamp_us) {
+      updateAtomicMaximum(
+          max_capture_lateness_us_,
+          saturateU32(sample.capture_timestamp_us -
+                      sample.scheduled_timestamp_us));
+    }
     sample.angle_raw = captured.angle_raw;
     AS5047D::ErrorFlags errors{};
     AS5047D::Status status{};
@@ -212,6 +260,10 @@ esp_err_t EncoderSampler::begin(EncoderRate rate,
   statistics_ = {};
   first_error_.store(ESP_OK);
   stop_cleanup_error_.store(ESP_OK);
+  last_alarm_lateness_us_.store(0U, std::memory_order_relaxed);
+  max_alarm_lateness_us_.store(0U, std::memory_order_relaxed);
+  max_isr_to_task_us_.store(0U, std::memory_order_relaxed);
+  max_capture_lateness_us_.store(0U, std::memory_order_relaxed);
   generation_ = 0U;
   period_us_ = period;
   samples_per_epoch_ = expectedSamplesPerEpoch(rate);
@@ -347,6 +399,17 @@ esp_err_t EncoderSampler::stop() {
 
 SamplerStatistics EncoderSampler::statistics() const {
   return statistics_;
+}
+
+EncoderTimingDiagnostics EncoderSampler::timingDiagnostics() const noexcept {
+  EncoderTimingDiagnostics diagnostics{};
+  diagnostics.max_alarm_lateness_us =
+      max_alarm_lateness_us_.load(std::memory_order_relaxed);
+  diagnostics.max_isr_to_task_us =
+      max_isr_to_task_us_.load(std::memory_order_relaxed);
+  diagnostics.max_capture_lateness_us =
+      max_capture_lateness_us_.load(std::memory_order_relaxed);
+  return diagnostics;
 }
 
 bool EncoderSampler::pop(RawEncoderSample &sample) noexcept {

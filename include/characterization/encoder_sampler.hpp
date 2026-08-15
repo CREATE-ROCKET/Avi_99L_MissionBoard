@@ -18,6 +18,12 @@
 
 namespace avi::characterization {
 
+struct EncoderTimingDiagnostics {
+  std::uint32_t max_alarm_lateness_us{0U};
+  std::uint32_t max_isr_to_task_us{0U};
+  std::uint32_t max_capture_lateness_us{0U};
+};
+
 class EncoderSampler {
 public:
   EncoderSampler() = default;
@@ -37,6 +43,7 @@ public:
     return stop_cleanup_error_.load();
   }
 #if defined(ESP_PLATFORM)
+  [[nodiscard]] EncoderTimingDiagnostics timingDiagnostics() const noexcept;
   void setFailureNotificationTask(TaskHandle_t task) noexcept {
     failure_notification_task_.store(task);
     if (task != nullptr && first_error_.load() != ESP_OK)
@@ -77,6 +84,10 @@ private:
   bool pipeline_running_{false};
   std::atomic<bool> stop_waiting_{false};
   std::atomic<TaskHandle_t> failure_notification_task_{nullptr};
+  std::atomic<std::uint32_t> last_alarm_lateness_us_{0U};
+  std::atomic<std::uint32_t> max_alarm_lateness_us_{0U};
+  std::atomic<std::uint32_t> max_isr_to_task_us_{0U};
+  std::atomic<std::uint32_t> max_capture_lateness_us_{0U};
   SamplerStatistics statistics_{};
 #endif
   SpscRing<RawEncoderSample, 128U> queue_{};
