@@ -58,7 +58,7 @@ bool appendSample(StreamPayload &payload, const EncoderSample &sample) {
          payload.u8(sample.valid ? 0x01U : 0x00U);
 }
 
-} // 無名名前空間
+} // namespace
 
 bool EncoderTestResult::passed() const {
   return begin_result == ESP_OK && status_result == ESP_OK &&
@@ -75,10 +75,9 @@ bool EncoderStreamResult::passed() const {
          driver_error_count == 0 && parity_error_count == 0 &&
          sensor_error_count == 0 && stream_error_count == 0 &&
          dropped_frames == 0 && output_errors == 0 &&
-         deadline_miss_count == 0 &&
-         begin_result == ESP_OK && stream_begin_result == ESP_OK &&
-         pipeline_start_result == ESP_OK && pipeline_stop_result == ESP_OK &&
-         final_status_result == ESP_OK &&
+         deadline_miss_count == 0 && begin_result == ESP_OK &&
+         stream_begin_result == ESP_OK && pipeline_start_result == ESP_OK &&
+         pipeline_stop_result == ESP_OK && final_status_result == ESP_OK &&
          final_error_flags_result == ESP_OK &&
          stream_finish_result == ESP_OK && end_result == ESP_OK &&
          !sensors::as5047d_health::statusFaulted(final_status) &&
@@ -89,6 +88,7 @@ esp_err_t EncoderBringup::beginImpl(SpiBringup &spi) {
   SPICREATE *const bus = spi.encoderBus();
   if (bus == nullptr)
     return ESP_ERR_INVALID_STATE;
+  encoder_bus_ = bus;
   AS5047D::Config config{};
   config.frequency_hz = board::kEncoderSpiFrequencyHz;
   config.angle_source = AS5047D::AngleSource::compensated;
@@ -108,6 +108,51 @@ esp_err_t EncoderBringup::readImpl(EncoderSample &sample, bool pipelined) {
   return result;
 }
 
+void EncoderBringup::scheduleRecovery() {
+  recovery_required_ = true;
+  const uint64_t now = nowUs();
+  next_recovery_us_ =
+      now <= std::numeric_limits<uint64_t>::max() - kRecoveryIntervalUs
+          ? now + kRecoveryIntervalUs
+          : std::numeric_limits<uint64_t>::max();
+}
+
+esp_err_t EncoderBringup::recoverPipelinedImpl() {
+  if (!pipeline_requested_ || encoder_bus_ == nullptr)
+    return ESP_ERR_INVALID_STATE;
+
+  if (encoder_.pipelinedReadActive())
+    (void)encoder_.stopPipelinedRead();
+  if (encoder_.initialized())
+    (void)encoder_.end();
+
+  AS5047D::Config config{};
+  config.frequency_hz = board::kEncoderSpiFrequencyHz;
+  config.angle_source = AS5047D::AngleSource::compensated;
+  esp_err_t result = encoder_.begin(*encoder_bus_, board::kEncoderCs, config);
+  if (result == ESP_OK) {
+    AS5047D::Status status{};
+    result = sensors::as5047d_health::validateStatus(
+        encoder_.getStatus(status), status);
+  }
+  if (result == ESP_OK)
+    result = encoder_.startPipelinedRead();
+
+  if (result != ESP_OK) {
+    if (encoder_.pipelinedReadActive())
+      (void)encoder_.stopPipelinedRead();
+    if (encoder_.initialized())
+      (void)encoder_.end();
+    scheduleRecovery();
+    return result;
+  }
+
+  recovery_required_ = false;
+  next_recovery_us_ = 0;
+  ++recovery_count_;
+  return ESP_OK;
+}
+
 esp_err_t EncoderBringup::endImpl() { return encoder_.end(); }
 
 esp_err_t EncoderBringup::begin(SpiBringup &spi) {
@@ -122,19 +167,52 @@ esp_err_t EncoderBringup::read(EncoderSample &sample) {
 
 esp_err_t EncoderBringup::startPipelinedRead() {
   ExclusiveGuard guard{busy_};
-  return guard.acquired() ? encoder_.startPipelinedRead()
-                          : ESP_ERR_INVALID_STATE;
+  if (!guard.acquired())
+    return ESP_ERR_INVALID_STATE;
+  pipeline_requested_ = true;
+  const esp_err_t result = encoder_.startPipelinedRead();
+  if (result != ESP_OK)
+    scheduleRecovery();
+  return result;
 }
 
 esp_err_t EncoderBringup::readPipelined(EncoderSample &sample) {
   ExclusiveGuard guard{busy_};
-  return guard.acquired() ? readImpl(sample, true) : ESP_ERR_INVALID_STATE;
+  if (!guard.acquired())
+    return ESP_ERR_INVALID_STATE;
+
+  if (recovery_required_) {
+    const uint64_t now = nowUs();
+    if (now < next_recovery_us_)
+      return ESP_ERR_TIMEOUT;
+    const esp_err_t recovery = recoverPipelinedImpl();
+    if (recovery != ESP_OK)
+      return recovery;
+  }
+
+  if (!encoder_.initialized() || !encoder_.pipelinedReadActive()) {
+    ++runtime_error_count_;
+    scheduleRecovery();
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  const esp_err_t result = readImpl(sample, true);
+  if (result != ESP_OK) {
+    ++runtime_error_count_;
+    scheduleRecovery();
+  }
+  return result;
 }
 
 esp_err_t EncoderBringup::stopPipelinedRead() {
   ExclusiveGuard guard{busy_};
-  return guard.acquired() ? encoder_.stopPipelinedRead()
-                          : ESP_ERR_INVALID_STATE;
+  if (!guard.acquired())
+    return ESP_ERR_INVALID_STATE;
+  pipeline_requested_ = false;
+  recovery_required_ = false;
+  next_recovery_us_ = 0;
+  return encoder_.pipelinedReadActive() ? encoder_.stopPipelinedRead()
+                                        : ESP_OK;
 }
 
 esp_err_t EncoderBringup::getStatus(AS5047D::Status &status) {
@@ -142,7 +220,7 @@ esp_err_t EncoderBringup::getStatus(AS5047D::Status &status) {
   if (!guard.acquired())
     return ESP_ERR_INVALID_STATE;
   return sensors::as5047d_health::validateStatus(encoder_.getStatus(status),
-                                                status);
+                                                 status);
 }
 
 esp_err_t
@@ -154,7 +232,13 @@ EncoderBringup::readAndClearErrorFlags(AS5047D::ErrorFlags &flags) {
 
 esp_err_t EncoderBringup::end() {
   ExclusiveGuard guard{busy_};
-  return guard.acquired() ? endImpl() : ESP_ERR_INVALID_STATE;
+  if (!guard.acquired())
+    return ESP_ERR_INVALID_STATE;
+  pipeline_requested_ = false;
+  recovery_required_ = false;
+  next_recovery_us_ = 0;
+  encoder_bus_ = nullptr;
+  return encoder_.initialized() ? endImpl() : ESP_OK;
 }
 
 esp_err_t EncoderBringup::test(SpiBringup &spi, EncoderTestResult &result) {
@@ -329,4 +413,4 @@ esp_err_t EncoderBringup::stream(SpiBringup &spi, uint32_t seconds,
   return first_error;
 }
 
-} // 名前空間 bringup
+} // namespace bringup
