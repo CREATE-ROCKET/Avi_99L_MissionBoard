@@ -6,8 +6,8 @@
 
 namespace runtime::flight_log {
 
-inline constexpr uint8_t kSchemaVersion = 1;
-inline constexpr std::size_t kSerializedRecordBytes = 128;
+inline constexpr uint8_t kSchemaVersion = 2;
+inline constexpr std::size_t kSerializedRecordBytes = 192;
 inline constexpr uint32_t kInvalidDropCounter = 0xFFFF'FFFFU;
 inline constexpr uint16_t kUnknownEncoderZeroCount = 0xFFFFU;
 

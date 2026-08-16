@@ -4,6 +4,8 @@
 #include <cmath>
 #include <cstring>
 
+#include "runtime/flight_runtime_metadata.hpp"
+
 namespace runtime::flight_log {
 namespace {
 
@@ -56,6 +58,7 @@ uint32_t crc32(const uint8_t *data, std::size_t size) {
 }
 
 SerializedRecord serialize(const Sample &sample) {
+  const auto metadata = flight_runtime_metadata::snapshot();
   SerializedRecord out{};
   std::copy(kMagic.begin(), kMagic.end(), out.begin());
   out[4] = kSchemaVersion;
@@ -89,7 +92,10 @@ SerializedRecord serialize(const Sample &sample) {
   out[59] = sample.reference_capture_event_sequence;
   out[60] = sample.gain_clamp_flags;
   out[61] = sample.fin_zero_configured ? 1U : 0U;
-  putU16(out, 62, sample.encoder_zero_count);
+  putU16(out, 62,
+         metadata.fin_zero.encoder_zero_count != kUnknownEncoderZeroCount
+             ? metadata.fin_zero.encoder_zero_count
+             : sample.encoder_zero_count);
   putU64(out, 64, sample.reference_capture_tick);
   putU64(out, 72, sample.reference_estimator_timestamp_us);
   putFloat(out, 80, sample.roll_estimate_rad);
@@ -101,9 +107,26 @@ SerializedRecord serialize(const Sample &sample) {
   putFloat(out, 104, sample.pitot_coefficient_assumed);
   putFloat(out, 108, sample.pitot_coefficient_diagnostic_min);
   putFloat(out, 112, sample.pitot_coefficient_diagnostic_max);
-  putFloat(out, 116, sample.measured_bidirectional_span_rad);
-  putU32(out, 120, 0U);
-  putU32(out, 124, crc32(out.data(), 124));
+  putFloat(out, 116, metadata.fin_zero.measured_bidirectional_span_rad);
+
+  putU64(out, 120, metadata.fin_zero.configured_timestamp_us);
+  putU32(out, 128, sample.fin_zero_configured ? sample.flight_epoch : 0U);
+  putU64(out, 132, metadata.encoder.capture_requested_timestamp_us);
+  putU64(out, 140, metadata.encoder.spi_transaction_start_us);
+  putU64(out, 148, metadata.encoder.spi_transaction_complete_us);
+  putU64(out, 156, metadata.encoder.consumer_timestamp_us);
+  putU64(out, 164, metadata.encoder.pipeline_ready_timestamp_us);
+  putU16(out, 172, metadata.encoder.consumer_deadline_miss_count);
+  putU16(out, 174, metadata.encoder.repeated_block_count);
+  putU16(out, 176, metadata.encoder.coalesced_notification_count);
+  putU16(out, 178, metadata.encoder.raw_capture_missed_tick_count);
+  putU16(out, 180, metadata.encoder.timestamp_offset_saturation_count);
+  out[182] = static_cast<uint8_t>(metadata.fin_zero.approach_direction);
+  out[183] = static_cast<uint8_t>(metadata.fin_zero.calibration_method);
+  out[184] = static_cast<uint8_t>(metadata.fin_zero.ground_verification_status);
+  out[185] = static_cast<uint8_t>(metadata.encoder.pipeline_state);
+  putU16(out, 186, 0U);
+  putU32(out, 188, crc32(out.data(), 188));
   return out;
 }
 
@@ -112,7 +135,7 @@ bool validate(const SerializedRecord &record) {
       record[4] != kSchemaVersion ||
       record[5] != static_cast<uint8_t>(kSerializedRecordBytes))
     return false;
-  return getU32(record, 124) == crc32(record.data(), 124);
+  return getU32(record, 188) == crc32(record.data(), 188);
 }
 
 bool erased(const SerializedRecord &record) {

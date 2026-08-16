@@ -5,10 +5,13 @@
 namespace sensors::power_presence_runtime {
 namespace {
 
-// TODO(HW_TEST): 実機ADC captureからON/OFF閾値、hysteresis、debounce、
-// stale timeoutを確定する。未確定中はFlight Status bit5/6を0とする。
-constexpr PowerPresenceConfig kLogicConfig{};
-constexpr PowerPresenceConfig kMotorConfig{};
+// TODO(HW_TEST): 本番値は実機ADC captureで更新する。
+// 現段階ではundervoltage判定には使わず、「railが実質0 Vではない」ことだけを
+// telemetryへ反映するための保守的なpresence閾値とする。
+constexpr PowerPresenceConfig kLogicConfig{
+    true, 1.0, 0.5, 3, 2, 500'000};
+constexpr PowerPresenceConfig kMotorConfig{
+    true, 1.0, 0.5, 3, 2, 500'000};
 PowerPresenceDetector logic_detector{kLogicConfig};
 PowerPresenceDetector motor_detector{kMotorConfig};
 
