@@ -14,7 +14,6 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
-#include <cstdio>
 
 namespace avi::characterization {
 
@@ -39,7 +38,7 @@ public:
   }
 #endif
 
-  [[nodiscard]] bool open() const noexcept { return file_ != nullptr; }
+  [[nodiscard]] bool open() const noexcept { return file_descriptor_ >= 0; }
   [[nodiscard]] esp_err_t firstError() const noexcept {
     return first_error_.load();
   }
@@ -107,7 +106,7 @@ private:
   std::atomic<std::uint32_t> total_fwrite_us_{0U};
   std::atomic<std::uint32_t> preallocation_us_{0U};
 #endif
-  FILE *file_{nullptr};
+  int file_descriptor_{-1};
   std::array<char, 128> current_path_{};
   std::atomic<bool> accepting_{false};
   std::atomic<bool> synced_{false};
@@ -118,6 +117,7 @@ private:
   std::atomic<std::uint64_t> queue_overflows_{0U};
   std::uint64_t planned_file_bytes_{0U};
   std::uint32_t file_crc32_{0U};
+  bool contiguous_preallocated_{false};
   bool prepared_{false};
   bool initialized_{false};
 };

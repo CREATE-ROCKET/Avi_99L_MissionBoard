@@ -68,36 +68,51 @@ void addAtomicTotal(std::atomic<std::uint32_t> &target,
   }
 }
 
-esp_err_t writeFile(void *context, const std::uint8_t *data,
-                    std::size_t size) noexcept {
-  auto *file = static_cast<FILE *>(context);
-  return std::fwrite(data, 1U, size, file) == size ? ESP_OK : ESP_FAIL;
+esp_err_t writeDescriptor(void *context, const std::uint8_t *data,
+                          std::size_t size) noexcept {
+  auto &descriptor = *static_cast<int *>(context);
+  if (descriptor < 0 || (data == nullptr && size != 0U))
+    return ESP_ERR_INVALID_STATE;
+  std::size_t offset = 0U;
+  while (offset < size) {
+    const ssize_t written =
+        ::write(descriptor, data + offset, size - offset);
+    if (written > 0) {
+      offset += static_cast<std::size_t>(written);
+      continue;
+    }
+    if (written < 0 && errno == EINTR)
+      continue;
+    return ESP_FAIL;
+  }
+  return ESP_OK;
 }
 
-esp_err_t flushFile(void *context) noexcept {
-  return std::fflush(static_cast<FILE *>(context)) == 0 ? ESP_OK
-                                                        : ESP_FAIL;
+esp_err_t flushDescriptor(void *) noexcept { return ESP_OK; }
+
+esp_err_t syncDescriptor(void *context) noexcept {
+  const int descriptor = *static_cast<int *>(context);
+  if (descriptor < 0)
+    return ESP_ERR_INVALID_STATE;
+  return ::fsync(descriptor) == 0 ? ESP_OK : ESP_FAIL;
 }
 
-esp_err_t syncFile(void *context) noexcept {
-  auto *file = static_cast<FILE *>(context);
-  return ::fsync(::fileno(file)) == 0 ? ESP_OK : ESP_FAIL;
-}
-
-esp_err_t truncateAndCloseFile(void *context) noexcept {
-  auto *file = static_cast<FILE *>(context);
+esp_err_t truncateAndCloseDescriptor(void *context) noexcept {
+  auto &descriptor = *static_cast<int *>(context);
+  if (descriptor < 0)
+    return ESP_ERR_INVALID_STATE;
   esp_err_t first = ESP_OK;
-  const long end_position = std::ftell(file);
+  const off_t end_position = ::lseek(descriptor, 0, SEEK_CUR);
   if (end_position < 0) {
     first = ESP_FAIL;
-  } else if (::ftruncate(::fileno(file), static_cast<off_t>(end_position)) !=
-             0) {
+  } else if (::ftruncate(descriptor, end_position) != 0) {
     first = ESP_FAIL;
   }
-  if (::fsync(::fileno(file)) != 0)
+  if (::fsync(descriptor) != 0)
     rememberOperation(ESP_FAIL, first);
-  if (std::fclose(file) != 0)
+  if (::close(descriptor) != 0)
     rememberOperation(ESP_FAIL, first);
+  descriptor = -1;
   return first;
 }
 
@@ -169,13 +184,14 @@ void LogWriterV5::resetRunMetrics() noexcept {
 void LogWriterV5::cleanupPreparedFile(bool remove_file) noexcept {
   accepting_.store(false);
   synced_.store(false);
-  if (file_ != nullptr) {
-    (void)std::fclose(file_);
-    file_ = nullptr;
+  if (file_descriptor_ >= 0) {
+    (void)::close(file_descriptor_);
+    file_descriptor_ = -1;
   }
   if (remove_file && current_path_[0] != '\0')
     (void)::unlink(current_path_.data());
   planned_file_bytes_ = 0U;
+  contiguous_preallocated_ = false;
   prepared_ = false;
 }
 
@@ -227,17 +243,17 @@ void LogWriterV5::processRecordBatch(ImmutableLogRecord current_record) {
   if (!encoded)
     return;
 
-  if (file_ != nullptr) {
+  if (file_descriptor_ >= 0) {
     const std::size_t byte_count = count * wire_v5::kRecordBytes;
     const std::int64_t fwrite_started_us = esp_timer_get_time();
-    const std::size_t written =
-        std::fwrite(encoded_batch_.data(), 1U, byte_count, file_);
+    const esp_err_t write_result =
+        writeDescriptor(&file_descriptor_, encoded_batch_.data(), byte_count);
     const std::uint32_t fwrite_elapsed_us = elapsedUs(fwrite_started_us);
     updateAtomicMaximum(max_fwrite_us_, fwrite_elapsed_us);
     addAtomicTotal(total_fwrite_us_, fwrite_elapsed_us);
     batch_count_.fetch_add(1U, std::memory_order_relaxed);
-    if (written != byte_count) {
-      rememberFirst(ESP_FAIL);
+    if (write_result != ESP_OK) {
+      rememberFirst(write_result);
     } else {
       // previous_crc chainingは連結データのCRCと等価なので、batch全体を1回で更新する。
       file_crc32_ = wire_v5::crc32(encoded_batch_.data(), byte_count,
@@ -255,18 +271,16 @@ void LogWriterV5::processRecordBatch(ImmutableLogRecord current_record) {
 void LogWriterV5::processControl(const ControlRequest &request) {
   esp_err_t result = first_error_.load();
   if (request.kind == ControlKind::Sync) {
-    bool synchronized = file_ != nullptr;
-    if (file_ == nullptr) {
+    bool synchronized = file_descriptor_ >= 0;
+    if (file_descriptor_ < 0) {
       rememberOperation(ESP_ERR_INVALID_STATE, result);
     } else {
-      const esp_err_t flush_result = flushFile(file_);
-      const esp_err_t sync_result = syncFile(file_);
-      synchronized = flush_result == ESP_OK && sync_result == ESP_OK;
-      rememberOperation(flush_result, result);
+      const esp_err_t sync_result = syncDescriptor(&file_descriptor_);
+      synchronized = sync_result == ESP_OK;
       rememberOperation(sync_result, result);
     }
     synced_.store(synchronized);
-  } else if (file_ == nullptr) {
+  } else if (file_descriptor_ < 0) {
     rememberOperation(ESP_ERR_INVALID_STATE, result);
   } else {
     if (!synced_.load())
@@ -282,14 +296,13 @@ void LogWriterV5::processControl(const ControlRequest &request) {
     const bool footer_valid = wire_v5::encodeFooter(finalized, bytes);
     if (!footer_valid)
       rememberOperation(ESP_ERR_INVALID_ARG, result);
-    FILE *const closing_file = file_;
     const FileCloseOperations operations{
-        closing_file, writeFile, flushFile, syncFile, truncateAndCloseFile};
+        &file_descriptor_, writeDescriptor, flushDescriptor, syncDescriptor,
+        truncateAndCloseDescriptor};
     result = bestEffortFinalizeFile(
         operations, footer_valid ? bytes.data() : nullptr,
         footer_valid ? bytes.size() : 0U, result);
-    // close callbackが実record+footer位置へtruncateしてからFILE ownershipを終了する。
-    file_ = nullptr;
+    // close callbackが実record+footer位置へtruncateしてdescriptor ownershipを終了する。
     prepared_ = false;
     synced_.store(false);
     accepting_.store(false);
@@ -333,7 +346,7 @@ esp_err_t LogWriterV5::submitControl(const ControlRequest &request) {
     control_pending_.store(false);
     return ESP_FAIL;
   }
-  // FILEへ触れるcallerはなく、writer taskのfinalize ackまで安全側で待機する。
+  // descriptorへ触れるcallerはなく、writer taskのfinalize ackまで安全側で待機する。
   if (xSemaphoreTake(control_ack_, portMAX_DELAY) != pdTRUE) {
     control_pending_.store(false);
     return ESP_FAIL;
@@ -386,8 +399,8 @@ esp_err_t LogWriterV5::initialize() {
 
 esp_err_t LogWriterV5::prepare(const char *base_name,
                                std::uint32_t expected_records) {
-  if (!initialized_ || file_ != nullptr || prepared_ || base_name == nullptr ||
-      base_name[0] == '\0')
+  if (!initialized_ || file_descriptor_ >= 0 || prepared_ ||
+      base_name == nullptr || base_name[0] == '\0')
     return ESP_ERR_INVALID_STATE;
   if (expected_records == 0U)
     return ESP_ERR_INVALID_ARG;
@@ -404,7 +417,7 @@ esp_err_t LogWriterV5::prepare(const char *base_name,
       static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()))
     return ESP_ERR_INVALID_SIZE;
 
-  int descriptor = -1;
+  bool path_reserved = false;
   for (unsigned index = 0U; index < 1'000U; ++index) {
     const int length = std::snprintf(
         current_path_.data(), current_path_.size(), "%s/%s_%03u.bin",
@@ -412,35 +425,52 @@ esp_err_t LogWriterV5::prepare(const char *base_name,
     if (length <= 0 ||
         static_cast<std::size_t>(length) >= current_path_.size())
       return ESP_ERR_INVALID_SIZE;
-    descriptor = ::open(current_path_.data(),
-                        O_RDWR | O_CREAT | O_EXCL, 0664);
-    if (descriptor >= 0)
+    const int placeholder = ::open(current_path_.data(),
+                                   O_WRONLY | O_CREAT | O_EXCL, 0664);
+    if (placeholder >= 0) {
+      if (::close(placeholder) != 0) {
+        (void)::unlink(current_path_.data());
+        return ESP_FAIL;
+      }
+      path_reserved = true;
       break;
+    }
     if (errno != EEXIST)
       return ESP_FAIL;
   }
-  if (descriptor < 0)
+  if (!path_reserved)
     return ESP_ERR_NOT_FOUND;
 
-  file_ = ::fdopen(descriptor, "w+b");
-  if (file_ == nullptr) {
-    (void)::close(descriptor);
+  const std::int64_t preallocation_started_us = esp_timer_get_time();
+  const esp_err_t allocation_result = esp_vfs_fat_create_contiguous_file(
+      kMountPoint, current_path_.data(), planned_bytes, true);
+  if (allocation_result != ESP_OK) {
+    (void)::unlink(current_path_.data());
+    return allocation_result;
+  }
+  bool contiguous = false;
+  const esp_err_t contiguous_result = esp_vfs_fat_test_contiguous_file(
+      kMountPoint, current_path_.data(), &contiguous);
+  if (contiguous_result != ESP_OK || !contiguous) {
+    (void)::unlink(current_path_.data());
+    return contiguous_result != ESP_OK ? contiguous_result
+                                       : ESP_ERR_INVALID_STATE;
+  }
+
+  file_descriptor_ = ::open(current_path_.data(), O_RDWR);
+  if (file_descriptor_ < 0) {
     (void)::unlink(current_path_.data());
     return ESP_FAIL;
   }
-  if (std::setvbuf(file_, nullptr, _IONBF, 0U) != 0) {
+  if (::fsync(file_descriptor_) != 0 ||
+      ::lseek(file_descriptor_, 0, SEEK_SET) != 0) {
     cleanupPreparedFile(true);
     return ESP_FAIL;
   }
 
-  const std::int64_t preallocation_started_us = esp_timer_get_time();
-  if (::ftruncate(descriptor, static_cast<off_t>(planned_bytes)) != 0 ||
-      ::fsync(descriptor) != 0 || std::fseek(file_, 0L, SEEK_SET) != 0) {
-    cleanupPreparedFile(true);
-    return ESP_FAIL;
-  }
   preallocation_us_.store(elapsedUs(preallocation_started_us));
   planned_file_bytes_ = planned_bytes;
+  contiguous_preallocated_ = true;
   prepared_ = true;
   accepting_.store(false);
   synced_.store(true);
@@ -448,7 +478,8 @@ esp_err_t LogWriterV5::prepare(const char *base_name,
 }
 
 esp_err_t LogWriterV5::open(const LogHeaderV5 &header) {
-  if (!initialized_ || !prepared_ || file_ == nullptr || accepting_.load())
+  if (!initialized_ || !prepared_ || file_descriptor_ < 0 ||
+      accepting_.load() || !contiguous_preallocated_)
     return ESP_ERR_INVALID_STATE;
 
   wire_v5::HeaderBytes bytes{};
@@ -456,8 +487,8 @@ esp_err_t LogWriterV5::open(const LogHeaderV5 &header) {
     cleanupPreparedFile(true);
     return ESP_ERR_INVALID_ARG;
   }
-  if (std::fseek(file_, 0L, SEEK_SET) != 0 ||
-      std::fwrite(bytes.data(), 1U, bytes.size(), file_) != bytes.size()) {
+  if (::lseek(file_descriptor_, 0, SEEK_SET) != 0 ||
+      writeDescriptor(&file_descriptor_, bytes.data(), bytes.size()) != ESP_OK) {
     cleanupPreparedFile(true);
     return ESP_FAIL;
   }
@@ -472,7 +503,7 @@ esp_err_t LogWriterV5::open(const LogHeaderV5 &header) {
 
 esp_err_t LogWriterV5::enqueue(
     const ImmutableLogRecord &record) {
-  if (!accepting_.load() || file_ == nullptr ||
+  if (!accepting_.load() || file_descriptor_ < 0 ||
       first_error_.load() != ESP_OK)
     return ESP_ERR_INVALID_STATE;
   // 完成済みimmutable recordを値copyするだけに留める。
@@ -492,7 +523,7 @@ esp_err_t LogWriterV5::enqueue(
 }
 
 esp_err_t LogWriterV5::drainAndSync() {
-  if (file_ == nullptr || !prepared_)
+  if (file_descriptor_ < 0 || !prepared_)
     return ESP_ERR_INVALID_STATE;
   accepting_.store(false);
   ControlRequest request{};
@@ -501,11 +532,12 @@ esp_err_t LogWriterV5::drainAndSync() {
 }
 
 esp_err_t LogWriterV5::close(const LogFooterV5 &footer) {
-  if (file_ == nullptr || !prepared_) {
+  if (file_descriptor_ < 0 || !prepared_) {
     endRateCheckStageDiagnostics();
     return ESP_ERR_INVALID_STATE;
   }
   const std::uint64_t planned_bytes = planned_file_bytes_;
+  const bool contiguous_preallocated = contiguous_preallocated_;
   accepting_.store(false);
   ControlRequest request{};
   request.kind = ControlKind::Finalize;
@@ -542,13 +574,20 @@ esp_err_t LogWriterV5::close(const LogFooterV5 &footer) {
                       : static_cast<std::uint32_t>(encode_total / records);
     const std::uint32_t fwrite_average =
         batches == 0U ? 0U : fwrite_total / batches;
+    const std::uint64_t write_bytes = records * wire_v5::kRecordBytes;
+    const std::uint64_t write_bps =
+        fwrite_total == 0U
+            ? 0U
+            : write_bytes * 1'000'000ULL /
+                  static_cast<std::uint64_t>(fwrite_total);
     std::printf(
         "CHAR_WRITER_TIMING rate=%u queue-depth=%u queue-high-water=%u "
         "batch-capacity=%u max-batch-records=%u batch-count=%u "
-        "preallocate-us=%u planned-bytes=%llu validate-max-us=%u "
-        "validate-total-us=%u validate-avg-us=%u encode-max-us=%u "
-        "encode-total-us=%u encode-avg-us=%u fwrite-max-us=%u "
-        "fwrite-total-us=%u fwrite-avg-us=%u records-written=%llu\n",
+        "preallocate-us=%u planned-bytes=%llu contiguous=%u "
+        "validate-max-us=%u validate-total-us=%u validate-avg-us=%u "
+        "encode-max-us=%u encode-total-us=%u encode-avg-us=%u "
+        "fwrite-max-us=%u fwrite-total-us=%u fwrite-avg-us=%u "
+        "write-bps=%llu records-written=%llu\n",
         static_cast<unsigned>(diagnostics.rate),
         static_cast<unsigned>(kQueueDepth),
         static_cast<unsigned>(queue_high_water_.load()),
@@ -557,6 +596,7 @@ esp_err_t LogWriterV5::close(const LogFooterV5 &footer) {
         static_cast<unsigned>(batches),
         static_cast<unsigned>(preallocation_us_.load()),
         static_cast<unsigned long long>(planned_bytes),
+        contiguous_preallocated ? 1U : 0U,
         static_cast<unsigned>(max_validate_us_.load()),
         static_cast<unsigned>(validate_total),
         static_cast<unsigned>(validate_average),
@@ -566,9 +606,11 @@ esp_err_t LogWriterV5::close(const LogFooterV5 &footer) {
         static_cast<unsigned>(max_fwrite_us_.load()),
         static_cast<unsigned>(fwrite_total),
         static_cast<unsigned>(fwrite_average),
+        static_cast<unsigned long long>(write_bps),
         static_cast<unsigned long long>(records));
   }
   planned_file_bytes_ = 0U;
+  contiguous_preallocated_ = false;
   endRateCheckStageDiagnostics();
   return result;
 }
@@ -576,7 +618,7 @@ esp_err_t LogWriterV5::close(const LogFooterV5 &footer) {
 esp_err_t LogWriterV5::abortAndClose(LogFooterV5 footer) {
   footer.completion = CompletionCode::Aborted;
   footer.unsupported_reason = UnsupportedReason::None;
-  if (file_ == nullptr) {
+  if (file_descriptor_ < 0) {
     endRateCheckStageDiagnostics();
     return ESP_OK;
   }

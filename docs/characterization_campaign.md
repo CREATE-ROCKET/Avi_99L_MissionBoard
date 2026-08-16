@@ -78,7 +78,9 @@ epoch n = [epoch_zero_us + n*1000,
 
 motor system identificationとflight realtime qualificationを分離します。
 
-**100 us command apply deadlineはmotor-IDでもfatalです。** 必要なDrive/Brake変更が100 usを超えた場合は遅れた指令を出さずCoastへ倒し、runを停止します。
+productionの100 us realtime requirementは変更しません。motor-IDでは100 usをcommand applyの診断targetとし、必要なcommand変更が100 usを超えても**同じ1 ms epoch内で完了する限り**actual `command_apply_timestamp_us`を保存してrunを継続します。
+
+command apply開始または完了が`epoch_start + 1000 us`以上へ達した場合はfatalです。まだDrive/Brakeを出していない場合は遅れた指令を出さずCoastへ倒し、適用後に境界超過が判明した場合も直ちにCoastへ倒して`AbortReason::Deadline`で停止します。
 
 consumer releaseがepoch終端から100 usを超えても、notificationがexactly 1で、releaseが1 epoch未満の遅延であり、raw sampleのepoch所属が壊れていない場合はmotor-ID診断として継続します。
 
@@ -86,7 +88,7 @@ release-only遅延は`consumer_lateness_us`、`CHAR_RATE_RESULT release-deadline
 
 次は引き続きfatalです。
 
-- command apply deadline miss
+- command applyが1 epoch以上遅れる、またはgeneration/epoch順序を保持できない
 - notification coalescing
 - 1 epoch以上のconsumer release遅延
 - encoder invalid / transport / status error
@@ -96,6 +98,8 @@ release-only遅延は`consumer_lateness_us`、`CHAR_RATE_RESULT release-deadline
 - position guard / hard abort / overshoot
 - motor apply error
 - SD write/sync/close error
+
+TB67Hのstandby復帰最大30 usは`command_apply_timestamp_us`へ固定加算せず、長いCoast後のplant-side latency uncertaintyとして解析します。
 
 この契約はflight controlの100 us realtime qualificationではありません。
 
@@ -190,27 +194,29 @@ V5 binaryが正本です。
 - footer: 192 byte
 - writer queue: 512 records
 - writer batch: 最大64 records
-- run前にplanned fileをpreallocate
-- 終了時にactual footer終端へtruncate
+- run前にplanned file全体をFATFS contiguous fileとして`alloc_now=true`で確保する
+- `esp_vfs_fat_test_contiguous_file()`で連続性を確認できない場合はcaptureを開始しない
+- record/header/footerはstdio bufferingを介さずPOSIX descriptorへshort-write/EINTR対応で書く
+- 終了時にactual footer終端へtruncateして`fsync`する
 
-PRECHECK8.4の1000 Hzでは10秒・10000 recordを`writer-queue-overflow=0`、`queue-high-water=132/512`で保存できています。
+2026-08-16の再試験では旧`ftruncate`事前確保経路で、553 record時点に`queue-high-water=512/512`、`writer-queue-overflow=1`、`fwrite-max-us=1333447`、約120 kB/s相当のrecord write throughputとなった。1 kHz V5が要求する320 kB/sを下回るため、queue増量ではなくstorage path自体を修正した。
+
+`CHAR_WRITER_TIMING`は`contiguous`と`write-bps`を追加表示する。新経路はまず10秒rate-checkで`contiguous=1`、`writer-queue-overflow=0`、queue high-waterが512へ張り付かないことを確認してからfull profileへ進む。
 
 ## 9. Validation
-
-旧V5 strict contractの確認には従来toolを残します。
 
 ```sh
 python3 tools/verify_characterization.py --self-test
 ```
 
-新しいmotor-ID captureはrelease-only遅延のflag省略を許す専用wrapperで検証します。
+motor-ID互換entry pointも同じV5 validatorを使用します。
 
 ```sh
 python3 tools/verify_motor_id_characterization.py capture.bin \
   --integrity integrity.json
 ```
 
-このwrapperはrelease-onlyの`deadline flag tears`だけを追加で許し、CRC、sequence、timestamp、raw sample、command apply deadline、mode、Vbus、footer等の既存検査を再利用します。
+V5 validatorはCRC、sequence、timestamp、raw sample、command apply、mode、Vbus、footerを検証します。旧100 us command deadline captureもdecode互換を維持します。
 
 ## 10. Spica package
 
