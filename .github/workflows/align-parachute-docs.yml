@@ -1,0 +1,41 @@
+name: Align parachute docs
+
+on:
+  push:
+    branches:
+      - docs/align-parachute-contract
+    paths:
+      - .github/workflows/align-parachute-docs.yml
+
+permissions:
+  contents: write
+
+jobs:
+  align:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply docs alignment
+        run: python tools/align_parachute_docs.py
+      - name: Validate docs
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -nF 'ParaOpen (0x25)' 'docs/08e_20260816_パラシュート簡素化.md'
+          grep -nF 'ParaClose (0x26)' 'docs/08e_20260816_パラシュート簡素化.md'
+          grep -nF '5 bit missing mask' 'docs/01_コマンド受信モード.md'
+          grep -nF 'パラシュートはFreeまたはpower-offへ移行せず' 'docs/01_コマンド受信モード.md'
+          grep -nF '0x20..0x24' 'docs/04c_ForceStartSequence詳細.md'
+      - name: Commit docs
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          rm -f .github/workflows/align-parachute-docs.yml tools/align_parachute_docs.py
+          git add -A
+          git diff --cached --check
+          git commit -m 'docs(mission): align simplified parachute contract'
+          git push origin HEAD:docs/align-parachute-contract
