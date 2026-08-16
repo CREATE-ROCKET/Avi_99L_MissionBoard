@@ -32,17 +32,12 @@
 namespace avi::characterization {
 namespace {
 
-// storage preallocation完了後にepoch zeroを決める。header overwriteでSDが一時stallしても
-// sampler/timer開始前に十分な余裕を残すためcharacterizationだけ1.5 s leadを取る。
 constexpr std::uint64_t kRunStartLeadUs = 1'500'000U;
 constexpr std::uint32_t kMinimumPostHeaderLeadUs = 100'000U;
 constexpr std::uint32_t kZeroCaptureTimeoutMs = 1'000U;
 
-// 動作確認済みZeroHold（1024 scaleでKp=500, Kd=25）をpermilleへ概算移植する。
-// 20 kHzで得たgainそのものを30 kHz flight値とはみなさず、zero approach/recenter専用に使う。
 constexpr std::int32_t kApproachKpPermillePerDeg = 500;
 constexpr std::int32_t kApproachKdPermillePerDegPerS = 25;
-// 30 kHz motor-only実測breakawayが約15%なので、微小0.1 deg stepは短い16% pulseで歯面を動かす。
 constexpr std::int16_t kApproachMinimumActivePermille = 160;
 constexpr std::int16_t kApproachMaximumPermille = 300;
 constexpr std::int32_t kApproachPulseRegionMilliDeg = 250;
@@ -125,8 +120,6 @@ UnsupportedReason unsupportedReason(
     const SamplerStatistics &statistics) noexcept {
   if (statistics.trigger_coalesced_or_missed != 0U)
     return UnsupportedReason::TriggerCoalesced;
-  // repeated/skippedがstartup epochだけに存在する場合はqualificationを落とさない。
-  // steady側の欠落はsteady_state_incomplete_epochsで必ず検出する。
   if (statistics.pre_epoch_samples != 0U ||
       statistics.late_after_release != 0U ||
       statistics.steady_state_incomplete_epochs != 0U)
@@ -134,8 +127,6 @@ UnsupportedReason unsupportedReason(
   if (statistics.invalid_samples != 0U ||
       statistics.encoder_transport_errors != 0U)
     return UnsupportedReason::InvalidRead;
-  // 1 kHz motor-IDではconsumer releaseの100 us超過はUART/record timestampで診断し、
-  // rate qualificationを落とさない。commandのfatal slipとschedule lossは別経路で扱う。
   if (statistics.raw_queue_overflows != 0U ||
       statistics.writer_queue_overflows != 0U ||
       statistics.bucket_collisions != 0U)
@@ -145,8 +136,7 @@ UnsupportedReason unsupportedReason(
   return UnsupportedReason::None;
 }
 
-AbortReason abortReasonForAcquisition(
-    UnsupportedReason reason) noexcept {
+AbortReason abortReasonForAcquisition(UnsupportedReason reason) noexcept {
   switch (reason) {
   case UnsupportedReason::DeadlineMiss:
     return AbortReason::Deadline;
@@ -229,7 +219,6 @@ MotorCommandRequest positionApproachCommand(
       std::clamp<std::int64_t>(undamped, kApproachMinimumActivePermille,
                                limit));
 
-  // 0.1 deg刻み付近で連続16%以上を入れて通り過ぎないよう、近傍だけpulse化する。
   if (absolute_error <= kApproachPulseRegionMilliDeg &&
       (local_epoch % kApproachPulsePeriodEpochs) >= kApproachPulseOnEpochs)
     return {0, MotorMode::Coast};
@@ -248,9 +237,6 @@ ProfileRunner::ProfileRunner(CampaignStateMachine &campaign,
 bool ProfileRunner::consumerTimerCallback(
     gptimer_handle_t, const gptimer_alarm_event_data_t *event, void *context) {
   auto &runner = *static_cast<ProfileRunner *>(context);
-  // GPTimer ISRでは予定epoch終端をqueueへ1件ずつ保存し、task notificationは
-  // tick/failure/stop共通のwake-up signalとしてだけ使用する。
-  // SAFETY: consumerとstatic queueはProfileRunnerのlifetime中保持される。
   const TaskHandle_t consumer =
       runner.consumer_task_.load(std::memory_order_acquire);
   if (!runner.consumer_timer_running_.load(std::memory_order_acquire) ||
@@ -288,8 +274,7 @@ bool ProfileRunner::consumerTimerCallback(
   return task_awoken == pdTRUE;
 }
 
-esp_err_t ProfileRunner::startConsumerTimer(
-    std::uint64_t epoch_zero_us) {
+esp_err_t ProfileRunner::startConsumerTimer(std::uint64_t epoch_zero_us) {
   if (consumer_timer_running_.load() ||
       epoch_zero_us >
           std::numeric_limits<std::uint64_t>::max() - kEpochDurationUs)
@@ -313,7 +298,6 @@ esp_err_t ProfileRunner::startConsumerTimer(
   consumer_task_.store(consumer);
   writer_.setFailureNotificationTask(consumer);
   sampler_.setFailureNotificationTask(consumer);
-  power_sampler_.setFailureNotificationTask(consumer);
 
   if (!consumer_timer_.initialized()) {
     const esp_err_t initialize_result =
@@ -328,8 +312,6 @@ esp_err_t ProfileRunner::startConsumerTimer(
   (void)ulTaskNotifyValueClear(consumer,
                                std::numeric_limits<std::uint32_t>::max());
 
-  // first alarmをepoch 0終端の絶対時刻へ設定し、その後はhardware auto-reloadで
-  // 固定1 ms周期を維持する。timer arm後のtask schedulingはalarm位相へ影響しない。
   consumer_timer_running_.store(true, std::memory_order_release);
   const esp_err_t result = consumer_timer_.start(
       epoch_zero_us + kEpochDurationUs, kEpochDurationUs);
@@ -339,7 +321,6 @@ esp_err_t ProfileRunner::startConsumerTimer(
     return result;
   }
 
-  // epoch 0のcommand処理は従来どおりepoch zeroから開始する。
   while (nowUs() + 2'000U < epoch_zero_us)
     vTaskDelay(1U);
   while (nowUs() < epoch_zero_us)
@@ -352,7 +333,6 @@ esp_err_t ProfileRunner::stopConsumerTimer() noexcept {
   const esp_err_t result = consumer_timer_.stop();
   writer_.setFailureNotificationTask(nullptr);
   sampler_.setFailureNotificationTask(nullptr);
-  power_sampler_.setFailureNotificationTask(nullptr);
   consumer_task_.store(nullptr, std::memory_order_release);
   if (consumer_tick_queue_ != nullptr)
     xQueueReset(consumer_tick_queue_);
@@ -364,8 +344,7 @@ esp_err_t ProfileRunner::stopConsumerTimer() noexcept {
 esp_err_t ProfileRunner::motorApply(
     void *context, const MotorCommandRequest &request,
     std::uint64_t &completed_at_us) {
-  auto &motor =
-      *static_cast<actuators::ProductionMotorDriver *>(context);
+  auto &motor = *static_cast<actuators::ProductionMotorDriver *>(context);
   esp_err_t result = ESP_ERR_INVALID_ARG;
   switch (request.mode) {
   case MotorMode::Coast:
@@ -386,8 +365,6 @@ esp_err_t ProfileRunner::motorApply(
     break;
   }
   }
-  // これはMCU/TB67H入力側へcommandを適用した実時刻であり、TB67H内部の
-  // standby復帰後にOUTが有効になるまでの最大30 usは含めない。
   completed_at_us = nowUs();
   return result;
 }
@@ -406,9 +383,7 @@ esp_err_t ProfileRunner::arm(const SessionId &session_id) noexcept {
   return journal_.arm();
 }
 
-esp_err_t ProfileRunner::disarm() noexcept {
-  return journal_.disarm(nowUs());
-}
+esp_err_t ProfileRunner::disarm() noexcept { return journal_.disarm(nowUs()); }
 
 void ProfileRunner::requestStop() noexcept {
   stop_requested_.store(true);
@@ -419,8 +394,7 @@ void ProfileRunner::requestStop() noexcept {
 #endif
 }
 
-esp_err_t
-ProfileRunner::captureZero(ZeroReferenceKind reference_kind) noexcept {
+esp_err_t ProfileRunner::captureZero(ZeroReferenceKind reference_kind) noexcept {
   if (journal_.armed() || !campaign_.canArmMotor())
     return ESP_ERR_INVALID_STATE;
   bool expected = false;
@@ -440,8 +414,7 @@ ProfileRunner::captureZero(ZeroReferenceKind reference_kind) noexcept {
     return ESP_ERR_INVALID_ARG;
   }
   if ((reference_kind == ZeroReferenceKind::M0 && m0_zero_valid_) ||
-      (reference_kind == ZeroReferenceKind::Common &&
-       common_zero_valid_)) {
+      (reference_kind == ZeroReferenceKind::Common && common_zero_valid_)) {
     busy_.store(false);
     return ESP_ERR_INVALID_STATE;
   }
@@ -485,9 +458,8 @@ ProfileRunner::captureZero(ZeroReferenceKind reference_kind) noexcept {
   return result;
 }
 
-LogHeaderV5 ProfileRunner::makeHeader(
-    EncoderRate rate, RunKind run_kind,
-    std::uint64_t epoch_zero_us) const {
+LogHeaderV5 ProfileRunner::makeHeader(EncoderRate rate, RunKind run_kind,
+                                      std::uint64_t epoch_zero_us) const {
   LogHeaderV5 header{};
   header.stage = campaign_.stage();
   header.encoder_rate = rate;
@@ -514,9 +486,7 @@ LogHeaderV5 ProfileRunner::makeHeader(
 MotorCommandRequest ProfileRunner::commandForEpisode(
     const ProfileEpisode &episode, std::uint32_t local_epoch,
     std::int32_t fin_angle_millideg) {
-  const auto drive = [](std::int16_t command) {
-    return driveCommand(command);
-  };
+  const auto drive = [](std::int16_t command) { return driveCommand(command); };
   const std::int16_t limit = episode.command_limit_permille;
   switch (episode.phase) {
   case ProfilePhase::StationaryBaseline:
@@ -616,8 +586,7 @@ MotorCommandRequest ProfileRunner::commandForEpisode(
     if (local_epoch % 20U == 0U)
       pseudo_random_state_ =
           (pseudo_random_state_ >> 1U) ^
-          (0x80200003U &
-           (0U - (pseudo_random_state_ & 1U)));
+          (0x80200003U & (0U - (pseudo_random_state_ & 1U)));
     return drive((pseudo_random_state_ & 1U) != 0U ? limit : -limit);
   case ProfilePhase::BandLimitedNoise: {
     if (local_epoch % 50U == 0U)
@@ -630,14 +599,12 @@ MotorCommandRequest ProfileRunner::commandForEpisode(
     return drive(static_cast<std::int16_t>(value));
   }
   case ProfilePhase::Chirp: {
-    const std::uint32_t half_period =
-        std::max<std::uint32_t>(
-            10U, 100U - 90U * local_epoch / episode.duration_epochs);
+    const std::uint32_t half_period = std::max<std::uint32_t>(
+        10U, 100U - 90U * local_epoch / episode.duration_epochs);
     return drive(((local_epoch / half_period) & 1U) == 0U ? limit : -limit);
   }
   case ProfilePhase::Recenter:
-    return positionApproachCommand(-fin_angle_millideg, 0, local_epoch,
-                                   limit);
+    return positionApproachCommand(-fin_angle_millideg, 0, local_epoch, limit);
   case ProfilePhase::ZeroApproach:
   case ProfilePhase::Idle:
     return {0, MotorMode::Coast};
@@ -645,11 +612,9 @@ MotorCommandRequest ProfileRunner::commandForEpisode(
   return {0, MotorMode::Coast};
 }
 
-esp_err_t ProfileRunner::runRateCheck(EncoderRate rate,
-                                      std::uint32_t seconds) {
+esp_err_t ProfileRunner::runRateCheck(EncoderRate rate, std::uint32_t seconds) {
   if (seconds == 0U || journal_.armed() ||
-      seconds > std::numeric_limits<std::uint32_t>::max() /
-                    kConsumerRateHz)
+      seconds > std::numeric_limits<std::uint32_t>::max() / kConsumerRateHz)
     return ESP_ERR_INVALID_ARG;
   bool expected = false;
   if (!busy_.compare_exchange_strong(expected, true))
@@ -660,8 +625,7 @@ esp_err_t ProfileRunner::runRateCheck(EncoderRate rate,
     busy_.store(false);
     return stop_result;
   }
-  const CampaignStatus begin =
-      campaign_.beginRun(rate, RunKind::RateCheck);
+  const CampaignStatus begin = campaign_.beginRun(rate, RunKind::RateCheck);
   esp_err_t result =
       begin == CampaignStatus::Ok
           ? run(rate, RunKind::RateCheck, seconds * kConsumerRateHz)
@@ -711,8 +675,7 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
     return ESP_ERR_INVALID_STATE;
   }
   const std::uint16_t zero_raw =
-      campaign_.stage() == AssemblyStage::M0 ? m0_zero_raw_
-                                             : common_zero_raw_;
+      campaign_.stage() == AssemblyStage::M0 ? m0_zero_raw_ : common_zero_raw_;
   const ProfilePlan plan(campaign_.stage(), rate, campaign_.profileSeed());
   if (!plan.valid()) {
     (void)campaign_.finishRun(RunOutcome::Failed);
@@ -725,9 +688,8 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
   std::array<char, kSessionIdBytes> session_token{};
   makeSafeSessionToken(campaign_.sessionId(), session_token);
   const int name_length = std::snprintf(
-      base_name, sizeof(base_name), "%s_%s_%u_%s",
-      session_token.data(), stageName(campaign_.stage()),
-      static_cast<unsigned>(rate),
+      base_name, sizeof(base_name), "%s_%s_%u_%s", session_token.data(),
+      stageName(campaign_.stage()), static_cast<unsigned>(rate),
       run_kind == RunKind::RateCheck ? "rate" : "full");
   if (name_length <= 0 ||
       static_cast<std::size_t>(name_length) >= sizeof(base_name)) {
@@ -735,7 +697,6 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
     return ESP_ERR_INVALID_SIZE;
   }
 
-  // FAT cluster allocationはmotor/encoder realtime開始前に全record分済ませる。
   esp_err_t first_error = writer_.prepare(base_name, epochs);
   if (first_error != ESP_OK) {
     (void)journal_.disarm(nowUs());
@@ -758,22 +719,14 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
     (void)campaign_.finishRun(RunOutcome::Failed);
     return first_error;
   }
-  first_error = power_sampler_.begin();
-  if (first_error != ESP_OK) {
-    (void)journal_.apply({0, MotorMode::Coast}, nowUs());
-    (void)journal_.disarm(nowUs());
-    LogFooterV5 footer{};
-    footer.statistics.first_error = first_error;
-    (void)writer_.abortAndClose(footer);
-    (void)campaign_.finishRun(RunOutcome::Failed);
-    return first_error;
-  }
+
+  // Motor-IDではVbus ADCは予備計測扱いとし、characterizationの取得対象から外す。
+  // PowerSampler taskを起動せず、V5には明示的なunavailable evidenceを保存する。
   first_error = sampler_.begin(rate, epoch_zero);
   if (first_error != ESP_OK) {
     (void)journal_.apply({0, MotorMode::Coast}, nowUs());
     (void)journal_.disarm(nowUs());
     (void)sampler_.stop();
-    (void)power_sampler_.stop();
     LogFooterV5 footer{};
     footer.statistics.first_error = first_error;
     (void)writer_.abortAndClose(footer);
@@ -781,13 +734,10 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
     return first_error;
   }
 
-  // epoch zeroより十分前に安全なCoastを一度だけ実機へ確定する。
-  // 以後同じcommandはCommandJournalがdedupし、実際の最終apply時刻を保持する。
   first_error = journal_.apply({0, MotorMode::Coast}, nowUs());
   if (first_error != ESP_OK) {
     (void)journal_.disarm(nowUs());
     (void)sampler_.stop();
-    (void)power_sampler_.stop();
     LogFooterV5 footer{};
     footer.statistics.first_error = first_error;
     (void)writer_.abortAndClose(footer);
@@ -810,13 +760,10 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
   std::uint64_t sequence = 0U;
   std::uint32_t qualification_valid = 0U;
   std::uint32_t qualification_total = 0U;
-  std::uint64_t vbus_invalid = 0U;
   std::uint32_t episode_offset = 0U;
   std::size_t episode_index = 0U;
   ShutdownSequence shutdown{};
   bool qualification_stop = false;
-  // footerのconsumer_deadline_missesはmotor-IDとしてfatalなdeadlineだけを保持する。
-  // release-only遅延はrelease_deadline_misses/consumer_lateness_usへ別記する。
   std::uint64_t runtime_deadline_misses = 0U;
   std::uint64_t command_deadline_misses = 0U;
   std::uint64_t release_deadline_misses = 0U;
@@ -841,7 +788,6 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
                                 std::uint64_t timestamp_us) noexcept {
     if (cause == ESP_OK)
       cause = ESP_ERR_INVALID_RESPONSE;
-    // 安全停止は毎回試すが、診断原因とabort理由は最初の値を保持する。
     (void)journal_.stopForError(cause, timestamp_us);
     if (first_error == ESP_OK) {
       first_error = cause;
@@ -858,12 +804,6 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
     const esp_err_t writer_error = writer_.firstError();
     if (writer_error != ESP_OK) {
       stopForFatal(writer_error, AbortReason::WriterError, nowUs());
-      return true;
-    }
-    const esp_err_t power_error = power_sampler_.firstError();
-    if (power_error != ESP_OK) {
-      ++vbus_invalid;
-      stopForFatal(power_error, AbortReason::VbusInvalid, nowUs());
       return true;
     }
     const esp_err_t sampler_error = sampler_.firstError();
@@ -883,7 +823,6 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
     (void)journal_.disarm(nowUs());
     (void)stopConsumerTimer();
     (void)sampler_.stop();
-    (void)power_sampler_.stop();
     LogFooterV5 footer{};
     footer.statistics.first_error = first_error;
     (void)writer_.abortAndClose(footer);
@@ -897,8 +836,6 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
     const std::uint64_t epoch_start =
         epoch_zero + static_cast<std::uint64_t>(epoch) * kEpochDurationUs;
     const std::uint64_t epoch_end = epoch_start + kEpochDurationUs;
-    // 100 usはflight realtime評価のtarget。motor-IDでは1 epochだけの遅れは
-    // actual apply timestampを次epochの実入力として保持し、2 epoch目へ入る前にfatalとする。
     const std::uint64_t apply_hard_deadline = epoch_end + kEpochDurationUs;
     ProfileEpisode episode{ProfilePhase::StationaryBaseline,
                            ApproachBranch::None, 1U, epochs, 0, false};
@@ -906,18 +843,15 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
     if (full) {
       while (episode_index + 1U < plan.commonEpisodes().size() &&
              epoch >= episode_offset +
-                          plan.commonEpisodes()[episode_index]
-                              .duration_epochs) {
-        episode_offset +=
-            plan.commonEpisodes()[episode_index].duration_epochs;
+                          plan.commonEpisodes()[episode_index].duration_epochs) {
+        episode_offset += plan.commonEpisodes()[episode_index].duration_epochs;
         ++episode_index;
       }
       episode = plan.commonEpisodes()[episode_index];
       local_epoch = epoch - episode_offset;
     }
 
-    MotorCommandRequest request =
-        commandForEpisode(episode, local_epoch, fin_angle);
+    MotorCommandRequest request = commandForEpisode(episode, local_epoch, fin_angle);
     std::int32_t target_fin_angle = 0;
     ZeroApproachController *approach = nullptr;
     if (episode.phase == ProfilePhase::ZeroApproach) {
@@ -956,8 +890,7 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
       request = {0, MotorMode::Coast};
       preapply_error = ESP_ERR_INVALID_STATE;
       preapply_abort = AbortReason::StopRequested;
-    } else if (full && !have_angle &&
-               request.command_permille != 0) {
+    } else if (full && !have_angle && request.command_permille != 0) {
       request = {0, MotorMode::Coast};
       guard_state = GuardState::Abort;
       preapply_error = ESP_ERR_INVALID_RESPONSE;
@@ -980,11 +913,7 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
       }
     }
 
-    // 1 epochだけ遅れたcommandは適用を継続する。ただし、そのcommandは既に終了した
-    // current epochの入力ではないためcurrent recordには適用前evidenceを残す。
-    // 次epoch recordがactual apply timestamp付きの新commandを正本として保持する。
-    const bool command_change_required =
-        !journal_.requestAlreadyApplied(request);
+    const bool command_change_required = !journal_.requestAlreadyApplied(request);
     const ImmutableCommandEvidence before_command = journal_.snapshot(nowUs());
     const std::uint64_t apply_started_us = nowUs();
     bool apply_deadline_missed =
@@ -997,8 +926,6 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
       ++runtime_deadline_misses;
       ++command_deadline_misses;
       guard_state = GuardState::Abort;
-      // 2 epoch目へ入ったDrive/Brakeは実機へ出さない。requestedは元指令のまま残し、
-      // applied=Coast/result=timeoutとして一つのgenerationへ記録する。
       apply_result = journal_.rejectAndCoast(
           request, ESP_ERR_TIMEOUT, apply_started_us);
     } else {
@@ -1023,8 +950,6 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
     }
     ImmutableCommandEvidence epoch_command =
         apply_epoch_slipped ? before_command : applied_command;
-    // command generation/requested/applied/mode/apply timestampは同じrealtime ownerで
-    // 一度だけ値copyし、writer taskはこのimmutable evidenceしか見ない。
     epoch_command.logger_snapshot_timestamp_us =
         std::max(nowUs(), epoch_command.command_apply_timestamp_us);
     if (preapply_error != ESP_OK)
@@ -1062,7 +987,6 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
       stopForFatal(apply_result, AbortReason::MotorApplyError, nowUs());
     }
 
-    // 先行異常とcommand hard deadlineが競合したepochは証拠を混同せず終了する。
     if (preapply_error != ESP_OK && apply_deadline_missed)
       break;
 
@@ -1075,9 +999,8 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
           std::max(max_consumer_work_us, current_consumer_work_us);
     }
     if (wait_entry_us > epoch_end) {
-      max_wait_entry_lateness_us =
-          std::max(max_wait_entry_lateness_us,
-                   saturateU32(wait_entry_us - epoch_end));
+      max_wait_entry_lateness_us = std::max(
+          max_wait_entry_lateness_us, saturateU32(wait_entry_us - epoch_end));
     }
 
     ConsumerTick consumer_tick{};
@@ -1120,7 +1043,6 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
                      nowUs());
         break;
       }
-      // notificationはtick件数の正本ではなく、tick/failure/stopのwake-upだけに使う。
       (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     }
     if (!consumer_tick_received)
@@ -1155,8 +1077,7 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
     previous_release_us = release_us;
     have_previous_release = true;
 
-    if (stop_requested_.load() &&
-        last_abort_reason_ == AbortReason::None) {
+    if (stop_requested_.load() && last_abort_reason_ == AbortReason::None) {
       stopForFatal(ESP_ERR_INVALID_STATE, AbortReason::StopRequested,
                    release_us);
     }
@@ -1174,8 +1095,6 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
     if (release_deadline_missed) {
       ++release_deadline_misses;
       if (one_epoch_catchup_allowed) {
-        // tick queueが各epochを保持するため、最大1 epoch分のbacklogは1件ずつreleaseして
-        // hardware timer位相へ追いつける。actual timestampはV5へそのまま残す。
         ++diagnostic_continuations;
       } else {
         ++runtime_deadline_misses;
@@ -1264,36 +1183,18 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
       }
     }
 
-    std::uint64_t snapshot_us = nowUs();
+    const std::uint64_t snapshot_us = nowUs();
     PowerEvidence power_evidence{};
-    bool power_measurement_valid =
-        power_sampler_.latest(snapshot_us, power_evidence) &&
-        power_sampler_.firstError() == ESP_OK;
-    snapshot_us = nowUs();
-    if (power_evidence.capture_timestamp_us > snapshot_us ||
-        (power_evidence.capture_timestamp_us != 0U &&
-         snapshot_us - power_evidence.capture_timestamp_us > 100'000U))
-      power_measurement_valid = false;
-    // rate-checkはmotor電源を物理遮断した状態でも実施するため0 Vを許容する。
-    // fullだけは実駆動が必要なので、ADC計測が有効でも0 mVならVbusInvalidとする。
-    const bool motor_power_present = power_evidence.motor_millivolts > 0U;
-    const bool power_valid =
-        power_measurement_valid && (!full || motor_power_present);
+    power_evidence.capture_timestamp_us = 0U;
+    power_evidence.motor_millivolts = 0U;
+    power_evidence.read_result = ESP_ERR_NOT_SUPPORTED;
+    power_evidence.valid = false;
     epoch_command.logger_snapshot_timestamp_us = snapshot_us;
+
     if (writer_.firstError() != ESP_OK) {
-      stopForFatal(writer_.firstError(), AbortReason::WriterError,
-                   release_us);
+      stopForFatal(writer_.firstError(), AbortReason::WriterError, release_us);
       if (release_us < epoch_end)
         break;
-    }
-    if (!power_valid) {
-      ++vbus_invalid;
-      esp_err_t power_error = power_evidence.read_result == ESP_OK
-                                  ? power_sampler_.firstError()
-                                  : power_evidence.read_result;
-      if (power_error == ESP_OK)
-        power_error = ESP_ERR_INVALID_RESPONSE;
-      stopForFatal(power_error, AbortReason::VbusInvalid, snapshot_us);
     }
 
     RawEncoderSample raw{};
@@ -1313,9 +1214,6 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
                    nowUs());
       break;
     }
-    // FixedEpochAssemblerは旧V5契約どおりrelease遅延でもEpochDeadlineを立てる。
-    // 新規1 kHz motor-IDではrelease-only遅延と1 epochだけのcommand slipを数値診断へ分離し、
-    // 2 epoch目へ入るcommandだけfatal flagとして残す。旧captureのdecode互換はvalidator側で維持する。
     if (release_deadline_missed && !apply_deadline_missed)
       block.flags = static_cast<std::uint16_t>(block.flags & ~EpochDeadline);
     if (apply_deadline_missed)
@@ -1324,8 +1222,7 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
     if ((block.flags & EpochAggregateValid) != 0U) {
       std::int32_t converted_angle = 0;
       if (!finAngleMilliDegreesFromUnwrappedQ16(
-              block.mean_unwrapped_counts_q16, zero_raw,
-              converted_angle)) {
+              block.mean_unwrapped_counts_q16, zero_raw, converted_angle)) {
         stopForFatal(ESP_ERR_INVALID_SIZE, AbortReason::PositionGuard,
                      nowUs());
         guard_state = GuardState::Abort;
@@ -1334,8 +1231,7 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
         fin_angle = converted_angle;
         const std::int64_t rate =
             have_angle
-                ? static_cast<std::int64_t>(fin_angle -
-                                            previous_fin_angle) *
+                ? static_cast<std::int64_t>(fin_angle - previous_fin_angle) *
                       1'000
                 : 0;
         if (rate < std::numeric_limits<std::int32_t>::min() ||
@@ -1350,19 +1246,16 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
       }
     } else if (full && first_error == ESP_OK &&
                !((block.flags & EpochStartup) != 0U &&
-                 block.epoch_index == 0U &&
-                 block.invalid_sample_count == 0U)) {
-      // startup epochだけはrepeated/skippedを許容する。steady-state欠落は即停止。
+                 block.epoch_index == 0U && block.invalid_sample_count == 0U)) {
       stopForFatal(ESP_ERR_INVALID_RESPONSE, AbortReason::EncoderInvalid,
                    nowUs());
     }
     if (sampler_.firstError() != ESP_OK) {
-      if (full) {
+      if (full)
         stopForFatal(sampler_.firstError(), AbortReason::SamplerError,
                      nowUs());
-      } else {
+      else
         stopForQualification();
-      }
     }
 
     if (approach != nullptr && have_angle &&
@@ -1381,13 +1274,12 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
       }
     }
     if (approach != nullptr &&
-        local_epoch + 1U >= episode.duration_epochs &&
-        !approach->complete() && first_error == ESP_OK) {
+        local_epoch + 1U >= episode.duration_epochs && !approach->complete() &&
+        first_error == ESP_OK) {
       stopForFatal(ESP_ERR_TIMEOUT, AbortReason::Timeout, nowUs());
     }
 
-    if ((first_error != ESP_OK || qualification_stop) &&
-        journal_.armed())
+    if ((first_error != ESP_OK || qualification_stop) && journal_.armed())
       (void)journal_.disarm(nowUs());
 
     ImmutableLogRecord record{};
@@ -1408,9 +1300,6 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
     record.first_error = first_error;
     record.command = epoch_command;
     record.power = power_evidence;
-    record.power.valid = power_valid;
-    if (!power_valid && record.power.read_result == ESP_OK)
-      record.power.read_result = ESP_ERR_INVALID_RESPONSE;
     record.encoder = block;
 
     if (hasError(validateRecord(record))) {
@@ -1420,11 +1309,10 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
       const esp_err_t enqueue_result = writer_.enqueue(record);
       if (enqueue_result != ESP_OK) {
         stopForFatal(enqueue_result,
-                     enqueue_result == ESP_ERR_NO_MEM
-                         ? AbortReason::QueueFull
-                         : AbortReason::WriterError,
+                     enqueue_result == ESP_ERR_NO_MEM ? AbortReason::QueueFull
+                                                      : AbortReason::WriterError,
                      nowUs());
-      } else if (enqueue_result == ESP_OK) {
+      } else {
         ++qualification_total;
         if ((block.flags & EpochAggregateValid) != 0U)
           ++qualification_valid;
@@ -1446,8 +1334,7 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
     rememberOperation(operation, first_error);
   };
 
-  const esp_err_t coast_result =
-      journal_.apply({0, MotorMode::Coast}, nowUs());
+  const esp_err_t coast_result = journal_.apply({0, MotorMode::Coast}, nowUs());
   markShutdown(coast_result);
   (void)shutdown.mark(ShutdownStep::Coast);
   const esp_err_t disarm_result = journal_.disarm(nowUs());
@@ -1456,7 +1343,6 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
   esp_err_t sampling_cleanup_result = stopConsumerTimer();
   const esp_err_t sampler_diagnostic_result = sampler_.stop();
   const EncoderTimingDiagnostics encoder_timing = sampler_.timingDiagnostics();
-  const esp_err_t power_diagnostic_result = power_sampler_.stop();
   rememberOperation(sampler_.stopCleanupError(), sampling_cleanup_result);
   markShutdown(sampling_cleanup_result);
   (void)shutdown.mark(ShutdownStep::SamplingStop);
@@ -1477,16 +1363,10 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
       epoch_statistics.startup_incomplete_epochs;
   statistics.steady_state_incomplete_epochs =
       epoch_statistics.steady_state_incomplete_epochs;
-  // release-only latenessはCHAR_RATE_RESULT release-deadlineと各recordの
-  // consumer_lateness_usへ残し、footerのfatal deadline counterには含めない。
   statistics.consumer_deadline_misses = runtime_deadline_misses;
   statistics.writer_queue_overflows = writer_.writerQueueOverflows();
-  statistics.vbus_invalid_samples = vbus_invalid;
+  statistics.vbus_invalid_samples = 0U;
   const UnsupportedReason acquisition_reason = unsupportedReason(statistics);
-  if (power_diagnostic_result != ESP_OK && first_error == ESP_OK) {
-    first_error = power_diagnostic_result;
-    last_abort_reason_ = AbortReason::VbusInvalid;
-  }
   if (full && acquisition_reason != UnsupportedReason::None &&
       first_error == ESP_OK) {
     first_error = sampler_diagnostic_result == ESP_OK
@@ -1517,14 +1397,13 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
   statistics.first_error = first_error;
   const UnsupportedReason unsupported =
       full ? UnsupportedReason::None : acquisition_reason;
-  const bool supported = first_error == ESP_OK &&
-                         unsupported == UnsupportedReason::None;
+  const bool supported =
+      first_error == ESP_OK && unsupported == UnsupportedReason::None;
   LogFooterV5 footer{};
   footer.completion =
       first_error != ESP_OK
           ? CompletionCode::Aborted
-          : (supported ? CompletionCode::Normal
-                       : CompletionCode::Unsupported);
+          : (supported ? CompletionCode::Normal : CompletionCode::Unsupported);
   footer.rate_supported = supported;
   footer.unsupported_reason =
       footer.completion == CompletionCode::Unsupported
@@ -1535,7 +1414,6 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
       run_kind == RunKind::RateCheck ? qualification_valid : 0U;
   footer.qualification_total_epochs =
       run_kind == RunKind::RateCheck ? qualification_total : 0U;
-  // wire上はcoast/disarm/sampling/realtime-drain/writer-drain/syncの6段階。
   footer.shutdown_step_mask = wire_shutdown_mask;
   (void)shutdown.mark(ShutdownStep::Footer);
   const esp_err_t close_result = writer_.close(footer);
@@ -1546,8 +1424,7 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
     const CompletionCode reported_completion =
         first_error != ESP_OK
             ? CompletionCode::Aborted
-            : (supported ? CompletionCode::Normal
-                         : CompletionCode::Unsupported);
+            : (supported ? CompletionCode::Normal : CompletionCode::Unsupported);
     const UnsupportedReason reported_reason =
         reported_completion == CompletionCode::Unsupported
             ? unsupported
@@ -1614,8 +1491,7 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
   if (first_error != ESP_OK)
     finish_status = campaign_.finishRun(RunOutcome::Failed);
   else if (!supported)
-    finish_status =
-        campaign_.finishRun(RunOutcome::Unsupported, unsupported);
+    finish_status = campaign_.finishRun(RunOutcome::Unsupported, unsupported);
   else
     finish_status = campaign_.finishRun(RunOutcome::Accepted);
   if (finish_status != CampaignStatus::Ok && first_error == ESP_OK)
