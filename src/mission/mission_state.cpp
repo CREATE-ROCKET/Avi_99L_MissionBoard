@@ -20,6 +20,13 @@ uint32_t nextEpoch(uint32_t current) {
 constexpr uint8_t bit(PreflightReadinessBit value) {
   return static_cast<uint8_t>(1U << static_cast<uint8_t>(value));
 }
+
+bool finFlightReadinessValid(const MissionSnapshot &snapshot) {
+  constexpr uint8_t required =
+      bit(PreflightReadinessBit::fin_zero_configured) |
+      bit(PreflightReadinessBit::motor_profile_valid);
+  return (snapshot.preflight_ready_mask & required) == required;
+}
 } // 無名名前空間
 
 uint8_t PreflightReadinessSnapshot::readyMask() const {
@@ -85,7 +92,8 @@ TransitionResult MissionStateMachine::startSequence(
   snapshot_.preflight_missing_mask = readiness.missingMask();
   snapshot_.parachute = ParaDirective::hold;
   control_gate_evaluated_ = false;
-  fin_control_available_ = readiness.fin_zero_configured;
+  fin_control_available_ =
+      readiness.fin_zero_configured && readiness.motor_profile_valid;
   elapsed_offset_us_ = 0;
   invalidateControlRollReference();
   invalidateLiftoff();
@@ -250,7 +258,8 @@ void MissionStateMachine::tick(const MissionTickInput &input,
       !control_gate_evaluated_) {
     control_gate_evaluated_ = true;
     if (!snapshot_.fin_control_disabled && !snapshot_.control_reentry_inhibited &&
-        input.control.ready() && captureControlRollReference(input))
+        finFlightReadinessValid(snapshot_) && input.control.ready() &&
+        captureControlRollReference(input))
       snapshot_.state = protocol::MissionState::control;
     else
       snapshot_.control_reentry_inhibited = true;
@@ -286,7 +295,9 @@ void MissionStateMachine::updateDirectives(uint64_t now_us) {
     return;
   }
   if (snapshot_.state == protocol::MissionState::control) {
-    snapshot_.fin = FinDirective::roll_control;
+    snapshot_.fin = finFlightReadinessValid(snapshot_)
+                        ? FinDirective::roll_control
+                        : FinDirective::brake;
     return;
   }
   if (snapshot_.state == protocol::MissionState::liftoff_detection ||
@@ -295,7 +306,7 @@ void MissionStateMachine::updateDirectives(uint64_t now_us) {
     if (snapshot_.liftoff_time_valid &&
         now_us >= snapshot_.liftoff_time_us + kPowerCutoffUs)
       snapshot_.fin = FinDirective::brake;
-    else if (fin_control_available_)
+    else if (fin_control_available_ && finFlightReadinessValid(snapshot_))
       snapshot_.fin = FinDirective::zero_hold;
     else
       snapshot_.fin = FinDirective::brake;
