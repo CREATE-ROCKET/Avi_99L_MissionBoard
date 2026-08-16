@@ -820,13 +820,10 @@ void parachuteTask(void *) {
     if (!mode_prepared) {
       // Step modeでは停止後のcurrent positionが相対残量へ戻るfirmwareが
       // あるため、productionでは絶対position + multi-turn feedbackを使う。
-      // configurePositionMode()は過去のStep設定で0になったposition limitも戻す。
-      last_initialization_error = servo.configurePositionMode(
+      // multi-turn absolute controlではangle limitを0/0にする必要があるため、
+      // 単回転用の0..4095 configurePositionMode()は使用しない。
+      last_initialization_error = servo.configureMultiTurnPositionMode(
           STS3215::Persistence::volatile_only);
-      if (last_initialization_error == ESP_OK)
-        last_initialization_error = servo.setFeedbackMode(
-            STS3215::FeedbackMode::multi_turn,
-            STS3215::Persistence::volatile_only);
       if (last_initialization_error != ESP_OK)
         return false;
       mode_prepared =

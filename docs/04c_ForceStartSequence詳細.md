@@ -20,6 +20,8 @@ Open/Closeは1回転内の絶対角であり、それぞれ独立したoptional�
 
 productionのパラシュートサーボは`OperatingMode::position`と`FeedbackMode::multi_turn`を使用する。`OperatingMode::step`は相対移動command向けであり、停止後のcurrent position feedbackを物理絶対角として扱えないfirmwareがあるため、productionのcurrent angle sourceには使用しない。
 
+STS3215のmulti-turn absolute position controlではminimum/maximum angle limitをともに`0`へ設定する。`0..4095`は単回転position mode用であり、multi-turn production設定には使用しない。
+
 - STS3215のfresh current positionはsigned multi-turn countとして取得する。
 - GUI/CAN/LoRaへ送る`parachute angle`とOpen/Close endpoint比較では、fresh multi-turn countを1回転内`0..4095`へwrapした物理絶対角を使う。
 - `ParaMoveRelative`はfresh multi-turn currentに要求変位を加えたabsolute multi-turn targetを`position` modeへ送る。要求変位は従来どおり`abs(delta) < 180 deg`とする。
