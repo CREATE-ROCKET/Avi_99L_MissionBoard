@@ -3048,9 +3048,10 @@ void airDataTask(void *) {
   }
   lps_ready.store(lps_result == ESP_OK, std::memory_order_release);
   ssc_ready.store(ssc_result == ESP_OK, std::memory_order_release);
-  std::printf("AirDataTask bus=%s lps=%s ssc=%s%s\n",
+  std::printf("AirDataTask bus=%s lps=%s ssc=%s timeout_ms=%lu%s\n",
               esp_err_to_name(bus_result), esp_err_to_name(lps_result),
               esp_err_to_name(ssc_result),
+              static_cast<unsigned long>(board::kAirDataOperationTimeoutMs),
               ssc_result == ESP_ERR_NOT_FOUND ? " (未接続は継続可能)" : "");
 
   sensors::AirDataFlightLogic flight_logic;
@@ -3063,6 +3064,26 @@ void airDataTask(void *) {
   uint64_t last_ssc_us = 0;
   uint64_t last_lps_us = 0;
   uint32_t calibration_generation = 0;
+  struct SscDiagnostics {
+    uint32_t success{};
+    uint32_t stale{};
+    uint32_t command_mode{};
+    uint32_t diagnostic_fault{};
+    uint32_t timeout{};
+    uint32_t i2c_error{};
+    uint32_t reconnect_attempts{};
+    uint32_t reconnect_success{};
+    uint32_t max_read_us{};
+    uint32_t consecutive_restartable_faults{};
+  } ssc_diagnostics;
+  uint64_t next_ssc_reconnect_us =
+      ssc_result == ESP_OK
+          ? 0
+          : static_cast<uint64_t>(esp_timer_get_time()) +
+                static_cast<uint64_t>(board::kSscReconnectIntervalMs) *
+                    1'000ULL;
+  esp_err_t last_ssc_reconnect_error = ssc_result;
+  bool ssc_recovery_pending = ssc_result != ESP_OK;
 
   auto updateMissionSnapshot = [&]() {
     if (xSemaphoreTake(state_mutex, 0) == pdTRUE) {
@@ -3080,10 +3101,17 @@ void airDataTask(void *) {
   auto setInitialSscError = [&](esp_err_t result) {
     if (snapshot.ssc_monotonic_us != 0)
       return;
-    snapshot.airspeed_raw = static_cast<uint8_t>(
-        result == ESP_ERR_TIMEOUT
-            ? protocol::quantization::AirspeedError::ssc_i2c_timeout
-            : protocol::quantization::AirspeedError::ssc_i2c_error);
+    protocol::quantization::AirspeedError error =
+        protocol::quantization::AirspeedError::ssc_i2c_error;
+    if (result == ESP_ERR_TIMEOUT)
+      error = protocol::quantization::AirspeedError::ssc_i2c_timeout;
+    else if (result == ESP_ERR_NOT_FINISHED)
+      error = protocol::quantization::AirspeedError::ssc_stale;
+    else if (result == ESP_ERR_INVALID_STATE)
+      error = protocol::quantization::AirspeedError::ssc_command_mode;
+    else if (result == ESP_ERR_INVALID_RESPONSE)
+      error = protocol::quantization::AirspeedError::ssc_diagnostic_fault;
+    snapshot.airspeed_raw = static_cast<uint8_t>(error);
   };
   auto setInitialLpsError = [&](esp_err_t result) {
     if (snapshot.lps_monotonic_us != 0)
@@ -3096,6 +3124,94 @@ void airDataTask(void *) {
         result == ESP_ERR_TIMEOUT
             ? protocol::quantization::LpsTemperatureError::i2c_timeout
             : protocol::quantization::LpsTemperatureError::i2c_bus_error);
+  };
+  auto incrementSaturated = [](uint32_t &value) {
+    if (value != std::numeric_limits<uint32_t>::max())
+      ++value;
+  };
+  auto printSscDiagnostics = [&](const char *prefix, esp_err_t result) {
+    std::printf(
+        "SSC %s result=%s success=%lu stale=%lu command=%lu diagnostic=%lu "
+        "timeout=%lu i2c=%lu reconnect=%lu/%lu consecutive=%lu "
+        "max_read_us=%lu\n",
+        prefix, esp_err_to_name(result),
+        static_cast<unsigned long>(ssc_diagnostics.success),
+        static_cast<unsigned long>(ssc_diagnostics.stale),
+        static_cast<unsigned long>(ssc_diagnostics.command_mode),
+        static_cast<unsigned long>(ssc_diagnostics.diagnostic_fault),
+        static_cast<unsigned long>(ssc_diagnostics.timeout),
+        static_cast<unsigned long>(ssc_diagnostics.i2c_error),
+        static_cast<unsigned long>(ssc_diagnostics.reconnect_success),
+        static_cast<unsigned long>(ssc_diagnostics.reconnect_attempts),
+        static_cast<unsigned long>(
+            ssc_diagnostics.consecutive_restartable_faults),
+        static_cast<unsigned long>(ssc_diagnostics.max_read_us));
+  };
+  auto recordSscRead = [&](esp_err_t result, uint32_t elapsed_us) {
+    if (elapsed_us > ssc_diagnostics.max_read_us)
+      ssc_diagnostics.max_read_us = elapsed_us;
+    bool restartable = false;
+    if (result == ESP_OK) {
+      incrementSaturated(ssc_diagnostics.success);
+      ssc_diagnostics.consecutive_restartable_faults = 0;
+    } else if (result == ESP_ERR_NOT_FINISHED) {
+      incrementSaturated(ssc_diagnostics.stale);
+      // staleはI2C transportが応答した結果なのでdevice再生成の根拠にしない。
+      ssc_diagnostics.consecutive_restartable_faults = 0;
+    } else if (result == ESP_ERR_INVALID_STATE) {
+      incrementSaturated(ssc_diagnostics.command_mode);
+      restartable = true;
+    } else if (result == ESP_ERR_INVALID_RESPONSE) {
+      incrementSaturated(ssc_diagnostics.diagnostic_fault);
+      restartable = true;
+    } else if (result == ESP_ERR_TIMEOUT) {
+      incrementSaturated(ssc_diagnostics.timeout);
+      restartable = true;
+    } else {
+      incrementSaturated(ssc_diagnostics.i2c_error);
+      restartable = true;
+    }
+    if (restartable)
+      incrementSaturated(ssc_diagnostics.consecutive_restartable_faults);
+    return restartable &&
+           ssc_diagnostics.consecutive_restartable_faults >=
+               board::kSscRestartConsecutiveFaults;
+  };
+  auto attemptSscReconnect = [&](uint64_t now_us, bool restart_initialized) {
+    if (bus_result != ESP_OK || now_us < next_ssc_reconnect_us)
+      return false;
+    if (ssc.initialized() && !restart_initialized)
+      return false;
+    if (mission_snapshot.deployment_power_cutoff_latched ||
+        recovery_requested.load(std::memory_order_acquire))
+      return false;
+
+    // SSCだけをbusからdetachする。共有I2C busとLPS25HBは維持する。
+    ssc_ready.store(false, std::memory_order_release);
+    ssc_recovery_pending = true;
+    incrementSaturated(ssc_diagnostics.reconnect_attempts);
+    esp_err_t cleanup = ssc.end();
+    if (cleanup == ESP_ERR_INVALID_STATE)
+      cleanup = ESP_OK;
+    esp_err_t reconnect = cleanup;
+    if (reconnect == ESP_OK)
+      reconnect = ssc.begin(bus);
+    next_ssc_reconnect_us =
+        now_us + static_cast<uint64_t>(board::kSscReconnectIntervalMs) *
+                     1'000ULL;
+    if (reconnect == ESP_OK) {
+      incrementSaturated(ssc_diagnostics.reconnect_success);
+      ssc_diagnostics.consecutive_restartable_faults = 0;
+      last_ssc_reconnect_error = ESP_OK;
+      // begin/probe成功だけではdataのnormal statusを保証しない。次の正常readまで
+      // ssc_ready=falseを維持し、古いairspeedをControlへ再接続しない。
+      return true;
+    }
+    if (reconnect != last_ssc_reconnect_error ||
+        ssc_diagnostics.reconnect_attempts == 1)
+      printSscDiagnostics("reconnect failed", reconnect);
+    last_ssc_reconnect_error = reconnect;
+    return false;
   };
 
   for (;;) {
@@ -3114,10 +3230,26 @@ void airDataTask(void *) {
     if (now_us - last_ssc_us >= 2'500) {
       last_ssc_us = now_us;
       updateMissionSnapshot();
+      if (!ssc.initialized())
+        (void)attemptSscReconnect(now_us, false);
       if (ssc.initialized()) {
         SSCDRRN005PD2A5::Data data{};
+        const int64_t read_started_us = esp_timer_get_time();
         const esp_err_t result = ssc.read(data);
+        const int64_t read_elapsed_us =
+            esp_timer_get_time() - read_started_us;
+        const uint32_t read_duration_us = static_cast<uint32_t>(
+            read_elapsed_us > 0 ? read_elapsed_us : 0);
+        const bool restart_requested =
+            recordSscRead(result, read_duration_us);
         if (result == ESP_OK) {
+          const bool recovered = ssc_recovery_pending;
+          ssc_ready.store(true, std::memory_order_release);
+          ssc_recovery_pending = false;
+          next_ssc_reconnect_us = 0;
+          last_ssc_reconnect_error = ESP_OK;
+          if (recovered)
+            printSscDiagnostics("recovered", ESP_OK);
           snapshot.ssc_monotonic_us = now_us;
           snapshot.ssc_valid = true;
           snapshot.ssc_temperature_celsius = data.temperature_celsius;
@@ -3181,8 +3313,20 @@ void airDataTask(void *) {
           }
         } else {
           setInitialSscError(result);
+          if (restart_requested) {
+            ssc_ready.store(false, std::memory_order_release);
+            ssc_recovery_pending = true;
+            const uint64_t reconnect_now_us =
+                static_cast<uint64_t>(esp_timer_get_time());
+            if (reconnect_now_us >= next_ssc_reconnect_us) {
+              printSscDiagnostics("restart requested", result);
+              (void)attemptSscReconnect(reconnect_now_us, true);
+            }
+          }
         }
       } else {
+        ssc_ready.store(false, std::memory_order_release);
+        ssc_recovery_pending = true;
         setInitialSscError(ESP_ERR_INVALID_STATE);
       }
       (void)xQueueOverwrite(air_data_queue, &snapshot);

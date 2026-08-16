@@ -42,8 +42,14 @@ constexpr i2c_port_t kAirDataI2cPort = I2C_NUM_0;
 constexpr gpio_num_t kAirDataSda = GPIO_NUM_47;
 constexpr gpio_num_t kAirDataScl = GPIO_NUM_48;
 constexpr uint32_t kAirDataI2cFrequencyHz = 300'000;
-// TODO(HW_TEST): 400 Hz取得時のI2C operation timeoutを実測で確定する
-constexpr uint32_t kAirDataOperationTimeoutMs = 2;
+// 400 Hz AirData試験コードと同じ10 ms上限を使用する。正常transactionは
+// timeoutまで待たず完了するため、2.5 ms取得周期そのものは変更しない。
+// TODO(HW_TEST): 10 ms上限での連続運転結果を記録し最終値を確定する
+constexpr uint32_t kAirDataOperationTimeoutMs = 10;
+// 単発I2C errorやstaleではfreshな直前sampleを即座に捨てず、連続fault時だけ
+// SSC device handleを再生成する。共有bus/LPSはresetしない。
+constexpr uint32_t kSscRestartConsecutiveFaults = 8;
+constexpr uint32_t kSscReconnectIntervalMs = 250;
 
 constexpr gpio_num_t kMotorIn2 = GPIO_NUM_38;
 constexpr gpio_num_t kMotorIn1 = GPIO_NUM_39;
