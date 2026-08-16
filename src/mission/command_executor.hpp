@@ -14,12 +14,12 @@ enum class CommandCode : uint8_t {
   disable_fin_control = 0x03,
   force_start_sequence = 0x04,
 
-  // CommandReceiveで地上局へ公開する動翼操作はこの2つだけとする。
+  // CommandReceiveで地上局へ公開する動翼の駆動操作はこの2つだけとする。
   fin_release_hold = 0x10,
   fin_hold_current = 0x13,
 
-  // production_runtime内部の既存分岐を維持するための互換名。
-  // 0x11/0x12はwire commandとしてはCommandExecutorで拒否する。
+  // FinZeroConfiguredを成立させる校正・設定commandは駆動操作とは別に残す。
+  // production_runtime内部の既存分岐を維持するため旧内部名も保持する。
   fin_free = fin_release_hold,
   set_fin_zero = 0x11,
   start_fin_zero_hold = 0x12,
