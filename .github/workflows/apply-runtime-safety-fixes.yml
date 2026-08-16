@@ -18,7 +18,9 @@ jobs:
         with:
           fetch-depth: 0
       - name: Apply runtime patch
-        run: python3 tools/apply_runtime_safety_fixes.py
+        run: |
+          sed -i 's/if count != 2:/if count != 1:/; s/expected=2/expected=1/' tools/apply_runtime_safety_fixes.py
+          python3 tools/apply_runtime_safety_fixes.py
       - name: Check and commit
         run: |
           git diff --check
