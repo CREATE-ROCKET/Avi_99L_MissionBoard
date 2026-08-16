@@ -258,6 +258,8 @@ struct AttitudeTiltTelemetry {
   uint8_t sequence{};
   uint8_t magnitude_raw{};
   uint16_t direction_raw{};
+  // COMMANDRECEIVE表示専用。最新PreflightCalibration姿勢を0 degとするwrapped roll。
+  uint16_t display_roll_raw{0x8001};
 };
 
 struct LpsTelemetry {
