@@ -3655,6 +3655,9 @@ void canTask(void *) {
           persistence_flags |= 1U << 1U;
         if (parachute_persistence_corrupt.load(std::memory_order_acquire))
           persistence_flags |= 1U << 2U;
+        if (sd_log_ready.load(std::memory_order_acquire) &&
+            !sd_log_failed.load(std::memory_order_acquire))
+          persistence_flags |= 1U << 3U;
         if (result_queue_overflow.load(std::memory_order_relaxed) != 0)
           persistence_flags |= 1U << 7U;
         const bool flight_elapsed_valid =
@@ -3741,10 +3744,9 @@ void commandWorkerTask(void *) {
         context.state = protocol::MissionState::unknown;
         context.deployment_power_cutoff_done = false;
       }
+      // loggingはflight sequence/recoveryの必須資源ではない。
       context.resources_preallocated =
-          flight_config::nonBypassFlightConfigurationReady() &&
-          flash_log_ready.load(std::memory_order_acquire) &&
-          sd_log_ready.load(std::memory_order_acquire);
+          flight_config::nonBypassFlightConfigurationReady();
       context.persistence_load_complete =
           parachute_config_load_complete.load(std::memory_order_acquire);
       context.persistence_runtime_available =

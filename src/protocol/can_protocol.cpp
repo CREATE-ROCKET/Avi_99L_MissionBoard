@@ -232,7 +232,7 @@ CanFrame encode(const PowerTimeTelemetry &message) {
   result.data[2] = message.motor_voltage_raw;
   putU16(result.data, 3, message.descent_elapsed_raw);
   putU16(result.data, 5, message.recovery_elapsed_raw);
-  result.data[7] = static_cast<uint8_t>(message.persistence_flags & 0x87U);
+  result.data[7] = static_cast<uint8_t>(message.persistence_flags & 0x8FU);
   return result;
 }
 
@@ -435,7 +435,7 @@ CodecError decode(const CanFrame &input, PowerTimeTelemetry &message) {
   const auto error = validate(input, CanId::power_time_telemetry, 8);
   if (error != CodecError::none)
     return error;
-  if ((input.data[7] & 0x78U) != 0)
+  if ((input.data[7] & 0x70U) != 0)
     return CodecError::reserved_bits;
   message = {input.data[0], input.data[1], input.data[2],
              getU16(input.data, 3), getU16(input.data, 5), input.data[7]};

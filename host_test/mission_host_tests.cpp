@@ -123,7 +123,7 @@ void testCanGolden(
                                             ParaMode::hold, 0x78}));
   expectFrame(golden, "CAN_103",
               encode(PowerTimeTelemetry{0xFC, 0xA0, 0xDC, 0xFFFA, 0x000C,
-                                        0x85}));
+                                        0x89}));
   expectFrame(golden, "CAN_104",
               encode(DescentCoreTelemetry{0xFB, 0x0015, 0xF7}));
   expectFrame(golden, "CAN_105",
@@ -176,12 +176,12 @@ void testCanGolden(
   assert(decode(recovery_mode_frame, recovery_mode) == CodecError::invalid_enum);
 
   PowerTimeTelemetry power_time{};
-  auto invalid_power_time = encode(PowerTimeTelemetry{1, 2, 3, 4, 5, 0x85});
-  invalid_power_time.data[7] |= 1U << 3U;
+  auto invalid_power_time = encode(PowerTimeTelemetry{1, 2, 3, 4, 5, 0x89});
+  invalid_power_time.data[7] |= 1U << 4U;
   assert(decode(invalid_power_time, power_time) == CodecError::reserved_bits);
   const auto masked_power_time =
       encode(PowerTimeTelemetry{1, 2, 3, 4, 5, 0xFD});
-  assert(masked_power_time.data[7] == 0x85);
+  assert(masked_power_time.data[7] == 0x8D);
 
   DescentCoreTelemetry descent_core{};
   auto invalid_descent = encode(DescentCoreTelemetry{1, 0x0015, 2});
