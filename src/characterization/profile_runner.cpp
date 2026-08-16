@@ -134,8 +134,8 @@ UnsupportedReason unsupportedReason(
   if (statistics.invalid_samples != 0U ||
       statistics.encoder_transport_errors != 0U)
     return UnsupportedReason::InvalidRead;
-  if (statistics.consumer_deadline_misses != 0U)
-    return UnsupportedReason::DeadlineMiss;
+  // 1 kHz motor-IDではconsumer releaseの100 us超過はUART/record timestampで診断し、
+  // rate qualificationを落とさない。command apply deadlineとschedule lossは別経路でfatal。
   if (statistics.raw_queue_overflows != 0U ||
       statistics.writer_queue_overflows != 0U ||
       statistics.bucket_collisions != 0U)
@@ -782,6 +782,8 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
   std::size_t episode_index = 0U;
   ShutdownSequence shutdown{};
   bool qualification_stop = false;
+  // footerのconsumer_deadline_missesはmotor-IDとしてfatalなdeadlineだけを保持する。
+  // release-only遅延はrelease_deadline_misses/consumer_lateness_usへ別記する。
   std::uint64_t runtime_deadline_misses = 0U;
   std::uint64_t command_deadline_misses = 0U;
   std::uint64_t release_deadline_misses = 0U;
@@ -942,8 +944,7 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
       }
     }
 
-    // 100 us deadlineは「このepochでhardware stateを変える必要がある場合」だけ
-    // 評価する。継続中のCoast/Drive/Brakeは過去の実apply時刻をそのまま保持する。
+    // 100 us command apply deadlineはmotor-IDでも緩和しない。
     const bool command_change_required =
         !journal_.requestAlreadyApplied(request);
     const ImmutableCommandEvidence before_command = journal_.snapshot(nowUs());
@@ -981,10 +982,7 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
     if (preapply_error != ESP_OK)
       stopForFatal(preapply_error, preapply_abort, nowUs());
     if (apply_deadline_missed) {
-      if (full)
-        stopForFatal(ESP_ERR_TIMEOUT, AbortReason::Deadline, nowUs());
-      else
-        ++diagnostic_continuations;
+      stopForFatal(ESP_ERR_TIMEOUT, AbortReason::Deadline, nowUs());
     } else if (apply_result != ESP_OK) {
       stopForFatal(apply_result, AbortReason::MotorApplyError, nowUs());
     }
@@ -1048,18 +1046,15 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
         release_us > epoch_end + kConsumerDeadlineBudgetUs;
     if (release_deadline_missed) {
       ++release_deadline_misses;
-      if (!apply_deadline_missed)
-        ++runtime_deadline_misses;
-      if (full) {
-        stopForFatal(ESP_ERR_TIMEOUT, AbortReason::Deadline, release_us);
-      } else if (consumer_notifications == 1U &&
-                 release_us < epoch_end + kEpochDurationUs) {
-        // rate-checkはmotor非駆動なので、1 epoch未満の単発latenessは証拠を残して継続する。
-        // 判定はfooterのDeadlineMissのままで、正常扱いにはしない。
+      if (consumer_notifications == 1U &&
+          release_us < epoch_end + kEpochDurationUs) {
+        // motor-IDはactual timestampで解析するため、固定epoch順序が保たれる1 epoch未満の
+        // release遅延は診断として継続する。flight realtime qualificationとは分離する。
         ++diagnostic_continuations;
       } else {
-        // notification coalescingや1 epoch以上の遅れは固定epoch順序を失うため継続しない。
-        stopForQualification();
+        // notification coalescingまたは1 epoch以上の遅延はepoch順序を保証できない。
+        ++runtime_deadline_misses;
+        stopForFatal(ESP_ERR_TIMEOUT, AbortReason::Deadline, release_us);
       }
     }
     const bool consumer_schedule_invalid =
@@ -1068,12 +1063,8 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
          release_us >= epoch_end + kEpochDurationUs);
     if (consumer_schedule_invalid) {
       ++consumer_schedule_misses;
-      if (!apply_deadline_missed)
-        ++runtime_deadline_misses;
-      if (full)
-        stopForFatal(ESP_ERR_TIMEOUT, AbortReason::Deadline, release_us);
-      else
-        stopForQualification();
+      ++runtime_deadline_misses;
+      stopForFatal(ESP_ERR_TIMEOUT, AbortReason::Deadline, release_us);
     }
 
     std::uint64_t snapshot_us = nowUs();
@@ -1125,6 +1116,11 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
                    nowUs());
       break;
     }
+    // FixedEpochAssemblerは旧V5契約どおりrelease遅延でもEpochDeadlineを立てる。
+    // 新規1 kHz motor-IDではrelease-only遅延を数値診断へ分離し、command deadlineだけを
+    // fatal flagとして残す。旧captureのdecode互換はvalidator側で維持する。
+    if (release_deadline_missed && !apply_deadline_missed)
+      block.flags = static_cast<std::uint16_t>(block.flags & ~EpochDeadline);
     if (apply_deadline_missed)
       block.flags = static_cast<std::uint16_t>(block.flags | EpochDeadline);
 
@@ -1158,14 +1154,10 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
     } else if (full && first_error == ESP_OK &&
                !((block.flags & EpochStartup) != 0U &&
                  block.epoch_index == 0U &&
-                 block.invalid_sample_count == 0U &&
-                 (block.flags & EpochDeadline) == 0U)) {
+                 block.invalid_sample_count == 0U)) {
       // startup epochだけはrepeated/skippedを許容する。steady-state欠落は即停止。
       stopForFatal(ESP_ERR_INVALID_RESPONSE, AbortReason::EncoderInvalid,
                    nowUs());
-    }
-    if ((block.flags & EpochDeadline) != 0U && full) {
-      stopForFatal(ESP_ERR_TIMEOUT, AbortReason::Deadline, nowUs());
     }
     if (sampler_.firstError() != ESP_OK) {
       if (full) {
@@ -1288,6 +1280,8 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
       epoch_statistics.startup_incomplete_epochs;
   statistics.steady_state_incomplete_epochs =
       epoch_statistics.steady_state_incomplete_epochs;
+  // release-only latenessはCHAR_RATE_RESULT release-deadlineと各recordの
+  // consumer_lateness_usへ残し、footerのfatal deadline counterには含めない。
   statistics.consumer_deadline_misses = runtime_deadline_misses;
   statistics.writer_queue_overflows = writer_.writerQueueOverflows();
   statistics.vbus_invalid_samples = vbus_invalid;

@@ -14,30 +14,15 @@
 namespace avi::characterization {
 namespace {
 
-constexpr std::uint32_t kHz2000TriggerOffsetUs = 120U;
-
 std::uint32_t periodUs(EncoderRate rate) noexcept {
   return 1'000'000U / static_cast<std::uint32_t>(rate);
 }
 
 std::uint32_t firstTriggerOffsetUs(EncoderRate rate) noexcept {
-  switch (rate) {
-  case EncoderRate::Hz1000:
-    return 500U;
-  case EncoderRate::Hz2000:
-    // PRECHECK7.5ではscheduled->capture最大347 usだった。
-    // command deadline 100 usを避けた直後にtriggerし、500 us slot終端までの
-    // capture余裕を増やす。2 kHz採用可否は引き続きrate-checkで判定する。
-    return kHz2000TriggerOffsetUs;
-  case EncoderRate::Hz5000:
-    return 0U;
-  }
-  return 0U;
+  return rate == EncoderRate::Hz1000 ? 500U : 0U;
 }
 
 static_assert(500U < 1'000U);
-static_assert(kHz2000TriggerOffsetUs > kConsumerDeadlineBudgetUs);
-static_assert(kHz2000TriggerOffsetUs < 500U);
 
 void rememberOperation(esp_err_t operation, esp_err_t &first) noexcept {
   if (first == ESP_OK && operation != ESP_OK)
@@ -252,8 +237,7 @@ void EncoderSampler::taskLoop() {
       running_.store(false);
     }
 
-    // Vault仕様どおり、capture中はdiagnostic目的でpipelineを定期停止しない。
-    // 2 kHzでも1 msごとのstop/status/ERRFL/restartはsampleを乱し得るため、
+    // capture中はdiagnostic目的でpipelineを定期停止しない。
     // healthはbegin前とstop後で確認する。
     sample.read_result_code = read_result;
     sample.valid = read_result == ESP_OK && captured.valid;
@@ -272,10 +256,9 @@ void EncoderSampler::taskLoop() {
 
 esp_err_t EncoderSampler::begin(EncoderRate rate,
                                 std::uint64_t epoch_zero_us) {
-  // AS5047Dの仕様上の最大更新レート2.5 kHzに対して余裕を取り、
-  // 99Lでは1 kHz / 2 kHzのみを新規acquisitionとして許可する。
-  if (running_.load() ||
-      (rate != EncoderRate::Hz1000 && rate != EncoderRate::Hz2000))
+  // motor system identificationとproductionは1 kHzへ固定する。
+  // 2/5 kHz enumはV5旧ログdecode互換用であり、新規acquisitionには使わない。
+  if (running_.load() || rate != EncoderRate::Hz1000)
     return ESP_ERR_INVALID_ARG;
 
   const std::uint32_t period = periodUs(rate);
@@ -306,8 +289,7 @@ esp_err_t EncoderSampler::begin(EncoderRate rate,
   period_us_ = period;
   samples_per_epoch_ = expectedSamplesPerEpoch(rate);
   epoch_zero_us_ = epoch_zero_us;
-  // 1 kHzは500 us、2 kHzは120/620 usでtriggerする。
-  // slot所属はscheduled時刻ではなくactual capture timestampで従来どおり
+  // 1 kHzはepoch中央の500 usでtriggerする。slot所属はactual capture timestampで
   // 半開区間へ厳密に割り当て、future sampleを現在epochへ借りない。
   first_sample_us_ = epoch_zero_us_ + first_trigger_offset;
   next_scheduled_us_ = first_sample_us_ - period_us_;
@@ -373,7 +355,6 @@ esp_err_t EncoderSampler::begin(EncoderRate rate,
   }
 
   // first alarmは絶対時刻へ固定し、その後はhardware auto-reloadを使う。
-  // 2 kHzではcommand deadline後にtriggerしてcaptureのslot終端余裕を確保する。
   running_.store(true, std::memory_order_release);
   result = timer_.start(first_sample_us_, period_us_);
   if (result != ESP_OK) {

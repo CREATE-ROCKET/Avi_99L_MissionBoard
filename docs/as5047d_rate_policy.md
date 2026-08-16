@@ -2,124 +2,85 @@
 
 ## 1. 優先順位
 
-本書は2026-08-16時点の99L AS5047D取得レート決定であり、既存の`docs/05_実装仕様.md`、`docs/characterization_campaign.md`、`docs/imu_control_heartbeat.md`等に残る5 kHz / 10 kHz取得記述と矛盾する場合は本書を優先する。
+本書は2026-08-16時点の99L AS5047D取得レート決定であり、`docs/05_実装仕様.md`、`docs/characterization_campaign.md`、`docs/imu_control_heartbeat.md`等に残る旧取得レート記述と矛盾する場合は本書を優先する。
 
-AS5047Dは最大更新レート2.5 kHzであるため、99Lでは仕様上限ぎりぎりを使わず、新規取得を次の2レートだけに限定する。
+**新規のAS5047D acquisitionはcharacterization / productionとも1000 Hzだけとする。**
 
-- 1000 Hz
-- 2000 Hz
+2000 Hz / 5000 Hz / 10000 Hzで新規実機captureを行わない。
 
-5000 Hz / 10000 Hzで新規AS5047D captureを行わない。
+## 2. 判断根拠
 
-## 2. Characterization
+PRECHECK8.4では1000 Hzで10秒・10000 epochについて、次を確認した。
 
-characterizationのrate-checkおよびfull captureで実際にAS5047D samplerを開始できるのは1000 Hz / 2000 Hzだけとする。
+- `valid=10000/10000`
+- `repeated=0`
+- `skipped=0`
+- `invalid=0`
+- `steady-incomplete=0`
+- `raw-queue-overflow=0`
+- `writer-queue-overflow=0`
+- `encoder-transport=0`
+- `encoder-status=0`
+- `command-deadline=0`
+- `records-written=10000`
 
-`EncoderRate::Hz5000`はV5の旧ログ・旧campaignとの互換用enumとして当面残すが、`EncoderSampler::begin()`は5000 Hzを`ESP_ERR_INVALID_ARG`で拒否し、SPI初期化やpipelined captureを開始しない。
-
-Stage完了条件は1000 Hz / 2000 Hzのrate-check解決と1000 Hz full完了だけを見る。旧5 kHz campaign slotはStage完了条件に含めない。
-
-1000 Hzは必須レートとする。2000 Hzはrate-check結果に基づいてaccepted / unsupportedを決定する。2000 Hzがunsupportedでも1000 Hz fullが正常であればcampaignは継続可能とする。
+同じ試験の2000 Hzでは`repeated=3`、`skipped=3`、`steady-incomplete=6`が発生した。motor system identificationおよびproduction controlは1000 Hzで成立させられるため、2000 Hzの追加qualificationを継続しない。
 
 ## 3. Production
 
-productionのAS5047D capture候補は2000 Hzのみとし、1 kHz estimator/controlへ渡す。5 kHz captureをproduction候補から除外する。
+`MissionRealtimeTask`は1 ms周期で動作し、各周期に`EncoderBringup::readPipelined()`を1回だけ実行する。AS5047D angle、fin velocity estimator、controlへ渡すencoder updateは1000 Hzとする。
 
-飛行中にdiagnostic目的でpipelined readを周期停止しない方針は変更しない。
+飛行中にdiagnostic目的でpipelined readを周期停止しない。詳細status/ERRFL確認はCommandReceiveまたはbring-upで行う。
 
-## 4. 旧ログ互換
+## 4. Motor system identification
 
-V5 wire layout、`EncoderRate::Hz5000`の数値、`kMaximumEncoderSamplesPerEpoch=5`は過去ログのdecode互換を壊さないため直ちには削除しない。
+新規motor-ID campaignで許可するrate-check/full captureは1000 Hzだけとする。
 
-これは5 kHz acquisitionを現在サポートする意味ではない。新規実機取得の許可条件と旧wire valueの認識を分離して扱う。
+Stage完了条件は次の2点だけを見る。
 
-## 5. Realtime capture timing
+1. 1000 Hz motor-ID rate-checkがnormal
+2. 1000 Hz full captureがnormal
 
-PRECHECK7.5では1 kHz raw capture自体はcompleteだった一方、consumerが前epoch処理を終える前に次alarmへ到達してrelease deadlineを落としていた。このためconsumerのqueue drainは「空になるまでproducerを追う」方式を禁止し、drain開始時にSPSC ringのproducer headをsnapshotして、その時点で公開済みだったsampleだけを有限個処理する。snapshot後にproducerがpublishしたsampleは次consumer cycleへ残す。future sampleを現在epochへ借りることはなく、epoch所属は引き続きactual capture timestampで決める。
+2000 Hz / 5000 Hz slotはV5旧campaignとのdecode互換のため型として残してよいが、新規campaignでは最初からunsupported扱いとし、operatorへ実行を要求しない。
 
-V5 recordのfull validationは`char_runtime`では実施せず、immutable recordをwriter queueへ値copyした後、`char_writer`がwire encode直前に`validateRecordStrict()`を1回だけ実施する。motor safety、position guard、deadline、queue overflow、encoder transport/status errorは従来どおりrealtime側で直接監視し、writer validation failureも既存failure notificationで安全停止へ伝播させる。native/offline validationは従来どおりstrictである。
+### 4.1. 100 us deadlineの扱い
 
-既存`CHAR_RATE_STAGE`の`record-validate-max-us`はrealtime pathからvalidationを外した後は0を基本とする。strict validationはwriter側へ移動したため、このfieldをwriter CPU時間として再解釈しない。
+motor-IDとflight realtime qualificationを分離する。
 
-### 5.1. Trigger phase
+100 us以内に必要なmotor command applyが完了しない場合は、motor-IDでも従来どおりfatalとする。遅れたDrive/Brakeを出力せず、Coastへ倒してrunを停止する。
 
-1 kHzは従来どおりepoch内500 usでtriggerする。
+一方、consumer releaseがepoch終端から100 usを超えても、次の全条件を満たす場合はmotor-IDのtimestamp診断としてrunを継続できる。
 
-2 kHzはPRECHECK7.5でscheduled→actual capture最大347 usが観測され、250/750 us triggerでは500 us slot境界を越えた。このため2 kHzのprovisional triggerを120/620 usへ前倒しする。120 usは100 us command deadlineより後に置き、encoder taskがcommand apply deadline内を直接奪わないようにする。
+- notificationがexactly 1
+- releaseが次epoch終端より前、すなわち1 epoch未満の遅延
+- raw sampleのactual capture timestampが正しいepoch/slot内
+- repeated/skipped/invalid/steady incompleteがない
 
-この120/620 usは採用済みflight定数ではなく実機qualification用のprovisional phaseである。actual capture timestampが各half-open slot内へ入り、repeated/skipped/deadlineが0になることをrate-checkで確認できない場合、2 kHzはunsupportedのままとする。deadlineやslot境界を緩めて成立扱いにしてはならない。
+このrelease-only遅延は`consumer_lateness_us`、`release-deadline`、`CHAR_RATE_TIMING`へ残すが、新規motor-ID recordでは`EpochDeadline`へ昇格しない。
 
-### 5.2. Task affinityとwriter throughput
+notification coalescing、1 epoch以上のrelease遅延、command deadline miss、encoder error、raw/writer queue overflow、Vbus invalid、position guard、overshoot等は従来どおりfatalである。
 
-PRECHECK7.8では`char_runtime`をCore 0へ分離したことで、1 kHzの`consumer-work-max-us`は644 us、`consumer-wait-late-max-us`は0まで改善し、2 kHzでもraw epochはcompleteになった。一方、1000/2000 Hzとも約233 recordでwriter queueがoverflowした。
+**このmotor-IDでrelease-only遅延を許容することは、production MissionRealtimeTaskが100 us realtime requirementを満たしたことを意味しない。** production timing qualificationは別試験とする。
 
-characterizationではtask affinityを次のように固定する。
+## 5. V5旧ログ互換
 
-- Core 0: `char_runtime` priority 21、`char_vbus` priority 12、`char_console` priority 5
-- Core 1: `char_encoder` priority 23、`char_writer` priority 10
+V5 schema、320 byte record、`EncoderRate::Hz2000` / `Hz5000`の数値、5 raw-sample slotは過去ログdecode互換のため残す。
 
-`char_encoder`は同Coreのwriterより常に優先し、AS5047D captureをSD書込みより優先する。
+旧V5 captureでrelease遅延に`EpochDeadline`が立っている形式もvalidatorは引き続き受理する。新しいmotor-ID captureではrelease-only遅延についてflagを省略し、数値timestampを証拠として保持する。
 
-PRECHECK7.9では1 kHzが10秒・10000 recordを`writer-queue-overflow=0`で完走し、queue high-waterは56だった。2 kHz raw captureもcompleteだったが、Core 1上で2 kHz encoder taskにpreemptされるwriterがqueue depth 128を使い切り、1615 record時点でoverflowした。SD/FATの瞬間stallをcharacterizationのRAM bufferで吸収することは許可するため、writer queue depthを512 recordsへ拡張する。
+通常の`tools/verify_characterization.py`は旧strict契約を保持する。新しいmotor-ID packageでは`tools/verify_motor_id_characterization.py`を使用し、release-only遅延のflag省略だけを追加で許可する。late commandのflag/abort証拠は緩和しない。
 
-queue拡張後も`queue-high-water`を必ず記録し、10秒run中に512へ単調に近づく場合は平均writer throughput不足として不合格とする。queue拡張は持続速度不足を合格扱いにするためには使用しない。
+## 6. Storage
 
-SDMMC mountは`char_runtime`から行わず、Core 1へpinした`char_writer` task自身のstartupで実施する。これによりstorage driverの初期化・interrupt allocationをrealtime consumer側Core 0から分離する。mount成否はstartup semaphoreで`LogWriterV5::initialize()`へ返し、失敗時はcaptureを開始しない。
+writer queueは512 records、writer batchは最大64 recordsを維持する。run前にplanned file sizeを`ftruncate()`/`fsync()`で事前確保し、終了時にactual footer終端へtruncateする。
 
-rate-check終了時は`CHAR_WRITER_TIMING`を出力する。
+PRECHECK8.4では1000 Hzで`queue-high-water=132/512`、`records-written=10000`、`writer-queue-overflow=0`で完走しているため、motor-IDのstorage pathは1000 Hz用途で継続使用する。
 
-```text
-queue-depth
-queue-high-water
-batch-capacity
-max-batch-records
-batch-count
-preallocate-us
-planned-bytes
-validate-max-us
-validate-total-us
-validate-avg-us
-encode-max-us
-encode-total-us
-encode-avg-us
-fwrite-max-us
-fwrite-total-us
-fwrite-avg-us
-records-written
-```
+## 7. Packaging
 
-`fwrite-max-us`はSD/FATの瞬間stall、`fwrite-avg-us`とqueue high-waterの推移は持続throughputの判定に使用する。1000 Hz consumer record生成はencoder raw rateが2 kHzでも1 record/msのままである。
+Spica引渡しpackageの新規必須captureは各stageについて次だけとする。
 
-### 5.3. PRECHECK8後のSD書込み契約
+- 1000 Hz rate-check normal
+- 1000 Hz full normal
 
-PRECHECK8ではqueue depth 512でも、1 kHzで`fwrite-max-us=951768`、2 kHzで`fwrite-max-us=532719`の長時間stallが観測された。1 kHzは9328 record、2 kHzは535 recordでqueue high-waterが512へ到達し、いずれもwriter queue overflowで停止した。raw encoder側は停止まで`repeated=0`、`skipped=0`、`steady-incomplete=0`であったため、queueをさらに拡大してstorage throughput不足を隠す方針は採らない。
-
-writer queue depthは512 recordsのまま維持し、1回のwriter batch上限を16 recordsから64 recordsへ拡大する。queueにbacklogがある場合は最大20 KiB級の連続V5 recordを一度の`fwrite`へまとめ、FAT/VFS/SDへの小write回数を減らす。
-
-各runではmotor、AS5047D sampler、consumer GPTimerを開始する前に、planned file sizeを
-
-```text
-V5 header + expected_epochs * V5 record + V5 footer
-```
-
-として`ftruncate()`で事前確保し、`fsync()`まで完了させる。ESP-IDF FatFs VFSのfile拡張は不足領域を実際にzero writeしてclusterを確保するため、motor run中のFAT cluster allocationをrun開始前へ移す。preallocation完了後に新しい`epoch_zero`を決め、characterizationでは1.5 sのstart leadを確保する。
-
-runがabortしてplanned record数に達しなかった場合もzero tailをV5 logとして残さない。footerを書き終えた実file positionへ終了時に`ftruncate()`し、`fsync()`してからcloseする。したがってstrict decoderが見るfile layoutは従来どおり`header + actual records + footer`である。
-
-V5 CRC32はpolynomial `0xEDB88320`、初期/final XOR、`previous_crc` chainingを変更せず、1 byteごとの8-bit loopから256-entry table lookupへ変更する。writerのfile CRCはrecord単位で関数を呼び直さず、同一batchの連結bytesを1回のchained CRCへ渡す。既存Python golden fixtureのCRC固定値とencode/decode byte一致を互換条件とし、V5 schema、record size、Spica importerを変更しない。
-
-preallocation、batch拡張、CRC高速化によっても100 us command/release deadline、half-open epoch/slot境界、queue overflow時のfail-safeを緩和しない。次のrate-checkでwriter overflowを解消した後もdeadline missが残る場合に限り、GPTimer interrupt priority/affinityを別変更として評価する。
-
-## 6. Characterization build最適化
-
-characterization firmwareはtiming qualification専用buildとして、ESP-IDF framework componentには公式の`CONFIG_COMPILER_OPTIMIZATION_PERF=y`を使用し、`-O2`のまま維持する。framework全体へPlatformIO `build_flags`で`-O3`を注入してはならない。
-
-MissionBoard自前の`src` componentだけは、characterization用CMake option `AVI_99L_CHARACTERIZATION_BUILD=ON`のとき`target_compile_options(... -O3)`を追加する。これにより`profile_runner`、`fixed_epoch_assembler`、`record_validation`、`log_writer_v5`、`encoder_sampler`等の自前処理を`-O3`で最適化しつつ、ESP-IDF UART/FreeRTOS/SDMMC等はEspressifが想定する`-O2`でbuildする。
-
-ESP-IDF framework全体のcompile-time/link-time LTOは使用しない。LTOによるframework task stack使用量やdriverコード生成の変化をcharacterization timing qualificationへ混入させないためである。
-
-`-Ofast`およびfast-math系optionも使用しない。`std::isfinite`、NaN/Inf、浮動小数点比較等の安全判定の意味論を維持するためである。
-
-2026-08-16の全component `-O3`試行ではESP-IDF `esp_driver_uart/src/uart.c`がGCCの`-Warray-bounds`を発生させ、frameworkの`-Werror`でbuild停止した。このため以後はcomponent-local `-O3`を正式なcharacterization build方針とする。
-
-最適化変更後のbinaryは別firmware SHAとして扱い、1/2 kHz rate-check、full 1 kHz、writer throughput、position guard、安全停止を再qualificationする。deadlineやacceptance基準は最適化のために緩和しない。
+FV / FH+ / FH- / M0の全stageで2000 Hz evidenceを要求しない。V5旧ログの2/5 kHz decode能力自体は削除しない。
