@@ -3,7 +3,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
-#include <cstring>
+#include <limits>
 
 namespace control::motor_bus_voltage {
 namespace {
@@ -16,20 +16,7 @@ constexpr Status kResetStatus = Status::uninitialized;
 #endif
 
 std::atomic<uint8_t> status_raw{static_cast<uint8_t>(kResetStatus)};
-std::atomic<uint64_t> voltage_bits{};
-
-uint64_t encode(double value) {
-  uint64_t bits{};
-  static_assert(sizeof(bits) == sizeof(value));
-  std::memcpy(&bits, &value, sizeof(bits));
-  return bits;
-}
-
-double decode(uint64_t bits) {
-  double value{};
-  std::memcpy(&value, &bits, sizeof(value));
-  return value;
-}
+std::atomic<uint32_t> voltage_millivolts{};
 
 } // namespace
 
@@ -38,7 +25,14 @@ void publish(double voltage_v) {
     invalidate();
     return;
   }
-  voltage_bits.store(encode(voltage_v), std::memory_order_relaxed);
+  const double millivolts = voltage_v * 1000.0;
+  if (!std::isfinite(millivolts) || millivolts < 1.0 ||
+      millivolts > static_cast<double>(std::numeric_limits<uint32_t>::max())) {
+    invalidate();
+    return;
+  }
+  voltage_millivolts.store(static_cast<uint32_t>(millivolts + 0.5),
+                           std::memory_order_relaxed);
   status_raw.store(static_cast<uint8_t>(Status::live),
                    std::memory_order_release);
 }
@@ -49,7 +43,7 @@ void invalidate() {
 }
 
 void reset() {
-  voltage_bits.store(0, std::memory_order_relaxed);
+  voltage_millivolts.store(0, std::memory_order_relaxed);
   status_raw.store(static_cast<uint8_t>(kResetStatus),
                    std::memory_order_release);
 }
@@ -59,11 +53,11 @@ Snapshot snapshot() {
       static_cast<Status>(status_raw.load(std::memory_order_acquire));
   if (status != Status::live)
     return {status, 0.0};
-  const double voltage_v =
-      decode(voltage_bits.load(std::memory_order_relaxed));
-  if (!std::isfinite(voltage_v) || voltage_v <= 0.0)
+  const uint32_t millivolts =
+      voltage_millivolts.load(std::memory_order_relaxed);
+  if (millivolts == 0)
     return {Status::invalid, 0.0};
-  return {Status::live, voltage_v};
+  return {Status::live, static_cast<double>(millivolts) * 0.001};
 }
 
 } // namespace control::motor_bus_voltage
