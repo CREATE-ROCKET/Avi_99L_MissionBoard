@@ -25,6 +25,7 @@ enum class CommandCode : uint8_t {
   start_fin_zero_hold = 0x12,
   fin_move_relative = fin_hold_current,
 
+  // 0x20..0x24はwire互換のため値だけ予約し、常にNotSupportedとする。
   para_free = 0x20,
   para_hold = 0x21,
   para_move_relative = 0x22,
@@ -52,8 +53,6 @@ enum class CommandDomain : uint8_t {
 struct CommandContext {
   protocol::MissionState state{protocol::MissionState::command_receive};
   bool resources_preallocated{};
-  bool persistence_load_complete{};
-  bool persistence_runtime_available{};
   bool fin_available{true};
   bool parachute_available{true};
   bool motor_test_busy{};
