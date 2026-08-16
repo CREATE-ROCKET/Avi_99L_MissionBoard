@@ -97,6 +97,30 @@ void testDisableAfterCaptureInvalidatesReference() {
   assert(!machine.snapshot().control_roll_reference_valid);
 }
 
+void testForcedMissingFinReadinessKeepsBrake() {
+  for (int missing_case = 0; missing_case < 2; ++missing_case) {
+    auto readiness = readyReadiness();
+    if (missing_case == 0)
+      readiness.fin_zero_configured = false;
+    else
+      readiness.motor_profile_valid = false;
+
+    mission::MissionStateMachine machine;
+    assert(machine.startSequence(0, readiness, mission::StartMode::forced) ==
+           mission::TransitionResult::completed);
+    assert(machine.snapshot().fin == mission::FinDirective::brake);
+
+    machine.tick({2'000'000, true, false, readyControl()});
+    assert(machine.snapshot().state == protocol::MissionState::engine_burn);
+    assert(machine.snapshot().fin == mission::FinDirective::brake);
+
+    machine.tick({9'000'000, false, false, readyControl(), 9'000});
+    assert(machine.snapshot().state == protocol::MissionState::engine_burn);
+    assert(machine.snapshot().control_reentry_inhibited);
+    assert(machine.snapshot().fin == mission::FinDirective::brake);
+  }
+}
+
 void testForceDoesNotMakeControlInputsValid() {
   auto readiness = readyReadiness();
   readiness.gyro_bias_valid = false;
@@ -124,6 +148,7 @@ int main() {
   testControlLossPreventsReentry();
   testFutureReferenceIsRejected();
   testDisableAfterCaptureInvalidatesReference();
+  testForcedMissingFinReadinessKeepsBrake();
   testForceDoesNotMakeControlInputsValid();
   std::cout << "mission state safety regression tests: PASS\n";
   return 0;
