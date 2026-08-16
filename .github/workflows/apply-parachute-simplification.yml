@@ -6,6 +6,7 @@ on:
       - fix/simplify-parachute-servo
     paths:
       - .github/workflows/apply-parachute-simplification.yml
+      - tools/fix_runtime_patch_script_v2.py
 
 permissions:
   contents: write
@@ -26,6 +27,15 @@ jobs:
           python tools/fix_runtime_patch_script_v2.py
           python tools/apply_runtime_v2.py
           python tools/fix_parachute_host_tests.py
+      - name: Capture patched sources
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: patched-parachute-sources
+          path: |
+            src/runtime/production_runtime.cpp
+            host_test/mission_host_tests.cpp
+          if-no-files-found: error
       - name: Run host tests
         shell: bash
         run: |
