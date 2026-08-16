@@ -2,6 +2,8 @@
 
 #include <cmath>
 
+#include "control/fin_overtravel_guard.hpp"
+
 namespace mission {
 namespace {
 constexpr uint64_t kOneSecondUs = 1'000'000;
@@ -59,6 +61,11 @@ TransitionResult MissionStateMachine::startSequence(
     uint64_t, const PreflightReadinessSnapshot &readiness, StartMode mode) {
   if (snapshot_.state != protocol::MissionState::command_receive)
     return TransitionResult::invalid_state;
+  // CommandReceiveでvalidな角度が20 deg以内へ戻っていれば、Start判定前に
+  // overtravelだけを復帰させる。別device faultには触れない。
+  (void)control::clearFinOvertravelIfRecoverable();
+  if (control::finOvertravelFaultLatched())
+    return TransitionResult::runtime_unavailable;
   if (!readiness.resources_preallocated)
     return TransitionResult::runtime_unavailable;
   if (mode == StartMode::normal && readiness.missingMask() != 0)
@@ -216,6 +223,18 @@ void MissionStateMachine::tick(const MissionTickInput &input,
     elapsed_us = elapsed_offset_us_ + input.monotonic_us - snapshot_.liftoff_time_us;
   snapshot_.elapsed_us = elapsed_us;
   fin_control_available_ = input.control.fin_control_available;
+
+  if (snapshot_.state == protocol::MissionState::command_receive) {
+    // CommandReceiveだけはvalid/freshな観測が20 deg以内へ戻れば復帰可能。
+    (void)control::clearFinOvertravelIfRecoverable();
+  } else if (control::finOvertravelFaultLatched()) {
+    // 飛行sequenceでは角度が戻っても同一flight epochのControlへ再entryしない。
+    snapshot_.control_reentry_inhibited = true;
+    fin_control_available_ = false;
+    invalidateControlRollReference();
+    if (snapshot_.state == protocol::MissionState::control)
+      snapshot_.state = protocol::MissionState::engine_burn;
+  }
 
   const bool flight_state = snapshot_.state == protocol::MissionState::engine_burn ||
                             snapshot_.state == protocol::MissionState::control;

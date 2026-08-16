@@ -78,6 +78,10 @@ struct EncoderPipelineConfig {
 inline constexpr ControlAuthorityLimits kControlAuthorityLimits{};
 inline constexpr PitotCoefficientDiagnosticsConfig
     kPitotCoefficientDiagnostics{};
+// TODO(HW_TEST): 実機たわみ・backlash・stopper位置・zero誤差を含めて
+// 20 degのovertravel fault閾値を最終確定する。通常の指令可能範囲とは別値。
+inline constexpr double kFinOvertravelFaultLimitRad =
+    0.34906585039886590;
 // TODO(HW_TEST): 1/2 kHzの最終選択後も本configだけを差し替える。
 // 現在のproduction producer/consumerは1 kHz暫定である。
 inline constexpr EncoderPipelineConfig kEncoderPipeline{1'000, 1'000};

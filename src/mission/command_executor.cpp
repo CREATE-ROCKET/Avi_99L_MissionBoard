@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cstdlib>
 
+#include "control/fin_overtravel_guard.hpp"
+
 namespace mission {
 namespace {
 using protocol::CommandPhase;
@@ -112,6 +114,11 @@ bool isStart(CommandCode code) {
          code == CommandCode::force_start_sequence;
 }
 
+bool blockedByFinOvertravel(CommandCode code) {
+  return isStart(code) || code == CommandCode::start_fin_zero_hold ||
+         code == CommandCode::fin_move_relative;
+}
+
 CommandResult resultFor(const GenericCommandRequest &request,
                         CommandPhase phase, CommandReason reason,
                         uint32_t detail = 0) {
@@ -136,6 +143,9 @@ CommandDecision CommandExecutor::begin(const GenericCommandRequest &request,
 
   const auto code = static_cast<CommandCode>(request.command);
   const CommandDomain domain = domainFor(code);
+  if (context.state == MissionState::command_receive)
+    (void)control::clearFinOvertravelIfRecoverable();
+
   CommandReason rejection = CommandReason::none;
   if (!commandKnown(code))
     rejection = CommandReason::not_supported;
@@ -143,6 +153,9 @@ CommandDecision CommandExecutor::begin(const GenericCommandRequest &request,
     rejection = CommandReason::invalid_argument;
   else if (!stateValid(code, context.state))
     rejection = CommandReason::invalid_state;
+  else if (control::finOvertravelFaultLatched() &&
+           blockedByFinOvertravel(code))
+    rejection = CommandReason::safety_interlock;
   else if (code == CommandCode::enter_recovery &&
            !context.deployment_power_cutoff_done)
     rejection = CommandReason::safety_interlock;
@@ -206,6 +219,10 @@ CommandResult CommandExecutor::finish(uint8_t transaction_id,
   entry->result.phase = phase;
   entry->result.reason = reason;
   entry->result.detail = detail;
+  if (phase == CommandPhase::completed && reason == CommandReason::none &&
+      static_cast<CommandCode>(entry->request.command) ==
+          CommandCode::set_fin_zero)
+    control::clearFinOvertravelFault();
   return entry->result;
 }
 

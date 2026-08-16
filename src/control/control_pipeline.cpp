@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include "control/fin_overtravel_guard.hpp"
+
 namespace control {
 namespace {
 
@@ -91,6 +93,8 @@ TorqueRequest RollController::compute(const RollState &state,
 
 TorqueRequest ZeroHoldController::compute(double angle_rad,
                                           double rate_rad_s) const {
+  if (finOvertravelFaultLatched())
+    return {};
   if (!std::isfinite(angle_rad) || !std::isfinite(rate_rad_s) ||
       !std::isfinite(config_.proportional_gain) ||
       !std::isfinite(config_.derivative_gain) ||
@@ -107,6 +111,7 @@ TorqueRequest ZeroHoldController::compute(double angle_rad,
 
 bool ZeroHoldController::updateValidity(double angle_rad, double rate_rad_s,
                                         bool sample_valid) {
+  observeFinOvertravel(angle_rad, sample_valid);
   const bool inside = sample_valid && std::isfinite(angle_rad) &&
                       std::isfinite(rate_rad_s) &&
                       std::abs(angle_rad) <= config_.valid_angle_rad &&
