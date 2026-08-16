@@ -43,7 +43,7 @@ jobs:
         if: success()
         run: |
           git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git config user.email 41898282+Natsu-B@users.noreply.github.com
           git rm .github/workflows/validate-final-readiness.yml
           git commit -m "test(mission): validate final readiness build"
           git push origin HEAD:fix/vault-final-flight-readiness-20260816
