@@ -165,7 +165,6 @@ esp_err_t LogWriterV5::initializeStorage() noexcept {
 }
 
 void LogWriterV5::resetRunMetrics() noexcept {
-  xQueueReset(queue_);
   xQueueReset(control_queue_);
   xQueueReset(sd_control_queue_);
   while (xSemaphoreTake(control_ack_, 0U) == pdTRUE) {
@@ -180,6 +179,8 @@ void LogWriterV5::resetRunMetrics() noexcept {
   last_sequence_.store(0U);
   queue_overflows_.store(0U);
   queue_high_water_.store(0U);
+  ingress_write_index_.store(0U, std::memory_order_relaxed);
+  ingress_read_index_.store(0U, std::memory_order_relaxed);
   psram_write_index_.store(0U, std::memory_order_relaxed);
   psram_read_index_.store(0U, std::memory_order_relaxed);
   psram_high_water_.store(0U);
@@ -197,6 +198,8 @@ void LogWriterV5::resetRunMetrics() noexcept {
 void LogWriterV5::cleanupPreparedFile(bool remove_file) noexcept {
   accepting_.store(false);
   synced_.store(false);
+  ingress_write_index_.store(0U, std::memory_order_relaxed);
+  ingress_read_index_.store(0U, std::memory_order_relaxed);
   psram_write_index_.store(0U, std::memory_order_relaxed);
   psram_read_index_.store(0U, std::memory_order_relaxed);
   if (file_descriptor_ >= 0) {
@@ -237,11 +240,21 @@ bool LogWriterV5::stageEncodedRecord(
   return true;
 }
 
-void LogWriterV5::processRecordBatch(ImmutableLogRecord current_record) {
+void LogWriterV5::processRecordBatch() {
   std::size_t count = 0U;
-  for (;;) {
-    // DRAM ingress queueから取り出したrecordをvalidation/encodeし、SD I/Oとは分離して
-    // 4 MiB PSRAM ringへ退避する。SD stall中もこのtaskはrecordを吸収し続ける。
+  while (count < kBatchRecords) {
+    const std::uint64_t read_index =
+        ingress_read_index_.load(std::memory_order_relaxed);
+    const std::uint64_t write_index =
+        ingress_write_index_.load(std::memory_order_acquire);
+    if (read_index == write_index)
+      break;
+
+    // consumerはread indexを進めるまでslot ownershipを保持するため、
+    // producerから上書きされない。record全体の追加copyは行わない。
+    const ImmutableLogRecord &current_record =
+        ingress_ring_[read_index % kQueueDepth];
+
     const std::int64_t validate_started_us = esp_timer_get_time();
     const bool record_valid = !hasError(validateRecordStrict(current_record));
     const std::uint32_t validate_elapsed_us = elapsedUs(validate_started_us);
@@ -265,11 +278,9 @@ void LogWriterV5::processRecordBatch(ImmutableLogRecord current_record) {
 
     if (!stageEncodedRecord(current_record.sequence, bytes))
       break;
-    ++count;
 
-    if (count >= kBatchRecords ||
-        xQueueReceive(queue_, &current_record, 0U) != pdTRUE)
-      break;
+    ingress_read_index_.store(read_index + 1U, std::memory_order_release);
+    ++count;
   }
 
   if (count != 0U && sd_task_ != nullptr)
@@ -319,8 +330,6 @@ bool LogWriterV5::drainStagedBatch() noexcept {
     return false;
   }
 
-  // SDへ完全に書けたbatchだけread indexを進める。PSRAMからのcopy中・write中は
-  // そのslotを未消費扱いにしてproducerによる上書きを防ぐ。
   file_crc32_ = wire_v5::crc32(sd_batch_.data(), byte_count, file_crc32_);
   const std::uint64_t before = records_written_.fetch_add(count);
   if (before == 0U)
@@ -363,7 +372,6 @@ void LogWriterV5::processSdControl(const ControlRequest &request) {
     result = bestEffortFinalizeFile(
         operations, footer_valid ? bytes.data() : nullptr,
         footer_valid ? bytes.size() : 0U, result);
-    // close callbackが実record+footer位置へtruncateしてdescriptor ownershipを終了する。
     prepared_ = false;
     synced_.store(false);
     accepting_.store(false);
@@ -394,27 +402,29 @@ void LogWriterV5::processControl(const ControlRequest &request) {
 }
 
 void LogWriterV5::taskLoop() {
-  // このtaskはSDへ触れない。DRAM ingress queueを優先してPSRAMへ逃がし、
-  // accepting=false後にqueueが空になってからcontrolをSD taskへ渡す。
+  // realtime ingress ringを最優先でPSRAMへ逃がす。
+  // accepting=false後、ringが空になってからcontrolをSD taskへ渡す。
   for (;;) {
-    ImmutableLogRecord first{};
-    if (xQueueReceive(queue_, &first, 0U) == pdTRUE) {
-      processRecordBatch(first);
+    const std::uint64_t read_index =
+        ingress_read_index_.load(std::memory_order_relaxed);
+    const std::uint64_t write_index =
+        ingress_write_index_.load(std::memory_order_acquire);
+    if (read_index != write_index) {
+      processRecordBatch();
       continue;
     }
+
     ControlRequest request{};
     if (xQueueReceive(control_queue_, &request, 0U) == pdTRUE) {
       processControl(request);
       continue;
     }
-    if (xQueueReceive(queue_, &first, pdMS_TO_TICKS(10)) == pdTRUE)
-      processRecordBatch(first);
+
+    (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
   }
 }
 
 void LogWriterV5::sdTaskLoop() {
-  // SDMMC hostのinterrupt allocationをchar_runtimeと分離するため、mountは
-  // Core 1の低優先度char_writer自身から実行する。
   const esp_err_t storage_result = initializeStorage();
   startup_result_.store(storage_result, std::memory_order_release);
   (void)xSemaphoreGive(startup_ack_);
@@ -430,8 +440,6 @@ void LogWriterV5::sdTaskLoop() {
 
     ControlRequest request{};
     if (xQueueReceive(sd_control_queue_, &request, 0U) == pdTRUE) {
-      // controlはstagerがDRAM ingressを全てPSRAMへ移した後に到着する。
-      // SD stallから復帰した後、残るPSRAM recordを全て書いてからsync/finalizeする。
       while (drainStagedBatch()) {
       }
       processSdControl(request);
@@ -453,6 +461,8 @@ esp_err_t LogWriterV5::submitControl(const ControlRequest &request) {
     control_pending_.store(false);
     return ESP_FAIL;
   }
+  if (task_ != nullptr)
+    xTaskNotifyGive(task_);
   if (xSemaphoreTake(control_ack_, portMAX_DELAY) != pdTRUE) {
     control_pending_.store(false);
     return ESP_FAIL;
@@ -468,16 +478,11 @@ esp_err_t LogWriterV5::initialize() {
     return previous == ESP_ERR_NOT_FINISHED ? ESP_ERR_INVALID_STATE : previous;
   }
 
-  // PSRAM ringはrun中に確保しない。4 MiBをboot時に明示的にexternal RAMから確保し、
-  // SDの数秒級tail latencyを吸収する。SDへ渡すbatchだけは内部DRAMに置く。
   psram_stage_ = static_cast<StagedRecord *>(heap_caps_malloc(
       kPsramStagingBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   if (psram_stage_ == nullptr)
     return ESP_ERR_NO_MEM;
 
-  queue_ = xQueueCreateStatic(
-      kQueueDepth, sizeof(ImmutableLogRecord), queue_storage_.data(),
-      &queue_control_);
   control_queue_ = xQueueCreateStatic(
       1U, sizeof(ControlRequest), control_queue_storage_.data(),
       &control_queue_control_);
@@ -487,17 +492,15 @@ esp_err_t LogWriterV5::initialize() {
   control_ack_ = xSemaphoreCreateBinaryStatic(&control_ack_storage_);
   sd_control_ack_ = xSemaphoreCreateBinaryStatic(&sd_control_ack_storage_);
   startup_ack_ = xSemaphoreCreateBinaryStatic(&startup_ack_storage_);
-  if (queue_ == nullptr || control_queue_ == nullptr ||
-      sd_control_queue_ == nullptr || control_ack_ == nullptr ||
-      sd_control_ack_ == nullptr || startup_ack_ == nullptr) {
+  if (control_queue_ == nullptr || sd_control_queue_ == nullptr ||
+      control_ack_ == nullptr || sd_control_ack_ == nullptr ||
+      startup_ack_ == nullptr) {
     heap_caps_free(psram_stage_);
     psram_stage_ = nullptr;
     return ESP_ERR_NO_MEM;
   }
 
   startup_result_.store(ESP_ERR_NOT_FINISHED, std::memory_order_release);
-  // char_writerはSD I/O専用の低優先度task。write()が数秒blockしても、
-  // char_log_stage(priority 12)とchar_encoder(priority 23)はCore 1で実行を続けられる。
   sd_task_ = xTaskCreateStaticPinnedToCore(
       sdTaskEntry, "char_writer", sizeof(sd_task_stack_), this, 10,
       sd_task_stack_, &sd_task_tcb_, 1);
@@ -629,28 +632,41 @@ esp_err_t LogWriterV5::open(const LogHeaderV5 &header) {
 }
 
 esp_err_t LogWriterV5::enqueue(const ImmutableLogRecord &record) {
-  if (!accepting_.load() || file_descriptor_ < 0 ||
+  if (!accepting_.load(std::memory_order_acquire) || file_descriptor_ < 0 ||
       first_error_.load() != ESP_OK)
     return ESP_ERR_INVALID_STATE;
-  // realtime callerは完成済みimmutable recordをDRAM queueへ値copyするだけに留める。
+
   RateCheckStageScope timing(RateCheckStage::WriterEnqueue);
-  if (xQueueSend(queue_, &record, 0U) != pdTRUE) {
+  const std::uint64_t write_index =
+      ingress_write_index_.load(std::memory_order_relaxed);
+  const std::uint64_t read_index =
+      ingress_read_index_.load(std::memory_order_acquire);
+  const std::uint64_t occupancy = write_index - read_index;
+  if (occupancy >= kQueueDepth) {
     updateAtomicMaximum(queue_high_water_,
                         static_cast<std::uint32_t>(kQueueDepth));
-    queue_overflows_.fetch_add(1U);
+    queue_overflows_.fetch_add(1U, std::memory_order_relaxed);
     rememberFirst(ESP_ERR_NO_MEM);
     return ESP_ERR_NO_MEM;
   }
+
+  // FreeRTOS queueを介さず、producer所有slotへplain DRAM copyしてから
+  // release-storeでconsumerへ公開する。
+  ingress_ring_[write_index % kQueueDepth] = record;
+  ingress_write_index_.store(write_index + 1U, std::memory_order_release);
   updateAtomicMaximum(
       queue_high_water_,
-      static_cast<std::uint32_t>(uxQueueMessagesWaiting(queue_)));
+      static_cast<std::uint32_t>(std::min<std::uint64_t>(
+          occupancy + 1U, std::numeric_limits<std::uint32_t>::max())));
+  if (task_ != nullptr)
+    xTaskNotifyGive(task_);
   return ESP_OK;
 }
 
 esp_err_t LogWriterV5::drainAndSync() {
   if (file_descriptor_ < 0 || !prepared_)
     return ESP_ERR_INVALID_STATE;
-  accepting_.store(false);
+  accepting_.store(false, std::memory_order_release);
   ControlRequest request{};
   request.kind = ControlKind::Sync;
   return submitControl(request);
@@ -663,7 +679,7 @@ esp_err_t LogWriterV5::close(const LogFooterV5 &footer) {
   }
   const std::uint64_t planned_bytes = planned_file_bytes_;
   const bool contiguous_preallocated = contiguous_preallocated_;
-  accepting_.store(false);
+  accepting_.store(false, std::memory_order_release);
   ControlRequest request{};
   request.kind = ControlKind::Finalize;
   request.footer = footer;
