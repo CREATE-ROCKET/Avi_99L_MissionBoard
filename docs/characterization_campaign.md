@@ -94,6 +94,16 @@ consumer tick queueは4件確保しますが、許可するbacklogは現在tick�
 
 2026-08-16のFV fullでは、epoch 1021で`release-late-us=1045`、旧notification count=2、`consumer-work-us=1040`となり、`ulTaskNotifyTake(pdTRUE)`が2 tickを一括clearしたことで停止しました。このケースはqueue化後、tick backlog=2として1 epoch catch-up対象になります。
 
+### 4.1. Vbus ADCの扱い
+
+Vbus ADCはmotor system identificationの補助観測であり、単発のADC read failureをmotor safety faultへ昇格しません。
+
+`PowerSampler`は100 HzでADCを読み、**正常に取得できたsampleだけ**をlatest evidenceへpublishします。`ESP_ERR_TIMEOUT`その他の単発read errorではそのsampleを捨て、直前の正常Vbus evidenceを保持して次の10 ms sampleを待ちます。ADC read errorを`PowerSampler::firstError()`へラッチしてrunを即停止してはいけません。
+
+latest evidenceのfreshness上限は100 msを維持します。100 ms以上正常Vbus sampleが得られずevidenceがstaleになった場合、またはfull runで有効なADC measurementとして0 mVを確認した場合は従来どおりVbus invalidとして扱います。ADC失敗sampleを正常値へ補間したり、capture timestampを書き換えて新しい測定に見せかけたりしません。
+
+2026-08-16のFV rate-checkでは95 epoch時点の単発ADC timeoutが`PowerSampler::firstError()`へラッチされ、encoder/storageが正常にもかかわらず`abort=10`になりました。この挙動を廃止し、単発ADC timeoutではcaptureを継続します。
+
 release-only遅延は`consumer_lateness_us`、`CHAR_RATE_RESULT release-deadline`、`CHAR_RATE_TIMING`へ残します。新規motor-ID V5 recordではrelease-only遅延を`EpochDeadline`へ昇格しません。
 
 次は引き続きfatalです。
@@ -107,7 +117,7 @@ release-only遅延は`consumer_lateness_us`、`CHAR_RATE_RESULT release-deadline
 - encoder invalid / transport / status error
 - steady-state incomplete / repeated / skipped
 - raw/writer queue overflow
-- Vbus invalid/stale/future timestamp
+- Vbus evidenceが100 ms以上更新されない、future timestampになる、またはfullで有効測定として0 mVを確認する
 - position guard / hard abort / overshoot
 - motor apply error
 - SD write/sync/close error
