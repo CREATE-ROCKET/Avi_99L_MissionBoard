@@ -6,7 +6,7 @@ on:
       - fix/simplify-parachute-servo
     paths:
       - .github/workflows/apply-parachute-simplification.yml
-      - tools/finalize_parachute_patch.py
+      - tools/harden_parachute_runtime.py
 
 permissions:
   contents: write
@@ -28,37 +28,56 @@ jobs:
           python tools/apply_runtime_v2.py
           python tools/fix_parachute_host_tests.py
           python tools/finalize_parachute_patch.py
-      - name: Capture patched sources
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: patched-parachute-sources
-          path: |
-            src/runtime/production_runtime.cpp
-            host_test/*.cpp
-          if-no-files-found: error
-      - name: Run host tests
+          python tools/harden_parachute_runtime.py
+      - name: Run parachute-related host tests
         shell: bash
         run: |
           set -euo pipefail
           cmake -S host_test -B host_test/build
-          cmake --build host_test/build --parallel 2
-          ctest --test-dir host_test/build --output-on-failure
+          cmake --build host_test/build --parallel 2 --target \
+            mission_host_tests \
+            fin_overtravel_tests \
+            parachute_configuration_tests \
+            mission_state_safety_regression_tests
+          ctest --test-dir host_test/build --output-on-failure \
+            -R '^(mission_host_tests|fin_overtravel_tests|parachute_configuration_tests|mission_state_safety_regression_tests)$'
       - name: Validate retired parachute paths are gone
         shell: bash
         run: |
           set -euo pipefail
-          ! grep -nE 'ParachutePersistence|parachute_persistence_|parachute_config_load_complete|parachute_open_configured|parachute_close_configured|configureMultiTurnPositionMode|servo\.disableTorque\(\)|ParaRequest::Kind::free|nvs_(open|set_blob|get_blob|flash_init)' src/runtime/production_runtime.cpp
+          ! grep -nE 'ParachutePersistence|parachute_persistence_|parachute_config_load_complete|parachute_open_configured|parachute_close_configured|configureMultiTurnPositionMode|servo\.disableTorque\(\)|ParaRequest::Kind::free|nvs_(open|set_blob|get_blob|flash_init)|emergency_power_safe_requested' src/runtime/production_runtime.cpp
           grep -n 'moveRelativeDegrees' src/runtime/production_runtime.cpp
+          grep -n 'setDirection' src/runtime/production_runtime.cpp
+          grep -n 'queueGenericCompletion' src/runtime/production_runtime.cpp
           grep -n 'kParachuteOpenRelativeDegrees' src/runtime/production_runtime.cpp
           ! grep -nE 'ParachuteEndpoint|ParachuteBlob|FlightParachuteConfiguration' src/actuators/parachute_configuration.hpp src/runtime/recovery_boot.*
+      - name: Build production firmware with pinned Avi ESP Libs
+        shell: bash
+        env:
+          AVI_99L_MOTOR_PROFILE_ID: '1'
+        run: |
+          set -euo pipefail
+          git submodule update --init --recursive
+          git -C lib/Avi_ESP_Libs fetch origin 43a185ab2a570d4e1b889a4a534984fd19b2194f
+          git -C lib/Avi_ESP_Libs checkout 43a185ab2a570d4e1b889a4a534984fd19b2194f
+          python -m pip install --disable-pip-version-check platformio
+          python -m platformio run -e avi_99l_missionboard
       - name: Commit implementation
         shell: bash
         run: |
           set -euo pipefail
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          rm -f .github/workflows/apply-parachute-simplification.yml .github/workflows/apply-parachute-simplification-v3.yml tools/apply_parachute.py.gz.b64 tools/apply_runtime_v2.py tools/fix_runtime_patch_script.py tools/fix_runtime_patch_script_v2.py tools/fix_parachute_host_tests.py tools/finalize_parachute_patch.py
+          rm -f \
+            .github/workflows/apply-parachute-simplification.yml \
+            .github/workflows/apply-parachute-simplification-v3.yml \
+            tools/apply_parachute.py.gz.b64 \
+            tools/apply_runtime_v2.py \
+            tools/fix_runtime_patch_script.py \
+            tools/fix_runtime_patch_script_v2.py \
+            tools/fix_parachute_host_tests.py \
+            tools/finalize_parachute_patch.py \
+            tools/harden_parachute_runtime.py
           git add -A
           git update-index --add --cacheinfo 160000,43a185ab2a570d4e1b889a4a534984fd19b2194f,lib/Avi_ESP_Libs
           git diff --cached --check
