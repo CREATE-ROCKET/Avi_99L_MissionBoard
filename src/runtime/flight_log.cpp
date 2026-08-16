@@ -13,6 +13,7 @@ constexpr uint8_t kValidityAirspeed = 1U << 1U;
 constexpr uint8_t kValidityPowerCutoff = 1U << 2U;
 constexpr uint8_t kValidityControlReference = 1U << 3U;
 constexpr uint8_t kValidityFinZero = 1U << 4U;
+constexpr std::size_t kCrcOffset = 172;
 
 void putU16(SerializedRecord &out, std::size_t offset, uint16_t value) {
   out[offset] = static_cast<uint8_t>(value);
@@ -43,7 +44,7 @@ uint32_t getU32(const SerializedRecord &record, std::size_t offset) {
          static_cast<uint32_t>(record[offset + 3]) << 24U;
 }
 
-} // 無名名前空間
+} // namespace
 
 uint32_t crc32(const uint8_t *data, std::size_t size) {
   uint32_t crc = 0xFFFF'FFFFU;
@@ -102,8 +103,21 @@ SerializedRecord serialize(const Sample &sample) {
   putFloat(out, 108, sample.pitot_coefficient_diagnostic_min);
   putFloat(out, 112, sample.pitot_coefficient_diagnostic_max);
   putFloat(out, 116, sample.measured_bidirectional_span_rad);
-  putU32(out, 120, 0U);
-  putU32(out, 124, crc32(out.data(), 124));
+
+  putU64(out, 120, sample.fin_zero_configured_timestamp_us);
+  putU32(out, 128, sample.fin_zero_flight_epoch);
+  out[132] = static_cast<uint8_t>(sample.fin_zero_approach_direction);
+  out[133] = static_cast<uint8_t>(sample.fin_zero_calibration_method);
+  out[134] =
+      static_cast<uint8_t>(sample.fin_zero_ground_verification_status);
+  out[135] = sample.encoder_diagnostic_flags;
+  putU64(out, 136, sample.encoder_sample_timestamp_us);
+  putU32(out, 144, sample.encoder_read_latency_us);
+  putU32(out, 148, sample.encoder_sample_age_us);
+  putU32(out, 152, sample.encoder_reconnect_count);
+  putU32(out, 156, sample.encoder_error_count);
+  // 160..171 reserved for schema v2 extension and kept zero.
+  putU32(out, kCrcOffset, crc32(out.data(), kCrcOffset));
   return out;
 }
 
@@ -112,7 +126,7 @@ bool validate(const SerializedRecord &record) {
       record[4] != kSchemaVersion ||
       record[5] != static_cast<uint8_t>(kSerializedRecordBytes))
     return false;
-  return getU32(record, 124) == crc32(record.data(), 124);
+  return getU32(record, kCrcOffset) == crc32(record.data(), kCrcOffset);
 }
 
 bool erased(const SerializedRecord &record) {
@@ -120,4 +134,4 @@ bool erased(const SerializedRecord &record) {
                      [](uint8_t value) { return value == 0xFFU; });
 }
 
-} // 名前空間 runtime::flight_log
+} // namespace runtime::flight_log
