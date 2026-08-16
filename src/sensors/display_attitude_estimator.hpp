@@ -18,6 +18,7 @@ enum class DisplayAttitudeInvalidReason : uint8_t {
 struct DisplayAttitudeState {
   double tilt_deg{};
   double direction_deg{};
+  double roll_deg{};
   uint64_t timestamp_us{};
   DisplayAttitudeInvalidReason invalid_reason{
       DisplayAttitudeInvalidReason::not_initialized};
@@ -46,8 +47,11 @@ private:
 
   std::array<double, 4> world_from_sensor_{1.0, 0.0, 0.0, 0.0};
   std::array<double, 3> gyro_bias_rad_s_{};
-  std::array<double, 3> longitudinal_sensor_{0.0, 0.0, 1.0};
+  // 実機取付ではICM42688の+Zが機体後方（鉛直下向き）なので、
+  // 機首向きlongitudinal axisはsensor -Zで固定する。
+  std::array<double, 3> longitudinal_sensor_{0.0, 0.0, -1.0};
   DisplayAttitudeState state_{};
+  double roll_rad_{};
   uint64_t previous_timestamp_us_{};
   bool initialized_{};
 };
