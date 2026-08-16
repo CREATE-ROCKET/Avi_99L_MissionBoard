@@ -11,6 +11,7 @@ namespace sensors::display_attitude_runtime {
 struct WireTelemetry {
   uint8_t magnitude_raw{122};
   uint16_t direction_raw{511};
+  uint16_t roll_raw{0x8001};
 };
 
 void observe(const bringup::ImuSample &sample);
