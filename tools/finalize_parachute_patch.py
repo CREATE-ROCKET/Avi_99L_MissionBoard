@@ -37,6 +37,71 @@ s, n = re.subn(
 if n != 1:
     raise RuntimeError(f"parachute persistence queue residual: {n}")
 
+# ActuatorEmergencyStopはfinをFreeへ倒すが、パラシュート電源は落とさずHoldを維持する。
+s = s.replace(
+    "std::atomic<bool> emergency_power_safe_requested{false};\n", "")
+s = s.replace(
+    "  if (xQueueSendToFront(emergency_queue, &envelope, 0) == pdTRUE) {\n"
+    "    if (!liftoff)\n"
+    "      emergency_power_safe_requested.store(true, std::memory_order_release);\n"
+    "    return;\n"
+    "  }",
+    "  if (xQueueSendToFront(emergency_queue, &envelope, 0) == pdTRUE)\n"
+    "    return;")
+s = s.replace(
+    "  if (actuator_emergency_latch.signal(transaction_id))\n"
+    "    emergency_metadata_overflow.fetch_add(1, std::memory_order_relaxed);\n"
+    "  emergency_power_safe_requested.store(true, std::memory_order_release);\n",
+    "  if (actuator_emergency_latch.signal(transaction_id))\n"
+    "    emergency_metadata_overflow.fetch_add(1, std::memory_order_relaxed);\n")
+s, emergency_block_count = re.subn(
+    r"\n    if \(emergency_power_safe_requested\.exchange\(false,\n"
+    r"\s*std::memory_order_acq_rel\)\) \{.*?\n    \}\n",
+    "\n", s, count=1, flags=re.S)
+if emergency_block_count != 1:
+    raise RuntimeError(
+        f"emergency parachute power-off block: {emergency_block_count}")
+
+# CommandReceiveでは1秒、flight中は既存20ms retry intervalを使う。
+reconnect_anchor = (
+    "  constexpr uint64_t kTelemetryIntervalUs = 500'000;\n"
+    "  constexpr uint64_t kMotionTimeoutUs = 3'000'000;\n")
+reconnect_code = reconnect_anchor + '''\n  auto reconnectIntervalMs = [&]() {
+    protocol::MissionState state = protocol::MissionState::unknown;
+    if (xSemaphoreTake(state_mutex, 0) == pdTRUE) {
+      state = state_machine.snapshot().state;
+      xSemaphoreGive(state_mutex);
+    }
+    return state == protocol::MissionState::command_receive
+               ? flight_config::kParachuteCommandReceiveReconnectMs
+               : flight_config::kParachute.retry_interval_ms;
+  };
+'''
+if reconnect_anchor not in s:
+    raise RuntimeError("parachute reconnect anchor not found")
+s = s.replace(reconnect_anchor, reconnect_code, 1)
+s = s.replace(
+    "static_cast<uint64_t>(\n                       flight_config::kParachuteCommandReceiveReconnectMs)",
+    "static_cast<uint64_t>(reconnectIntervalMs())", 1)
+s = s.replace(
+    "static_cast<uint64_t>(\n                     flight_config::kParachuteCommandReceiveReconnectMs)",
+    "static_cast<uint64_t>(reconnectIntervalMs())", 2)
+
+# 相対move前に必ず現在位置Holdを成立させ、Torque ON状態から1回だけmoveを発行する。
+old_move = '''    // 相対移動は1 operationにつき1回だけ発行する。retryで再送しない。
+    const esp_err_t result =
+        servo.moveRelativeDegrees(delta_degrees, motion());
+    if (result != ESP_OK) {'''
+new_move = '''    // 相対移動は1 operationにつき1回だけ発行する。retryで再送しない。
+    // fresh接続直後でもTorque OFFのままtargetだけ書かないよう、先にHoldを確立する。
+    esp_err_t result = establishHold();
+    if (result == ESP_OK)
+      result = servo.moveRelativeDegrees(delta_degrees, motion());
+    if (result != ESP_OK) {'''
+if old_move not in s:
+    raise RuntimeError("relative move anchor not found")
+s = s.replace(old_move, new_move, 1)
+
 # 廃止したNVS/absolute endpoint経路がproduction runtimeに残らないことを保証する。
 for forbidden in [
     "ParachutePersistenceRequest",
@@ -55,6 +120,7 @@ for forbidden in [
     "loadFlightParachuteConfiguration",
     "storeFlightParachuteConfiguration",
     "clearFlightParachuteConfiguration",
+    "emergency_power_safe_requested",
 ]:
     if forbidden in s:
         raise RuntimeError(f"runtime forbidden token remains: {forbidden}")
