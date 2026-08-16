@@ -42,10 +42,11 @@ bool CampaignStateMachine::validSessionId(
 
 void CampaignStateMachine::resetStageRuns() noexcept {
   rate_results_ = {};
-  // M0完了前だけCharacterizationRuntime側に旧3-slot resolved checkが残る。
-  // 5 kHzは新規取得対象外なので、M0ではlegacy slotを最初からunsupported扱いにする。
-  if (stage_ == AssemblyStage::M0)
-    rate_results_[2] = RateResult::Unsupported;
+  // 新規motor system identificationは1 kHzだけで実施する。
+  // 2/5 kHz slotはV5旧ログ互換のため型として残すが、新規campaignでは最初から
+  // unsupported扱いとして、operatorに不要なrate-checkを要求しない。
+  rate_results_[1] = RateResult::Unsupported;
+  rate_results_[2] = RateResult::Unsupported;
   full_completed_ = {};
   active_run_kind_ = RunKind::None;
 }
@@ -94,6 +95,9 @@ CampaignStatus CampaignStateMachine::beginRun(EncoderRate rate,
                                                RunKind kind) noexcept {
   if (state_ != CampaignState::Ready)
     return CampaignStatus::InvalidState;
+  // V5 decoderは旧2/5 kHz値を認識するが、新規実機取得は1 kHzだけ許可する。
+  if (rate != EncoderRate::Hz1000)
+    return CampaignStatus::InvalidArgument;
   const std::size_t index = rateIndex(rate);
   if (index >= rate_results_.size() ||
       (kind != RunKind::RateCheck && kind != RunKind::Full))
@@ -142,10 +146,8 @@ CampaignStatus CampaignStateMachine::finishRun(
 }
 
 bool CampaignStateMachine::allRateChecksResolved() const noexcept {
-  // AS5047Dの新規acquisitionは1 kHz / 2 kHzだけを対象とする。
-  // index 2の5 kHz slotはV5の旧campaign互換のため保持するが、Stage完了条件には使わない。
-  return rate_results_[0] != RateResult::Pending &&
-         rate_results_[1] != RateResult::Pending;
+  // motor ID campaignの成立条件は1 kHz rate-checkだけを見る。
+  return rate_results_[0] != RateResult::Pending;
 }
 
 CampaignStatus CampaignStateMachine::completeStage() noexcept {
