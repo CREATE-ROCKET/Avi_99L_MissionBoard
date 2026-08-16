@@ -90,16 +90,35 @@ public:
                                  StreamProtocol &protocol,
                                  EncoderStreamResult &result);
 
-  [[nodiscard]] bool initialized() const { return encoder_.initialized(); }
+  // low-level driverが一時的にend状態でも、production pipelineの自己復旧を
+  // 継続する間はtrueを返す。明示end()後はfalseへ戻る。
+  [[nodiscard]] bool initialized() const {
+    return encoder_.initialized() || recovery_required_;
+  }
   [[nodiscard]] bool busy() const { return busy_.load(); }
+  [[nodiscard]] uint32_t recoveryCount() const { return recovery_count_; }
+  [[nodiscard]] uint32_t runtimeErrorCount() const {
+    return runtime_error_count_;
+  }
+  [[nodiscard]] bool recoveryPending() const { return recovery_required_; }
 
 private:
+  static constexpr uint64_t kRecoveryIntervalUs = 1'000'000;
+
   [[nodiscard]] esp_err_t beginImpl(SpiBringup &spi);
   [[nodiscard]] esp_err_t readImpl(EncoderSample &sample, bool pipelined);
+  [[nodiscard]] esp_err_t recoverPipelinedImpl();
   [[nodiscard]] esp_err_t endImpl();
+  void scheduleRecovery();
 
   AS5047D encoder_{};
+  SPICREATE *encoder_bus_{nullptr};
   std::atomic<bool> busy_{false};
+  bool pipeline_requested_{false};
+  bool recovery_required_{false};
+  uint64_t next_recovery_us_{0};
+  uint32_t recovery_count_{0};
+  uint32_t runtime_error_count_{0};
 };
 
-} // 名前空間 bringup
+} // namespace bringup
