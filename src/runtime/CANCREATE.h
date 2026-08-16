@@ -105,7 +105,9 @@ public:
       frame.data[6] = 0;
       frame.data[7] = 0;
       if (frame.data[2] == 0U) {
-        if (runtime::recovery_persistence::prepareExit(exit_transaction)) {
+        if (!runtime::recovery_persistence::exitArgumentsValid(exit_transaction)) {
+          frame.data[2] = 5U; // InvalidArgument
+        } else if (runtime::recovery_persistence::prepareExit(exit_transaction)) {
           frame.data[2] = 2U; // Complete
           exit_complete = true;
         } else {

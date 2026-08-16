@@ -75,9 +75,13 @@ bool exitRequestPending(uint8_t transaction_id) {
          exit_transaction.load(std::memory_order_acquire) == transaction_id;
 }
 
+bool exitArgumentsValid(uint8_t transaction_id) {
+  return exitRequestPending(transaction_id) &&
+         exit_arguments_valid.load(std::memory_order_acquire);
+}
+
 bool prepareExit(uint8_t transaction_id) {
-  if (!exitRequestPending(transaction_id) ||
-      !exit_arguments_valid.load(std::memory_order_acquire))
+  if (!exitArgumentsValid(transaction_id))
     return false;
   if (exit_prepared.load(std::memory_order_acquire))
     return true;
