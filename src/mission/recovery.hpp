@@ -18,6 +18,7 @@ struct RecoveryMarker {
   uint16_t version{};
   uint16_t checksum{};
   uint32_t wake_sequence{};
+  uint64_t entry_rtc_time_us{};
   bool recovery_requested{};
 };
 
@@ -32,7 +33,8 @@ struct BootEvidence {
 };
 
 [[nodiscard]] uint16_t recoveryMarkerChecksum(const RecoveryMarker &marker);
-[[nodiscard]] RecoveryMarker makeRecoveryMarker(uint32_t wake_sequence);
+[[nodiscard]] RecoveryMarker makeRecoveryMarker(
+    uint32_t wake_sequence, uint64_t entry_rtc_time_us = 0);
 [[nodiscard]] bool validRecoveryMarker(const RecoveryMarker &marker);
 [[nodiscard]] BootPath selectBootPath(const BootEvidence &evidence);
 
