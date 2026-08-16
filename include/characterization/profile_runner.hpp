@@ -12,10 +12,13 @@
 #if defined(ESP_PLATFORM)
 #include "actuators/production_motor.hpp"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 #endif
 
+#include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 
@@ -46,6 +49,15 @@ public:
 
 private:
 #if defined(ESP_PLATFORM)
+  struct ConsumerTick {
+    std::uint64_t alarm_value_us{0U};
+    std::uint32_t alarm_lateness_us{0U};
+  };
+
+  // 正常tick + 1 epoch catch-upに加えて、さらに遅れた状態をqueue上で検出するため4件持つ。
+  // policy上許可するbacklogは2 tickまでで、3 tick以上はfatal。
+  static constexpr std::size_t kConsumerTickQueueDepth = 4U;
+
   static esp_err_t motorApply(void *context,
                               const MotorCommandRequest &request,
                               std::uint64_t &completed_at_us);
@@ -69,6 +81,12 @@ private:
   LogWriterV5 &writer_;
   PowerSampler power_sampler_{};
   AbsolutePeriodicTimer consumer_timer_{};
+  StaticQueue_t consumer_tick_queue_control_{};
+  std::array<std::uint8_t,
+             kConsumerTickQueueDepth * sizeof(ConsumerTick)>
+      consumer_tick_queue_storage_{};
+  QueueHandle_t consumer_tick_queue_{nullptr};
+  std::atomic<bool> consumer_tick_queue_overflow_{false};
   std::atomic<TaskHandle_t> consumer_task_{nullptr};
   std::atomic<bool> consumer_timer_running_{false};
 #endif
