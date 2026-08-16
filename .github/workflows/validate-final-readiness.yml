@@ -24,7 +24,18 @@ jobs:
           python-version: '3.12'
       - run: pip install platformio
       - name: Build production firmware
-        run: pio run -e avi_99l_missionboard
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          pio run -e avi_99l_missionboard 2>&1 | tee /tmp/mission-build.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            grep -E "(^|[[:space:]])(fatal )?error:|undefined reference|collect2:" /tmp/mission-build.log | tail -40 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+            exit "$status"
+          fi
       - name: Run native tests
         run: pio test -e native
       - run: git diff --check
