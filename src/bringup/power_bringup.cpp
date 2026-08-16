@@ -6,6 +6,7 @@
 #include <limits>
 
 #include "config/board_config.hpp"
+#include "control/motor_bus_voltage.hpp"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_adc/adc_oneshot.h"
@@ -193,7 +194,7 @@ esp_err_t encodeAndSend(StreamProtocol &stream, int64_t timestamp_us,
   return encoded ? stream.send(StreamRecordType::adc, payload)
                  : ESP_ERR_INVALID_SIZE;
 }
-} // 無名名前空間
+} // namespace
 
 esp_err_t initialize() {
   if (adc_unit != nullptr)
@@ -280,6 +281,7 @@ esp_err_t end() {
   if (first == ESP_OK) {
     logic_channel = {};
     motor_channel = {};
+    control::motor_bus_voltage::reset();
   }
   return first;
 }
@@ -288,12 +290,18 @@ bool initialized() { return adc_unit != nullptr; }
 
 esp_err_t read(PowerSample &sample) {
   sample = {};
-  if (!initialized() || stream_running.load())
+  if (!initialized() || stream_running.load()) {
+    control::motor_bus_voltage::invalidate();
     return ESP_ERR_INVALID_STATE;
+  }
 
   sample.timestamp_us = esp_timer_get_time();
   sample.logic = readSample(logic_channel);
   sample.motor = readSample(motor_channel);
+  if (sample.motor.calibrated_valid)
+    control::motor_bus_voltage::publish(sample.motor.source_voltage_v);
+  else
+    control::motor_bus_voltage::invalidate();
   if (!sample.logic.raw_valid)
     return sample.logic.status;
   if (!sample.motor.raw_valid)
@@ -390,4 +398,4 @@ esp_err_t adcStream(uint32_t seconds, StreamProtocol &stream,
   return first;
 }
 
-} // 名前空間 bringup::power
+} // namespace bringup::power
