@@ -6,7 +6,7 @@ on:
       - fix/simplify-parachute-servo
     paths:
       - .github/workflows/apply-parachute-simplification.yml
-      - tools/fix_runtime_patch_script_v2.py
+      - tools/finalize_parachute_patch.py
 
 permissions:
   contents: write
@@ -27,6 +27,7 @@ jobs:
           python tools/fix_runtime_patch_script_v2.py
           python tools/apply_runtime_v2.py
           python tools/fix_parachute_host_tests.py
+          python tools/finalize_parachute_patch.py
       - name: Capture patched sources
         if: always()
         uses: actions/upload-artifact@v4
@@ -34,7 +35,7 @@ jobs:
           name: patched-parachute-sources
           path: |
             src/runtime/production_runtime.cpp
-            host_test/mission_host_tests.cpp
+            host_test/*.cpp
           if-no-files-found: error
       - name: Run host tests
         shell: bash
@@ -57,7 +58,7 @@ jobs:
           set -euo pipefail
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          rm -f .github/workflows/apply-parachute-simplification.yml .github/workflows/apply-parachute-simplification-v3.yml tools/apply_parachute.py.gz.b64 tools/apply_runtime_v2.py tools/fix_runtime_patch_script.py tools/fix_runtime_patch_script_v2.py tools/fix_parachute_host_tests.py
+          rm -f .github/workflows/apply-parachute-simplification.yml .github/workflows/apply-parachute-simplification-v3.yml tools/apply_parachute.py.gz.b64 tools/apply_runtime_v2.py tools/fix_runtime_patch_script.py tools/fix_runtime_patch_script_v2.py tools/fix_parachute_host_tests.py tools/finalize_parachute_patch.py
           git add -A
           git update-index --add --cacheinfo 160000,43a185ab2a570d4e1b889a4a534984fd19b2194f,lib/Avi_ESP_Libs
           git diff --cached --check
