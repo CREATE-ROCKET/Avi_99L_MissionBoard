@@ -6,7 +6,7 @@ on:
       - fix/simplify-parachute-servo
     paths:
       - .github/workflows/apply-parachute-simplification.yml
-      - tools/apply_parachute.py.gz.b64
+      - tools/apply_runtime_v2.py
 
 permissions:
   contents: write
@@ -19,12 +19,11 @@ jobs:
         with:
           fetch-depth: 0
           submodules: false
-      - name: Apply mechanical patch
+      - name: Apply runtime patch
         shell: bash
         run: |
           set -euo pipefail
-          base64 -d tools/apply_parachute.py.gz.b64 | gzip -d > /tmp/apply_parachute.py
-          python /tmp/apply_parachute.py
+          python tools/apply_runtime_v2.py
       - name: Run host tests
         shell: bash
         run: |
@@ -36,7 +35,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ! grep -nE 'ParachutePersistence|parachute_persistence_|parachute_config_load_complete|configureMultiTurnPositionMode|servo\.disableTorque\(\)|ParaRequest::Kind::free|nvs_(open|set_blob|get_blob|flash_init)' src/runtime/production_runtime.cpp
+          ! grep -nE 'ParachutePersistence|parachute_persistence_|parachute_config_load_complete|parachute_open_configured|parachute_close_configured|configureMultiTurnPositionMode|servo\.disableTorque\(\)|ParaRequest::Kind::free|nvs_(open|set_blob|get_blob|flash_init)' src/runtime/production_runtime.cpp
           grep -n 'moveRelativeDegrees' src/runtime/production_runtime.cpp
           grep -n 'kParachuteOpenRelativeDegrees' src/runtime/production_runtime.cpp
       - name: Commit implementation
@@ -45,7 +44,7 @@ jobs:
           set -euo pipefail
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          rm -f .github/workflows/apply-parachute-simplification.yml tools/apply_parachute.py.gz.b64
+          rm -f .github/workflows/apply-parachute-simplification.yml tools/apply_parachute.py.gz.b64 tools/apply_runtime_v2.py
           git add -A
           git update-index --add --cacheinfo 160000,43a185ab2a570d4e1b889a4a534984fd19b2194f,lib/Avi_ESP_Libs
           git diff --cached --check
