@@ -3303,7 +3303,11 @@ void airDataTask(void *) {
       } else {
         ssc_ready.store(false, std::memory_order_release);
         ssc_recovery_pending = true;
-        setInitialSscError(ESP_ERR_INVALID_STATE);
+        // begin/reconnect失敗の原因をcommand_modeへ潰さず、そのままtelemetryへ残す。
+        const esp_err_t unavailable_result =
+            last_ssc_reconnect_error == ESP_OK ? ESP_ERR_INVALID_STATE
+                                               : last_ssc_reconnect_error;
+        setInitialSscError(unavailable_result);
       }
       (void)xQueueOverwrite(air_data_queue, &snapshot);
     }
