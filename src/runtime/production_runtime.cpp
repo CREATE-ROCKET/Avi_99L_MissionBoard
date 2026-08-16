@@ -16,6 +16,7 @@
 #include "avi_esp_libs/timeout.h"
 #include "bringup/encoder_bringup.hpp"
 #include "bringup/imu_bringup.hpp"
+#include "bringup/power_bringup.hpp"
 #include "bringup/safe_outputs.hpp"
 #include "bringup/spi_bringup.hpp"
 #include "config/board_config.hpp"
@@ -321,6 +322,10 @@ std::atomic<bool> fin_zero_configured{false};
 std::atomic<bool> lps_ready{false};
 std::atomic<bool> ssc_ready{false};
 std::atomic<bool> sts_ready{false};
+std::atomic<uint8_t> logic_voltage_raw{static_cast<uint8_t>(
+    protocol::quantization::BatteryError::unavailable)};
+std::atomic<uint8_t> motor_voltage_raw{static_cast<uint8_t>(
+    protocol::quantization::BatteryError::unavailable)};
 std::atomic<uint8_t> parachute_angle_raw{
     static_cast<uint8_t>(
         protocol::quantization::ParachuteAngleError::unavailable)};
@@ -3422,7 +3427,9 @@ void canTask(void *) {
         if (result_queue_overflow.load(std::memory_order_relaxed) != 0)
           persistence_flags |= 1U << 7U;
         const protocol::PowerTimeTelemetry power{
-            sequences.next(protocol::CanId::power_time_telemetry), 0xFF, 0xFF,
+            sequences.next(protocol::CanId::power_time_telemetry),
+            logic_voltage_raw.load(std::memory_order_acquire),
+            motor_voltage_raw.load(std::memory_order_acquire),
             latest.state == protocol::MissionState::descent
                 ? protocol::quantization::encodeDescentElapsed(
                       static_cast<double>(latest.flight_elapsed_us) / 1.0e6,
@@ -3560,8 +3567,41 @@ void commandWorkerTask(void *) {
 
 void housekeepingTask(void *) {
   addWatchdog();
+  bool logic_numeric_valid = false;
+  bool motor_numeric_valid = false;
+
+  auto publishVoltage = [](const bringup::power::AdcReading &reading,
+                           std::atomic<uint8_t> &raw,
+                           bool &numeric_valid) {
+    if (!reading.calibrated_valid) {
+      if (!numeric_valid) {
+        raw.store(static_cast<uint8_t>(
+                      protocol::quantization::BatteryError::adc_error),
+                  std::memory_order_release);
+      }
+      return;
+    }
+
+    const uint8_t encoded = protocol::quantization::encodeBatteryVoltage(
+        reading.source_voltage_v,
+        protocol::quantization::BatteryError::adc_error);
+    raw.store(encoded, std::memory_order_release);
+    numeric_valid = encoded <= 240U;
+  };
+
   for (;;) {
-    // ADC/LEDはownerを確保し、flight設定未確定中は駆動せずhealth周期のみ維持する。
+    if (!bringup::power::initialized())
+      (void)bringup::power::initialize();
+
+    if (bringup::power::initialized()) {
+      bringup::power::PowerSample sample{};
+      (void)bringup::power::read(sample);
+      publishVoltage(sample.logic, logic_voltage_raw, logic_numeric_valid);
+      publishVoltage(sample.motor, motor_voltage_raw, motor_numeric_valid);
+    }
+
+    // Battery present threshold/debounceはVault上でTODO(HW_TEST)のため、
+    // Flight Status bit5/6の判定にはまだ使用しない。
     resetWatchdog();
     vTaskDelay(pdMS_TO_TICKS(100));
   }
