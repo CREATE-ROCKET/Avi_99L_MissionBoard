@@ -3808,11 +3808,10 @@ void housekeepingTask(void *) {
                            std::atomic<uint8_t> &raw,
                            bool &numeric_valid) {
     if (!reading.calibrated_valid) {
-      if (!numeric_valid) {
-        raw.store(static_cast<uint8_t>(
-                      protocol::quantization::BatteryError::adc_error),
-                  std::memory_order_release);
-      }
+      raw.store(static_cast<uint8_t>(
+                    protocol::quantization::BatteryError::adc_error),
+                std::memory_order_release);
+      numeric_valid = false;
       return;
     }
 
@@ -4522,7 +4521,8 @@ esp_err_t ProductionRuntime::start() {
       4, sizeof(protocol::RecoveryControl), sd_recovery_queue_buffer.data(),
       &sd_recovery_queue_storage);
   storage_export_queue = xQueueCreateStatic(
-      2, sizeof(StorageExportRequest), storage_export_queue_buffer.data(),
+      2, sizeof(StorageExportRequest),
+      storage_export_queue_buffer.data(),
       &storage_export_queue_storage);
   flash_log_queue = xQueueCreateStatic(
       32, sizeof(flight_log::SerializedRecord), flash_log_queue_buffer.data(),
