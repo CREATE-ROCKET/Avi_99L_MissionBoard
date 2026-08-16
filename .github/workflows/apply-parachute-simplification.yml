@@ -7,6 +7,7 @@ on:
     paths:
       - .github/workflows/apply-parachute-simplification.yml
       - tools/apply_runtime_v2.py
+      - tools/fix_runtime_patch_script.py
 
 permissions:
   contents: write
@@ -23,6 +24,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          python tools/fix_runtime_patch_script.py
           python tools/apply_runtime_v2.py
       - name: Run host tests
         shell: bash
@@ -44,7 +46,7 @@ jobs:
           set -euo pipefail
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          rm -f .github/workflows/apply-parachute-simplification.yml tools/apply_parachute.py.gz.b64 tools/apply_runtime_v2.py
+          rm -f .github/workflows/apply-parachute-simplification.yml tools/apply_parachute.py.gz.b64 tools/apply_runtime_v2.py tools/fix_runtime_patch_script.py
           git add -A
           git update-index --add --cacheinfo 160000,43a185ab2a570d4e1b889a4a534984fd19b2194f,lib/Avi_ESP_Libs
           git diff --cached --check
