@@ -44,13 +44,15 @@ private:
 
 class SdFlightLog {
 public:
-  static constexpr std::size_t kWriteBatchRecords = 64U;
+  // schema v2は256 byte/record。32 recordで8 KiBへ揃える。
+  static constexpr std::size_t kWriteBatchRecords = 32U;
   static constexpr std::size_t kWriteBatchBytes =
       flight_log::kSerializedRecordBytes * kWriteBatchRecords;
   static constexpr std::size_t kPsramReserveBytes = 512U * 1024U;
   static constexpr std::size_t kMaxPsramStagingBytes = 8U * 1024U * 1024U;
 
   static_assert(kWriteBatchBytes == 8192U);
+  static_assert(4096U % flight_log::kSerializedRecordBytes == 0U);
 
   ~SdFlightLog();
   [[nodiscard]] esp_err_t prepareForFlight();
@@ -122,4 +124,4 @@ private:
   std::atomic<esp_err_t> flush_result_{ESP_OK};
 };
 
-} // 名前空間 runtime::flight_storage
+} // namespace runtime::flight_storage
