@@ -2,9 +2,10 @@
 
 #include "esp_attr.h"
 #include "esp_rtc_time.h"
-#include "esp_system.h"
 #include "esp_sleep.h"
+#include "esp_system.h"
 #include "mission/recovery.hpp"
+#include "protocol/quantization.hpp"
 
 namespace runtime::recovery_boot {
 namespace {
@@ -142,6 +143,17 @@ bool resetPreservesRtcMemory() {
   const esp_reset_reason_t reason = esp_reset_reason();
   return reason != ESP_RST_POWERON && reason != ESP_RST_DEEPSLEEP;
 }
+
+bool markerStoragePresent() {
+  return recovery_marker.magic != 0 || recovery_marker.version != 0 ||
+         recovery_marker.checksum != 0 || recovery_marker.wake_sequence != 0 ||
+         recovery_marker.entry_rtc_time_us != 0 ||
+         recovery_marker.recovery_requested;
+}
+
+uint16_t recoveryTimeError(protocol::quantization::TimeError error) {
+  return static_cast<uint16_t>(0xFFF0U | static_cast<uint8_t>(error));
+}
 } // 無名名前空間
 
 bool loadStartReadinessAudit(StartReadinessAudit &audit) {
@@ -184,8 +196,57 @@ uint32_t wakeSequence() {
              ? recovery_marker.wake_sequence
              : 0;
 }
+
+bool commitRecoveryEntryMarker() {
+  if (mission::validRecoveryMarker(recovery_marker) &&
+      recovery_marker.entry_rtc_time_us != 0)
+    return true;
+
+  const uint64_t now_us = esp_rtc_get_time_us();
+  if (now_us == 0)
+    return false;
+  recovery_marker = mission::makeRecoveryMarker(0, now_us);
+  return mission::validRecoveryMarker(recovery_marker) &&
+         recovery_marker.entry_rtc_time_us == now_us;
+}
+
+uint16_t recoveryElapsedRaw(bool recovery_requested, bool recovery_only) {
+  if (mission::validRecoveryMarker(recovery_marker)) {
+    if (recovery_marker.entry_rtc_time_us == 0)
+      return recoveryTimeError(
+          protocol::quantization::TimeError::rtc_recovery_failed);
+    if (recovery_only && !wakeCauseValid())
+      return recoveryTimeError(
+          protocol::quantization::TimeError::rtc_recovery_failed);
+
+    const uint64_t now_us = esp_rtc_get_time_us();
+    if (now_us < recovery_marker.entry_rtc_time_us)
+      return recoveryTimeError(
+          protocol::quantization::TimeError::time_inconsistent);
+    const double elapsed_seconds =
+        static_cast<double>(now_us - recovery_marker.entry_rtc_time_us) / 1.0e6;
+    return protocol::quantization::encodeRecoveryElapsed(
+        elapsed_seconds, protocol::quantization::TimeError::internal_error);
+  }
+
+  if (recovery_only) {
+    return recoveryTimeError(
+        markerStoragePresent()
+            ? protocol::quantization::TimeError::checkpoint_invalid
+            : protocol::quantization::TimeError::checkpoint_missing);
+  }
+  if (recovery_requested)
+    return recoveryTimeError(
+        protocol::quantization::TimeError::recovery_in_progress);
+  return recoveryTimeError(protocol::quantization::TimeError::unavailable);
+}
+
 void prepareMarker() {
-  recovery_marker = mission::makeRecoveryMarker(wakeSequence() + 1U);
+  if (!mission::validRecoveryMarker(recovery_marker) ||
+      recovery_marker.entry_rtc_time_us == 0)
+    return;
+  recovery_marker = mission::makeRecoveryMarker(
+      wakeSequence() + 1U, recovery_marker.entry_rtc_time_us);
 }
 void clearMarker() { recovery_marker = {}; }
 
