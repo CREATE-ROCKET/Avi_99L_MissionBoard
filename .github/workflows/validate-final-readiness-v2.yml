@@ -1,0 +1,64 @@
+name: Validate latest final readiness
+
+on:
+  push:
+    branches:
+      - fix/vault-final-flight-readiness-20260816
+    paths:
+      - .github/workflows/validate-final-readiness-v2.yml
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      AVI_99L_MOTOR_PROFILE_ID: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/vault-final-flight-readiness-20260816
+          submodules: recursive
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install platformio
+      - name: Build production firmware
+        id: production_build
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          pio run -e avi_99l_missionboard 2>&1 | tee /tmp/mission-build.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            tail -240 /tmp/mission-build.log > ci_mission_build_failure_v2.txt
+            exit "$status"
+          fi
+      - name: Persist failure excerpt
+        if: failure() && steps.production_build.conclusion == 'failure'
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+Natsu-B@users.noreply.github.com
+          git add ci_mission_build_failure_v2.txt
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "test(mission): capture latest build failure"
+          git push origin HEAD:fix/vault-final-flight-readiness-20260816
+      - name: Run native tests
+        if: success()
+        run: pio test -e native
+      - if: success()
+        run: git diff --check
+      - name: Remove temporary validation files
+        if: success()
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+Natsu-B@users.noreply.github.com
+          git rm .github/workflows/validate-final-readiness-v2.yml
+          if [ -f .github/workflows/validate-final-readiness.yml ]; then git rm .github/workflows/validate-final-readiness.yml; fi
+          if [ -f ci_mission_build_failure.txt ]; then git rm ci_mission_build_failure.txt; fi
+          if [ -f ci_mission_build_failure_v2.txt ]; then git rm ci_mission_build_failure_v2.txt; fi
+          git commit -m "test(mission): validate final readiness build"
+          git push origin HEAD:fix/vault-final-flight-readiness-20260816
