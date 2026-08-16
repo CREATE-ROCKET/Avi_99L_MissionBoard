@@ -107,43 +107,48 @@ void testCommandReceiveRecoveryAndGating() {
 
   for (const auto code : {CommandCode::start_sequence,
                           CommandCode::force_start_sequence,
-                          CommandCode::start_fin_zero_hold,
-                          CommandCode::fin_move_relative}) {
+                          CommandCode::fin_hold_current}) {
     mission::CommandExecutor executor;
     const auto decision = executor.begin(command(1, code), context);
     assert(!decision.execute);
     assert(decision.result.reason == CommandReason::safety_interlock);
   }
 
-  mission::CommandExecutor free_executor;
-  const auto free_decision =
-      free_executor.begin(command(2, CommandCode::fin_free), context);
-  assert(free_decision.execute);
-  assert(free_decision.result.phase == CommandPhase::accepted);
+  mission::CommandExecutor release_executor;
+  const auto release_decision =
+      release_executor.begin(command(2, CommandCode::fin_release_hold), context);
+  assert(release_decision.execute);
+  assert(release_decision.result.phase == CommandPhase::accepted);
 
-  mission::CommandExecutor failed_zero_executor;
-  const auto failed_zero =
-      failed_zero_executor.begin(command(3, CommandCode::set_fin_zero), context);
-  assert(failed_zero.execute);
-  (void)failed_zero_executor.finish(3, CommandPhase::failed,
-                                    CommandReason::device_unavailable);
+  for (const auto code : {CommandCode::set_fin_zero,
+                          CommandCode::start_fin_zero_hold}) {
+    mission::CommandExecutor legacy_executor;
+    const auto legacy = legacy_executor.begin(command(3, code), context);
+    assert(!legacy.execute);
+    assert(legacy.result.phase == CommandPhase::rejected);
+    assert(legacy.result.reason == CommandReason::not_supported);
+  }
+
+  resetGuard();
+  mission::CommandExecutor hold_executor;
+  const auto hold =
+      hold_executor.begin(command(4, CommandCode::fin_hold_current), context);
+  assert(hold.execute);
+  assert(hold.result.phase == CommandPhase::accepted);
+
+  mission::CommandExecutor argument_executor;
+  auto invalid_hold = command(5, CommandCode::fin_hold_current);
+  invalid_hold.arguments[0] = 1;
+  const auto invalid = argument_executor.begin(invalid_hold, context);
+  assert(!invalid.execute);
+  assert(invalid.result.reason == CommandReason::invalid_argument);
+
+  control::observeFinOvertravel(degrees(-20.1), true);
   assert(control::finOvertravelFaultLatched());
-
-  mission::CommandExecutor successful_zero_executor;
-  const auto successful_zero = successful_zero_executor.begin(
-      command(4, CommandCode::set_fin_zero), context);
-  assert(successful_zero.execute);
-  (void)successful_zero_executor.finish(4, CommandPhase::completed,
-                                        CommandReason::none);
-  assert(!control::finOvertravelFaultLatched());
-  assert(zero.compute(0.0, 0.0).valid);
-
-  control::observeFinOvertravel(degrees(20.1), true);
-  assert(control::finOvertravelFaultLatched());
-  control::observeFinOvertravel(degrees(20.0), true);
+  control::observeFinOvertravel(degrees(-19.9), true);
   mission::CommandExecutor recovered_executor;
   const auto recovered = recovered_executor.begin(
-      command(5, CommandCode::start_fin_zero_hold), context);
+      command(6, CommandCode::fin_hold_current), context);
   assert(recovered.execute);
   assert(!control::finOvertravelFaultLatched());
 }
