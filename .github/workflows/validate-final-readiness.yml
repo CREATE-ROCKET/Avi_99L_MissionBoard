@@ -24,6 +24,7 @@ jobs:
           python-version: '3.12'
       - run: pip install platformio
       - name: Build production firmware
+        id: production_build
         shell: bash
         run: |
           set +e
@@ -31,19 +32,31 @@ jobs:
           pio run -e avi_99l_missionboard 2>&1 | tee /tmp/mission-build.log
           status=${PIPESTATUS[0]}
           if [ "$status" -ne 0 ]; then
+            tail -220 /tmp/mission-build.log > ci_mission_build_failure.txt
             grep -E "(^|[[:space:]])(fatal )?error:|undefined reference|collect2:" /tmp/mission-build.log | tail -40 | while IFS= read -r line; do
               echo "::error::$line"
             done
             exit "$status"
           fi
+      - name: Persist failure excerpt
+        if: failure() && steps.production_build.conclusion == 'failure'
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+Natsu-B@users.noreply.github.com
+          git add ci_mission_build_failure.txt
+          git commit -m "test(mission): capture build failure"
+          git push origin HEAD:fix/vault-final-flight-readiness-20260816
       - name: Run native tests
+        if: success()
         run: pio test -e native
-      - run: git diff --check
-      - name: Remove temporary workflow
+      - if: success()
+        run: git diff --check
+      - name: Remove temporary validation files
         if: success()
         run: |
           git config user.name github-actions[bot]
           git config user.email 41898282+Natsu-B@users.noreply.github.com
           git rm .github/workflows/validate-final-readiness.yml
+          if [ -f ci_mission_build_failure.txt ]; then git rm ci_mission_build_failure.txt; fi
           git commit -m "test(mission): validate final readiness build"
           git push origin HEAD:fix/vault-final-flight-readiness-20260816
