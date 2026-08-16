@@ -120,24 +120,38 @@ void testCommandReceiveRecoveryAndGating() {
   assert(release_decision.execute);
   assert(release_decision.result.phase == CommandPhase::accepted);
 
-  for (const auto code : {CommandCode::set_fin_zero,
-                          CommandCode::start_fin_zero_hold}) {
-    mission::CommandExecutor legacy_executor;
-    const auto legacy = legacy_executor.begin(command(3, code), context);
-    assert(!legacy.execute);
-    assert(legacy.result.phase == CommandPhase::rejected);
-    assert(legacy.result.reason == CommandReason::not_supported);
-  }
+  mission::CommandExecutor failed_zero_executor;
+  const auto failed_zero =
+      failed_zero_executor.begin(command(3, CommandCode::set_fin_zero), context);
+  assert(failed_zero.execute);
+  (void)failed_zero_executor.finish(3, CommandPhase::failed,
+                                    CommandReason::device_unavailable);
+  assert(control::finOvertravelFaultLatched());
 
-  resetGuard();
+  mission::CommandExecutor successful_zero_executor;
+  const auto successful_zero = successful_zero_executor.begin(
+      command(4, CommandCode::set_fin_zero), context);
+  assert(successful_zero.execute);
+  (void)successful_zero_executor.finish(4, CommandPhase::completed,
+                                        CommandReason::none);
+  assert(!control::finOvertravelFaultLatched());
+  assert(zero.compute(0.0, 0.0).valid);
+
+  mission::CommandExecutor legacy_executor;
+  const auto legacy = legacy_executor.begin(
+      command(5, CommandCode::start_fin_zero_hold), context);
+  assert(!legacy.execute);
+  assert(legacy.result.phase == CommandPhase::rejected);
+  assert(legacy.result.reason == CommandReason::not_supported);
+
   mission::CommandExecutor hold_executor;
   const auto hold =
-      hold_executor.begin(command(4, CommandCode::fin_hold_current), context);
+      hold_executor.begin(command(6, CommandCode::fin_hold_current), context);
   assert(hold.execute);
   assert(hold.result.phase == CommandPhase::accepted);
 
   mission::CommandExecutor argument_executor;
-  auto invalid_hold = command(5, CommandCode::fin_hold_current);
+  auto invalid_hold = command(7, CommandCode::fin_hold_current);
   invalid_hold.arguments[0] = 1;
   const auto invalid = argument_executor.begin(invalid_hold, context);
   assert(!invalid.execute);
@@ -148,7 +162,7 @@ void testCommandReceiveRecoveryAndGating() {
   control::observeFinOvertravel(degrees(-19.9), true);
   mission::CommandExecutor recovered_executor;
   const auto recovered = recovered_executor.begin(
-      command(6, CommandCode::fin_hold_current), context);
+      command(8, CommandCode::fin_hold_current), context);
   assert(recovered.execute);
   assert(!control::finOvertravelFaultLatched());
 }
