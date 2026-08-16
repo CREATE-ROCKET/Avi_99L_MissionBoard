@@ -2,12 +2,20 @@
 
 #include_next "CANCREATE.h"
 
+#include <atomic>
 #include <cstdint>
 
 #include "esp_timer.h"
 #include "runtime/recovery_persistence.hpp"
 #include "sensors/display_attitude_runtime.hpp"
 #include "sensors/power_presence_runtime.hpp"
+
+namespace mission_runtime_can_detail {
+// Kinematics 0x100のrollはCommandReceive中だけ表示用rollへ差し替える。
+// MissionEventとMissionStatusの両方から状態を追跡し、遷移直後の100 Hz frameでも
+// 旧状態を長く保持しないようにする。
+inline std::atomic<uint8_t> mission_state_raw{0};
+} // namespace mission_runtime_can_detail
 
 class MissionRuntimeCan final : public CANCREATE {
 public:
@@ -49,7 +57,13 @@ public:
             frame.data[0], phase == 1 && reason == 0);
     }
 
+    if (frame.identifier == 0x020 && frame.data_length == 8)
+      mission_runtime_can_detail::mission_state_raw.store(
+          frame.data[3], std::memory_order_release);
+
     if (frame.identifier == 0x102 && frame.data_length == 8) {
+      mission_runtime_can_detail::mission_state_raw.store(
+          frame.data[1], std::memory_order_release);
       uint16_t status = static_cast<uint16_t>(frame.data[2]) |
                         (static_cast<uint16_t>(frame.data[3]) << 8U);
       if (sensors::power_presence_runtime::logicPresent(now_us))
@@ -68,6 +82,14 @@ public:
       frame.data[3] = static_cast<uint8_t>(status >> 8U);
     }
 
+    if (frame.identifier == 0x100 && frame.data_length == 8 &&
+        mission_runtime_can_detail::mission_state_raw.load(
+            std::memory_order_acquire) == 0U) {
+      const auto attitude = sensors::display_attitude_runtime::wireTelemetry(now_us);
+      frame.data[1] = static_cast<uint8_t>(attitude.roll_raw);
+      frame.data[2] = static_cast<uint8_t>(attitude.roll_raw >> 8U);
+    }
+
     if (frame.identifier == 0x103 && frame.data_length == 8) {
       sensors::power_presence_runtime::observeRaw(frame.data[1], frame.data[2],
                                                   now_us);
@@ -77,17 +99,13 @@ public:
       }
     }
 
-    if (frame.identifier == 0x107 &&
-        (frame.data_length == 3 || frame.data_length == 5)) {
+    if (frame.identifier == 0x107 && frame.data_length == 3) {
       const auto attitude = sensors::display_attitude_runtime::wireTelemetry(now_us);
       const uint16_t packed =
           static_cast<uint16_t>(attitude.magnitude_raw & 0x7FU) |
           static_cast<uint16_t>((attitude.direction_raw & 0x01FFU) << 7U);
-      frame.data_length = 5;
       frame.data[1] = static_cast<uint8_t>(packed);
       frame.data[2] = static_cast<uint8_t>(packed >> 8U);
-      frame.data[3] = static_cast<uint8_t>(attitude.roll_raw);
-      frame.data[4] = static_cast<uint8_t>(attitude.roll_raw >> 8U);
     }
 
     if (frame.identifier == 0x014 && frame.data_length == 3) {
