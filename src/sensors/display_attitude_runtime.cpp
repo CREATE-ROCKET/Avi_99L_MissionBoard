@@ -21,6 +21,8 @@ std::atomic<uint8_t> calibration_transaction{0};
 std::atomic<uint8_t> calibration_state{0}; // 0=idle, 1=active, 2=finish-success, 3=finish-failed
 std::atomic<uint8_t> magnitude_raw{122};
 std::atomic<uint16_t> direction_raw{511};
+std::atomic<uint16_t> roll_raw{
+    static_cast<uint16_t>(protocol::quantization::RollError::not_initialized)};
 std::atomic<uint64_t> last_host_timestamp_us{0};
 
 DisplayAttitudeEstimator estimator;
@@ -30,9 +32,11 @@ std::array<double, 3> gyro_sum{};
 std::array<double, 3> accel_sum{};
 uint64_t last_sensor_timestamp_us = 0;
 
-void publishInvalid(uint8_t raw) {
-  magnitude_raw.store(raw, std::memory_order_release);
+void publishInvalid(uint8_t tilt_raw,
+                    protocol::quantization::RollError roll_error) {
+  magnitude_raw.store(tilt_raw, std::memory_order_release);
   direction_raw.store(511, std::memory_order_release);
+  roll_raw.store(static_cast<uint16_t>(roll_error), std::memory_order_release);
 }
 
 void resetCalibrationAccumulators() {
@@ -52,16 +56,22 @@ void publishEstimatorState() {
   if (!state.valid) {
     switch (state.invalid_reason) {
     case DisplayAttitudeInvalidReason::not_initialized:
-      publishInvalid(122);
+      publishInvalid(122, protocol::quantization::RollError::not_initialized);
       break;
     case DisplayAttitudeInvalidReason::reset_invalidated:
-      publishInvalid(125);
+      publishInvalid(125, protocol::quantization::RollError::reset_invalidated);
+      break;
+    case DisplayAttitudeInvalidReason::sample_invalid:
+      publishInvalid(124, protocol::quantization::RollError::sample_invalid);
+      break;
+    case DisplayAttitudeInvalidReason::timestamp_invalid:
+      publishInvalid(124, protocol::quantization::RollError::timestamp_invalid);
       break;
     case DisplayAttitudeInvalidReason::none:
-      publishInvalid(121);
+      publishInvalid(121, protocol::quantization::RollError::unavailable);
       break;
     default:
-      publishInvalid(124);
+      publishInvalid(124, protocol::quantization::RollError::estimator_invalid);
       break;
     }
     return;
@@ -75,13 +85,17 @@ void publishEstimatorState() {
           ? protocol::quantization::encodeTiltDirection(state.direction_deg)
           : 511,
       std::memory_order_release);
+  roll_raw.store(
+      protocol::quantization::encodeRoll(
+          state.roll_deg, protocol::quantization::RollError::out_of_range),
+      std::memory_order_release);
 }
 
 void finishCalibration(const bringup::ImuSample &sample) {
   if (gyro_samples < kMinimumCalibrationSamples ||
       accel_samples < kMinimumCalibrationSamples) {
     estimator.invalidateForDataLoss();
-    publishInvalid(124);
+    publishInvalid(124, protocol::quantization::RollError::estimator_invalid);
     resetCalibrationAccumulators();
     return;
   }
@@ -107,7 +121,7 @@ void finishCalibration(const bringup::ImuSample &sample) {
   if (!bias_valid || !gravity_valid || timestamp == 0 ||
       !estimator.initialize(timestamp, bias, gravity, kLauncherTiltDeg,
                             kLauncherTrueAzimuthDeg)) {
-    publishInvalid(124);
+    publishInvalid(124, protocol::quantization::RollError::estimator_invalid);
   } else {
     last_sensor_timestamp_us = timestamp;
     publishEstimatorState();
@@ -127,7 +141,7 @@ void observe(const bringup::ImuSample &sample) {
     resetCalibrationAccumulators();
     calibration_state.store(0, std::memory_order_release);
     estimator.invalidateForDataLoss();
-    publishInvalid(124);
+    publishInvalid(124, protocol::quantization::RollError::estimator_invalid);
   }
 
   const bool gyro_valid = sample.angular_velocity_valid &&
@@ -172,7 +186,7 @@ void observe(const bringup::ImuSample &sample) {
   if (!gyro_valid || timestamp == 0 || timestamp <= last_sensor_timestamp_us ||
       !estimator.update(timestamp, angular_velocity, gyro_valid)) {
     estimator.invalidateForDataLoss();
-    publishInvalid(124);
+    publishInvalid(124, protocol::quantization::RollError::estimator_invalid);
     return;
   }
   last_sensor_timestamp_us = timestamp;
@@ -185,7 +199,7 @@ void calibrationAccepted(uint8_t transaction_id) {
   calibration_transaction.store(transaction_id, std::memory_order_release);
   resetCalibrationAccumulators();
   calibration_state.store(1, std::memory_order_release);
-  publishInvalid(122);
+  publishInvalid(122, protocol::quantization::RollError::not_initialized);
 }
 
 void calibrationFinished(uint8_t transaction_id, bool success) {
@@ -197,12 +211,12 @@ void calibrationFinished(uint8_t transaction_id, bool success) {
 
 void invalidateForDataLoss() {
   estimator.invalidateForDataLoss();
-  publishInvalid(124);
+  publishInvalid(124, protocol::quantization::RollError::estimator_invalid);
 }
 
 void invalidateForReset() {
   estimator.invalidateForReset();
-  publishInvalid(125);
+  publishInvalid(125, protocol::quantization::RollError::reset_invalidated);
 }
 
 WireTelemetry wireTelemetry(uint64_t now_us) {
@@ -210,8 +224,10 @@ WireTelemetry wireTelemetry(uint64_t now_us) {
   const uint8_t magnitude = magnitude_raw.load(std::memory_order_acquire);
   if (magnitude <= 120 &&
       (last == 0 || now_us < last || now_us - last > kStaleUs))
-    return {123, 511};
-  return {magnitude, direction_raw.load(std::memory_order_acquire)};
+    return {123, 511,
+            static_cast<uint16_t>(protocol::quantization::RollError::stale)};
+  return {magnitude, direction_raw.load(std::memory_order_acquire),
+          roll_raw.load(std::memory_order_acquire)};
 }
 
 } // namespace sensors::display_attitude_runtime
