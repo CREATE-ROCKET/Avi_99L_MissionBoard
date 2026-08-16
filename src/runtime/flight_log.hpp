@@ -6,10 +6,36 @@
 
 namespace runtime::flight_log {
 
-inline constexpr uint8_t kSchemaVersion = 1;
-inline constexpr std::size_t kSerializedRecordBytes = 128;
+inline constexpr uint8_t kSchemaVersion = 2;
+inline constexpr std::size_t kSerializedRecordBytes = 176;
 inline constexpr uint32_t kInvalidDropCounter = 0xFFFF'FFFFU;
 inline constexpr uint16_t kUnknownEncoderZeroCount = 0xFFFFU;
+
+enum class FinZeroApproachDirection : uint8_t {
+  unknown = 0,
+  positive = 1,
+  negative = 2,
+};
+
+enum class FinZeroCalibrationMethod : uint8_t {
+  unknown = 0,
+  current_position = 1,
+  positive_single_approach = 2,
+  negative_single_approach = 3,
+  bidirectional_midpoint = 4,
+};
+
+enum class FinZeroGroundVerificationStatus : uint8_t {
+  unknown = 0,
+  unverified = 1,
+  verified = 2,
+};
+
+enum EncoderDiagnosticFlag : uint8_t {
+  encoder_sample_valid = 1U << 0U,
+  encoder_rate_valid = 1U << 1U,
+  encoder_reconnected_since_zero = 1U << 2U,
+};
 
 struct Sample {
   uint64_t monotonic_us{};
@@ -53,6 +79,22 @@ struct Sample {
   float pitot_coefficient_diagnostic_min{};
   float pitot_coefficient_diagnostic_max{};
   float measured_bidirectional_span_rad{};
+
+  // schema v2: FinZero transaction provenanceと1 kHz direct encoder診断。
+  uint64_t fin_zero_configured_timestamp_us{};
+  uint32_t fin_zero_flight_epoch{};
+  FinZeroApproachDirection fin_zero_approach_direction{
+      FinZeroApproachDirection::unknown};
+  FinZeroCalibrationMethod fin_zero_calibration_method{
+      FinZeroCalibrationMethod::unknown};
+  FinZeroGroundVerificationStatus fin_zero_ground_verification_status{
+      FinZeroGroundVerificationStatus::unknown};
+  uint8_t encoder_diagnostic_flags{};
+  uint64_t encoder_sample_timestamp_us{};
+  uint32_t encoder_read_latency_us{};
+  uint32_t encoder_sample_age_us{};
+  uint32_t encoder_reconnect_count{};
+  uint32_t encoder_error_count{};
 };
 
 using SerializedRecord = std::array<uint8_t, kSerializedRecordBytes>;
@@ -62,4 +104,4 @@ using SerializedRecord = std::array<uint8_t, kSerializedRecordBytes>;
 [[nodiscard]] bool validate(const SerializedRecord &record);
 [[nodiscard]] bool erased(const SerializedRecord &record);
 
-} // 名前空間 runtime::flight_log
+} // namespace runtime::flight_log
