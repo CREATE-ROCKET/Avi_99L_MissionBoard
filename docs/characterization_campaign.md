@@ -96,13 +96,22 @@ consumer tick queueは4件確保しますが、許可するbacklogは現在tick�
 
 ### 4.1. Vbus ADCの扱い
 
-Vbus ADCはmotor system identificationの補助観測であり、単発のADC read failureをmotor safety faultへ昇格しません。
+**motor system identificationではVbus ADCを取得しません。** Vbusは補助・予備観測であり、今回のplant同定成立条件には含めません。
 
-`PowerSampler`は100 HzでADCを読み、**正常に取得できたsampleだけ**をlatest evidenceへpublishします。`ESP_ERR_TIMEOUT`その他の単発read errorではそのsampleを捨て、直前の正常Vbus evidenceを保持して次の10 ms sampleを待ちます。ADC read errorを`PowerSampler::firstError()`へラッチしてrunを即停止してはいけません。
+characterizationのrate-check/fullでは`PowerSampler` taskを起動せず、ADC read、freshness、0 mV判定のいずれもrunの停止条件にしません。production runtimeのbattery ADC経路はこの決定の対象外で、変更しません。
 
-latest evidenceのfreshness上限は100 msを維持します。100 ms以上正常Vbus sampleが得られずevidenceがstaleになった場合、またはfull runで有効なADC measurementとして0 mVを確認した場合は従来どおりVbus invalidとして扱います。ADC失敗sampleを正常値へ補間したり、capture timestampを書き換えて新しい測定に見せかけたりしません。
+V5 schema互換を維持するため、各recordのpower evidenceは次の固定値で「未取得」を明示します。
 
-2026-08-16のFV rate-checkでは95 epoch時点の単発ADC timeoutが`PowerSampler::firstError()`へラッチされ、encoder/storageが正常にもかかわらず`abort=10`になりました。この挙動を廃止し、単発ADC timeoutではcaptureを継続します。
+```text
+power.valid = false
+power.read_result = ESP_ERR_NOT_SUPPORTED
+power.capture_timestamp_us = 0
+power.motor_millivolts = 0
+```
+
+`vbus-invalid` diagnosticはmotor-IDでは0のままとします。ADC値を仮定値や直前値で補間したり、未取得を有効測定に見せかけたりしません。
+
+このためSpicaではVbus補正を行わず、入力はactual duty/PWMと`command_apply_timestamp_us`を正本とします。試験中の供給電圧変動は同定不確かさとして扱います。
 
 release-only遅延は`consumer_lateness_us`、`CHAR_RATE_RESULT release-deadline`、`CHAR_RATE_TIMING`へ残します。新規motor-ID V5 recordではrelease-only遅延を`EpochDeadline`へ昇格しません。
 
@@ -117,7 +126,6 @@ release-only遅延は`consumer_lateness_us`、`CHAR_RATE_RESULT release-deadline
 - encoder invalid / transport / status error
 - steady-state incomplete / repeated / skipped
 - raw/writer queue overflow
-- Vbus evidenceが100 ms以上更新されない、future timestampになる、またはfullで有効測定として0 mVを確認する
 - position guard / hard abort / overshoot
 - motor apply error
 - SD write/sync/close error
@@ -264,7 +272,7 @@ python3 tools/verify_motor_id_characterization.py capture.bin \
   --integrity integrity.json
 ```
 
-V5 validatorはCRC、sequence、timestamp、raw sample、command apply、mode、Vbus、footerを検証します。旧100 us command deadline captureもdecode互換を維持します。
+V5 validatorはCRC、sequence、timestamp、raw sample、command apply、mode、power unavailable evidence、footerを検証します。motor-IDで`power.valid=false`かつ`power.read_result=ESP_ERR_NOT_SUPPORTED`は正常な未取得表現です。旧100 us command deadline captureもdecode互換を維持します。
 
 ## 10. Spica package
 
