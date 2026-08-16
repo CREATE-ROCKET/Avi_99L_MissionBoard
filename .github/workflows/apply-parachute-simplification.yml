@@ -6,7 +6,7 @@ on:
       - fix/simplify-parachute-servo
     paths:
       - .github/workflows/apply-parachute-simplification.yml
-      - tools/harden_parachute_runtime.py
+      - tools/fix_parachute_host_tests_v2.py
 
 permissions:
   contents: write
@@ -29,6 +29,7 @@ jobs:
           python tools/fix_parachute_host_tests.py
           python tools/finalize_parachute_patch.py
           python tools/harden_parachute_runtime.py
+          python tools/fix_parachute_host_tests_v2.py
       - name: Run parachute-related host tests
         shell: bash
         run: |
@@ -77,7 +78,8 @@ jobs:
             tools/fix_runtime_patch_script_v2.py \
             tools/fix_parachute_host_tests.py \
             tools/finalize_parachute_patch.py \
-            tools/harden_parachute_runtime.py
+            tools/harden_parachute_runtime.py \
+            tools/fix_parachute_host_tests_v2.py
           git add -A
           git update-index --add --cacheinfo 160000,43a185ab2a570d4e1b889a4a534984fd19b2194f,lib/Avi_ESP_Libs
           git diff --cached --check
