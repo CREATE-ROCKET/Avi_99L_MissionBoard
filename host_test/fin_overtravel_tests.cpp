@@ -65,6 +65,16 @@ void testThresholdAndInvalidSamples() {
   control::observeFinOvertravel(degrees(-20.0), true);
   assert(!control::finOvertravelFaultLatched());
 
+  // invalid/stale相当のsampleは範囲外でもovertravelを新規成立させない。
+  control::observeFinOvertravel(degrees(20.1), false);
+  assert(!control::finOvertravelFaultLatched());
+  control::observeFinOvertravel(degrees(-20.1), false);
+  assert(!control::finOvertravelFaultLatched());
+  control::observeFinOvertravel(NAN, true);
+  assert(!control::finOvertravelFaultLatched());
+  control::observeFinOvertravel(INFINITY, true);
+  assert(!control::finOvertravelFaultLatched());
+
   control::observeFinOvertravel(degrees(20.1), true);
   assert(control::finOvertravelFaultLatched());
   control::observeFinOvertravel(0.0, false);
@@ -72,6 +82,9 @@ void testThresholdAndInvalidSamples() {
   assert(control::finOvertravelFaultLatched());
 
   control::observeFinOvertravel(NAN, true);
+  assert(!control::clearFinOvertravelIfRecoverable());
+  assert(control::finOvertravelFaultLatched());
+  control::observeFinOvertravel(INFINITY, true);
   assert(!control::clearFinOvertravelIfRecoverable());
   assert(control::finOvertravelFaultLatched());
 

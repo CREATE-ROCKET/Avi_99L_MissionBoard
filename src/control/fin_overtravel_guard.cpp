@@ -16,15 +16,16 @@ std::atomic<bool> inside_fault_limit{false};
 
 void observeFinOvertravel(double angle_rad, bool valid_sample) {
   const bool finite_angle = std::isfinite(angle_rad);
+  const bool usable_sample = valid_sample && finite_angle;
   const bool inside =
-      finite_angle && std::abs(angle_rad) <= board::kFinOvertravelFaultLimitRad;
+      usable_sample && std::abs(angle_rad) <= board::kFinOvertravelFaultLimitRad;
 
-  sample_valid.store(valid_sample && finite_angle, std::memory_order_release);
-  inside_fault_limit.store(valid_sample && inside, std::memory_order_release);
+  sample_valid.store(usable_sample, std::memory_order_release);
+  inside_fault_limit.store(inside, std::memory_order_release);
 
-  // rate estimatorが一時的に未readyでも、有限な最新角が20 degを超えた事実は
-  // 安全側へlatchする。stale/invalid sampleは解除には利用しない。
-  if (finite_angle && !inside)
+  // invalid/stale/zero未設定相当のsampleは別faultで扱い、overtravelを
+  // 新規成立させない。既存overtravelの解除にも利用しない。
+  if (usable_sample && !inside)
     fault_latched.store(true, std::memory_order_release);
 }
 

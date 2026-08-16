@@ -9,7 +9,8 @@ struct FinOvertravelStatus {
 };
 
 // 1 kHzの動翼観測からovertravel状態を更新する。
-// fault成立は有限な角度だけで判定し、解除可否にはvalid sampleを要求する。
+// fault成立・解除ともvalidな有限角sampleだけを使用する。
+// invalid/stale/zero未設定相当のsampleは新規fault成立にも解除にも使用しない。
 void observeFinOvertravel(double angle_rad, bool sample_valid);
 
 [[nodiscard]] FinOvertravelStatus finOvertravelStatus();
