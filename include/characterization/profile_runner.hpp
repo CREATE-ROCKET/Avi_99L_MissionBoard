@@ -50,7 +50,7 @@ public:
 private:
 #if defined(ESP_PLATFORM)
   struct ConsumerTick {
-    std::uint64_t epoch_index{0U};
+    std::uint32_t epoch_index{0U};
     std::uint32_t alarm_lateness_us{0U};
   };
 
@@ -86,7 +86,8 @@ private:
              kConsumerTickQueueDepth * sizeof(ConsumerTick)>
       consumer_tick_queue_storage_{};
   QueueHandle_t consumer_tick_queue_{nullptr};
-  std::atomic<std::uint64_t> consumer_tick_generation_{0U};
+  // timer running中はISRだけが更新し、start前/stop後だけtask側がresetする。
+  std::uint32_t consumer_tick_generation_{0U};
   std::atomic<bool> consumer_tick_queue_overflow_{false};
   std::atomic<TaskHandle_t> consumer_task_{nullptr};
   std::atomic<bool> consumer_timer_running_{false};
