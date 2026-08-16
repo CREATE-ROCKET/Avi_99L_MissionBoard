@@ -15,11 +15,27 @@ constexpr double kParachuteDegreesPerCount =
 
 class AbsoluteParachuteAngle {
 public:
+  // NVS/RTC endpointなど、既に1回転内へ正規化済みのcountだけを受理する。
   [[nodiscard]] static constexpr std::optional<AbsoluteParachuteAngle>
-  fromCount(uint16_t count) {
+  fromCanonicalCount(uint16_t count) {
     if (count >= kParachuteCountsPerRevolution)
       return std::nullopt;
     return AbsoluteParachuteAngle{count};
+  }
+
+  // STS3215のcurrent position rawはbit15=sign、bit0..14=magnitudeであり、
+  // step/multi-turn動作では1回転を越える。機構の絶対角として使う際は
+  // signed positionを1回転内の0..4095へwrapする。
+  // 保存済みendpoint/checkpointの検証にはfromCanonicalCount()を使うこと。
+  [[nodiscard]] static constexpr std::optional<AbsoluteParachuteAngle>
+  fromCount(uint16_t raw_count) {
+    const int32_t magnitude = static_cast<int32_t>(raw_count & 0x7FFFU);
+    const int32_t signed_count =
+        (raw_count & 0x8000U) != 0U ? -magnitude : magnitude;
+    int32_t wrapped = signed_count % kParachuteCountsPerRevolution;
+    if (wrapped < 0)
+      wrapped += kParachuteCountsPerRevolution;
+    return fromCanonicalCount(static_cast<uint16_t>(wrapped));
   }
 
   [[nodiscard]] constexpr uint16_t count() const { return count_; }
@@ -263,7 +279,8 @@ decodeParachuteEndpoint(const uint8_t *data, std::size_t size,
     return {std::nullopt, ParachuteBlobError::wrong_payload_size};
   if (readLe16(data + 10) != 0)
     return {std::nullopt, ParachuteBlobError::reserved_nonzero};
-  const auto angle = AbsoluteParachuteAngle::fromCount(readLe16(data + 8));
+  const auto angle =
+      AbsoluteParachuteAngle::fromCanonicalCount(readLe16(data + 8));
   if (!angle.has_value())
     return {std::nullopt, ParachuteBlobError::angle_out_of_range};
   return {angle, ParachuteBlobError::none};

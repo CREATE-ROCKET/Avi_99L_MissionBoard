@@ -27,7 +27,7 @@ void require(bool condition, const char *message) {
 }
 
 AbsoluteParachuteAngle angle(uint16_t count) {
-  const auto value = AbsoluteParachuteAngle::fromCount(count);
+  const auto value = AbsoluteParachuteAngle::fromCanonicalCount(count);
   require(value.has_value(), "test angle must be valid");
   return *value;
 }
@@ -54,8 +54,27 @@ void requireCorruptNullopt(const ParachuteEndpointBlob &blob,
 void testAbsoluteAnglesAndConfiguration() {
   require(angle(0).count() == 0, "count zero must be valid");
   require(angle(4095).count() == 4095, "count 4095 must be valid");
-  require(!AbsoluteParachuteAngle::fromCount(4096).has_value(),
-          "count 4096 must not be normalized");
+  require(!AbsoluteParachuteAngle::fromCanonicalCount(4096).has_value(),
+          "canonical count 4096 must remain invalid");
+
+  const auto one_turn = AbsoluteParachuteAngle::fromCount(4096);
+  require(one_turn.has_value() && one_turn->count() == 0,
+          "STS +1 turn must wrap to zero");
+  const auto positive_multi_turn = AbsoluteParachuteAngle::fromCount(
+      static_cast<uint16_t>(7 * actuators::kParachuteCountsPerRevolution +
+                            321));
+  require(positive_multi_turn.has_value() &&
+              positive_multi_turn->count() == 321,
+          "STS positive multi-turn position must wrap to one turn");
+  const auto negative_one = AbsoluteParachuteAngle::fromCount(0x8001U);
+  require(negative_one.has_value() && negative_one->count() == 4095,
+          "STS signed-magnitude -1 must wrap to 4095");
+  const auto negative_turn = AbsoluteParachuteAngle::fromCount(0x9000U);
+  require(negative_turn.has_value() && negative_turn->count() == 0,
+          "STS signed-magnitude -4096 must wrap to zero");
+  const auto negative_4095 = AbsoluteParachuteAngle::fromCount(0x8FFFU);
+  require(negative_4095.has_value() && negative_4095->count() == 1,
+          "STS signed-magnitude -4095 must wrap to one");
 
   ParachuteConfiguration configuration{};
   require(!configuration.openConfigured() && !configuration.closeConfigured(),
@@ -164,7 +183,7 @@ void testBlobValidation() {
   refreshCrc(blob);
   requireCorruptNullopt(blob, ParachuteEndpoint::open,
                         ParachuteBlobError::angle_out_of_range,
-                        "out-of-range count must not be normalized");
+                        "out-of-range stored count must not be normalized");
 }
 
 void testTransactionAndRebootLoad() {

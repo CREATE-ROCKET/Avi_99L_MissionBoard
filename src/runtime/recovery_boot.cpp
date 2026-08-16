@@ -322,13 +322,13 @@ bool loadFlightParachuteConfiguration(
           parachuteCheckpointChecksum(parachute_checkpoint))
     return false;
   if ((parachute_checkpoint.valid_mask & kOpenValid) != 0) {
-    configuration.open = actuators::AbsoluteParachuteAngle::fromCount(
+    configuration.open = actuators::AbsoluteParachuteAngle::fromCanonicalCount(
         parachute_checkpoint.open_count);
     if (!configuration.open.has_value())
       return false;
   }
   if ((parachute_checkpoint.valid_mask & kCloseValid) != 0) {
-    configuration.close = actuators::AbsoluteParachuteAngle::fromCount(
+    configuration.close = actuators::AbsoluteParachuteAngle::fromCanonicalCount(
         parachute_checkpoint.close_count);
     if (!configuration.close.has_value())
       return false;

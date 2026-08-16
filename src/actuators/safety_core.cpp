@@ -25,7 +25,8 @@ void PowerArbiter::latchDeploymentCutoff() {
 ParachuteAction
 ParachuteController::startOpen(uint64_t now_us,
                               uint16_t initial_position_count) {
-  if (!AbsoluteParachuteAngle::fromCount(initial_position_count).has_value() ||
+  if (!AbsoluteParachuteAngle::fromCanonicalCount(initial_position_count)
+           .has_value() ||
       status_.state != ParachuteOpenState::idle)
     return ParachuteAction::none;
   status_ = {};
@@ -57,8 +58,10 @@ ParachuteAction ParachuteController::tick(const ParachuteTick &input) {
     return ParachuteAction::none;
 
   bool progressed = false;
-  const auto previous = AbsoluteParachuteAngle::fromCount(window_position_count_);
-  const auto current = AbsoluteParachuteAngle::fromCount(input.position_count);
+  const auto previous =
+      AbsoluteParachuteAngle::fromCanonicalCount(window_position_count_);
+  const auto current =
+      AbsoluteParachuteAngle::fromCanonicalCount(input.position_count);
   if (input.position_valid && previous.has_value() && current.has_value()) {
     const auto displacement = shortestParachuteDisplacement(*previous, *current);
     progressed = displacement.valid() &&
