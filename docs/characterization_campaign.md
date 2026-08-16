@@ -86,15 +86,24 @@ command apply開始または完了が予定epoch終端を越え、かつ次epoch
 
 command apply開始が`epoch_start + 2000 us`以上の場合は遅れたDrive/Brakeを出さずCoastへ倒します。開始時刻は2 ms未満でも適用完了が`epoch_start + 2000 us`以上に達した場合は直ちにCoastへ倒し、`AbortReason::Deadline`で停止します。
 
-consumer releaseがepoch終端から100 usを超えても、notificationがexactly 1で、releaseが1 epoch未満の遅延であり、raw sampleのepoch所属が壊れていない場合はmotor-ID診断として継続します。
+consumer GPTimer tickはtask notification countへ集約せず、ISRで`epoch_index`と`alarm_lateness_us`を付けたstatic FreeRTOS queueへ1件ずつ保存します。task notificationはtick/failure/stopのwake-up signalだけに使用します。
+
+consumer tick queueは4件確保しますが、許可するbacklogは現在tickを含め最大2件です。つまり**最大1 epochだけcatch-up**できます。releaseが100 usを超えても、tick順序が正しく、queue overflowがなく、backlogが2以下、ISR latenessが1 ms未満、releaseがepoch終端から2 ms未満なら診断継続します。queueに残った次epoch tickは次ループで即座に1件ずつ処理します。
+
+`FixedEpochAssembler`はfuture epoch sampleを別bucketへ保存するため、consumer catch-up中もfuture sampleを現在epochへ借用しません。actual capture timestampによる半開区間所属を維持します。
+
+2026-08-16のFV fullでは、epoch 1021で`release-late-us=1045`、旧notification count=2、`consumer-work-us=1040`となり、`ulTaskNotifyTake(pdTRUE)`が2 tickを一括clearしたことで停止しました。このケースはqueue化後、tick backlog=2として1 epoch catch-up対象になります。
 
 release-only遅延は`consumer_lateness_us`、`CHAR_RATE_RESULT release-deadline`、`CHAR_RATE_TIMING`へ残します。新規motor-ID V5 recordではrelease-only遅延を`EpochDeadline`へ昇格しません。
 
 次は引き続きfatalです。
 
 - command applyが2 epoch目へ達する、またはgeneration/epoch順序を保持できない
-- notification coalescing
-- 1 epoch以上のconsumer release遅延
+- consumer tick queue overflow
+- tick epoch順序不一致
+- tick backlogが3以上
+- consumer GPTimer ISR latenessが1 ms以上
+- consumer releaseがepoch終端から2 ms以上遅れる
 - encoder invalid / transport / status error
 - steady-state incomplete / repeated / skipped
 - raw/writer queue overflow
