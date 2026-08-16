@@ -248,28 +248,42 @@ ProfileRunner::ProfileRunner(CampaignStateMachine &campaign,
 bool ProfileRunner::consumerTimerCallback(
     gptimer_handle_t, const gptimer_alarm_event_data_t *event, void *context) {
   auto &runner = *static_cast<ProfileRunner *>(context);
-  // GPTimer ISRでは固定lifetimeのconsumer taskへ通知するだけに留める。
-  // SAFETY: consumerはchar_runtime taskでrun中に削除されず、ISRではI/Oを行わない。
+  // GPTimer ISRでは予定epoch終端をqueueへ1件ずつ保存し、task notificationは
+  // tick/failure/stop共通のwake-up signalとしてだけ使用する。
+  // SAFETY: consumerとstatic queueはProfileRunnerのlifetime中保持される。
   const TaskHandle_t consumer =
       runner.consumer_task_.load(std::memory_order_acquire);
   if (!runner.consumer_timer_running_.load(std::memory_order_acquire) ||
       consumer == nullptr)
     return false;
 
-  if (event != nullptr) {
-    const std::uint64_t lateness =
-        event->count_value >= event->alarm_value
-            ? event->count_value - event->alarm_value
-            : 0U;
-    const std::uint32_t lateness_us = saturateU32(lateness);
-    portENTER_CRITICAL_ISR(&g_consumer_timing_lock);
-    g_consumer_last_alarm_lateness_us = lateness_us;
-    g_consumer_max_alarm_lateness_us =
-        std::max(g_consumer_max_alarm_lateness_us, lateness_us);
-    portEXIT_CRITICAL_ISR(&g_consumer_timing_lock);
+  BaseType_t task_awoken = pdFALSE;
+  if (event == nullptr || runner.consumer_tick_queue_ == nullptr) {
+    runner.consumer_tick_queue_overflow_.store(true,
+                                               std::memory_order_release);
+    vTaskNotifyGiveFromISR(consumer, &task_awoken);
+    return task_awoken == pdTRUE;
   }
 
-  BaseType_t task_awoken = pdFALSE;
+  const std::uint64_t lateness =
+      event->count_value >= event->alarm_value
+          ? event->count_value - event->alarm_value
+          : 0U;
+  const std::uint32_t lateness_us = saturateU32(lateness);
+  portENTER_CRITICAL_ISR(&g_consumer_timing_lock);
+  g_consumer_last_alarm_lateness_us = lateness_us;
+  g_consumer_max_alarm_lateness_us =
+      std::max(g_consumer_max_alarm_lateness_us, lateness_us);
+  portEXIT_CRITICAL_ISR(&g_consumer_timing_lock);
+
+  ConsumerTick tick{};
+  tick.epoch_index = runner.consumer_tick_generation_++;
+  tick.alarm_lateness_us = lateness_us;
+  if (xQueueSendFromISR(runner.consumer_tick_queue_, &tick, &task_awoken) !=
+      pdTRUE) {
+    runner.consumer_tick_queue_overflow_.store(true,
+                                               std::memory_order_release);
+  }
   vTaskNotifyGiveFromISR(consumer, &task_awoken);
   return task_awoken == pdTRUE;
 }
@@ -283,6 +297,19 @@ esp_err_t ProfileRunner::startConsumerTimer(
   const TaskHandle_t consumer = xTaskGetCurrentTaskHandle();
   if (consumer == nullptr)
     return ESP_ERR_INVALID_STATE;
+
+  if (consumer_tick_queue_ == nullptr) {
+    consumer_tick_queue_ = xQueueCreateStatic(
+        static_cast<UBaseType_t>(kConsumerTickQueueDepth),
+        sizeof(ConsumerTick), consumer_tick_queue_storage_.data(),
+        &consumer_tick_queue_control_);
+    if (consumer_tick_queue_ == nullptr)
+      return ESP_ERR_NO_MEM;
+  }
+  xQueueReset(consumer_tick_queue_);
+  consumer_tick_generation_ = 0U;
+  consumer_tick_queue_overflow_.store(false, std::memory_order_release);
+
   consumer_task_.store(consumer);
   writer_.setFailureNotificationTask(consumer);
   sampler_.setFailureNotificationTask(consumer);
@@ -327,6 +354,10 @@ esp_err_t ProfileRunner::stopConsumerTimer() noexcept {
   sampler_.setFailureNotificationTask(nullptr);
   power_sampler_.setFailureNotificationTask(nullptr);
   consumer_task_.store(nullptr, std::memory_order_release);
+  if (consumer_tick_queue_ != nullptr)
+    xQueueReset(consumer_tick_queue_);
+  consumer_tick_generation_ = 0U;
+  consumer_tick_queue_overflow_.store(false, std::memory_order_release);
   return result;
 }
 
@@ -1049,17 +1080,64 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
                    saturateU32(wait_entry_us - epoch_end));
     }
 
-    const std::uint32_t consumer_notifications =
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    ConsumerTick consumer_tick{};
+    bool consumer_tick_received = false;
+    for (;;) {
+      if (consumer_tick_queue_overflow_.load(std::memory_order_acquire)) {
+        ++consumer_schedule_misses;
+        ++runtime_deadline_misses;
+        stopForFatal(ESP_ERR_TIMEOUT, AbortReason::Deadline, nowUs());
+        if (full && !full_deadline_diagnostic_printed) {
+          std::printf(
+              "CHAR_FULL_ABORT_TIMING epoch=%u episode=%u phase=%u "
+              "reason=tick-queue-overflow apply-start-late-us=0 "
+              "apply-duration-us=0 apply-complete-late-us=0 "
+              "release-late-us=0 notifications=%u consumer-work-us=%u "
+              "fin-angle-mdeg=%d command-permille=%d\n",
+              static_cast<unsigned>(epoch),
+              static_cast<unsigned>(episode.episode_index),
+              static_cast<unsigned>(episode.phase),
+              consumer_tick_queue_ == nullptr
+                  ? 0U
+                  : static_cast<unsigned>(
+                        uxQueueMessagesWaiting(consumer_tick_queue_)),
+              static_cast<unsigned>(current_consumer_work_us),
+              static_cast<int>(fin_angle),
+              static_cast<int>(request.command_permille));
+          full_deadline_diagnostic_printed = true;
+        }
+        break;
+      }
+      if (consumer_tick_queue_ != nullptr &&
+          xQueueReceive(consumer_tick_queue_, &consumer_tick, 0U) == pdTRUE) {
+        consumer_tick_received = true;
+        break;
+      }
+      if (stopForLatchedFailure())
+        break;
+      if (stop_requested_.load()) {
+        stopForFatal(ESP_ERR_INVALID_STATE, AbortReason::StopRequested,
+                     nowUs());
+        break;
+      }
+      // notificationはtick件数の正本ではなく、tick/failure/stopのwake-upだけに使う。
+      (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    }
+    if (!consumer_tick_received)
+      break;
     if (stopForLatchedFailure())
       break;
+
     const std::uint64_t release_us = nowUs();
     const std::uint32_t release_lateness_us =
         release_us > epoch_end ? saturateU32(release_us - epoch_end) : 0U;
-    std::uint32_t alarm_lateness_us = 0U;
-    portENTER_CRITICAL(&g_consumer_timing_lock);
-    alarm_lateness_us = g_consumer_last_alarm_lateness_us;
-    portEXIT_CRITICAL(&g_consumer_timing_lock);
+    const std::uint32_t alarm_lateness_us = consumer_tick.alarm_lateness_us;
+    const std::uint32_t consumer_tick_backlog =
+        1U + static_cast<std::uint32_t>(
+                 uxQueueMessagesWaiting(consumer_tick_queue_));
+    const bool tick_queue_overflow =
+        consumer_tick_queue_overflow_.load(std::memory_order_acquire);
+    const bool tick_matches_epoch = consumer_tick.epoch_index == epoch;
     const std::uint32_t isr_to_task_us =
         release_lateness_us >= alarm_lateness_us
             ? release_lateness_us - alarm_lateness_us
@@ -1085,17 +1163,21 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
     if (last_abort_reason_ == AbortReason::StopRequested &&
         release_us < epoch_end)
       break;
+
     const bool release_deadline_missed =
         release_us > epoch_end + kConsumerDeadlineBudgetUs;
+    const bool one_epoch_catchup_allowed =
+        tick_matches_epoch && !tick_queue_overflow &&
+        consumer_tick_backlog <= 2U &&
+        alarm_lateness_us < kEpochDurationUs &&
+        release_us < epoch_end + 2U * kEpochDurationUs;
     if (release_deadline_missed) {
       ++release_deadline_misses;
-      if (consumer_notifications == 1U &&
-          release_us < epoch_end + kEpochDurationUs) {
-        // motor-IDはactual timestampで解析するため、固定epoch順序が保たれる1 epoch未満の
-        // release遅延は診断として継続する。flight realtime qualificationとは分離する。
+      if (one_epoch_catchup_allowed) {
+        // tick queueが各epochを保持するため、最大1 epoch分のbacklogは1件ずつreleaseして
+        // hardware timer位相へ追いつける。actual timestampはV5へそのまま残す。
         ++diagnostic_continuations;
       } else {
-        // notification coalescingまたは1 epoch以上の遅延はepoch順序を保証できない。
         ++runtime_deadline_misses;
         stopForFatal(ESP_ERR_TIMEOUT, AbortReason::Deadline, release_us);
         if (full && !full_deadline_diagnostic_printed) {
@@ -1112,8 +1194,15 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
                   ? saturateU32(apply_completed_us - apply_started_us)
                   : 0U;
           const char *deadline_reason =
-              consumer_notifications != 1U ? "notification-coalesced"
-                                           : "release-hard";
+              tick_queue_overflow
+                  ? "tick-queue-overflow"
+                  : (!tick_matches_epoch
+                         ? "tick-order"
+                         : (consumer_tick_backlog > 2U
+                                ? "tick-backlog"
+                                : (alarm_lateness_us >= kEpochDurationUs
+                                       ? "alarm-hard"
+                                       : "release-hard")));
           std::printf(
               "CHAR_FULL_ABORT_TIMING epoch=%u episode=%u phase=%u "
               "reason=%s apply-start-late-us=%lld apply-duration-us=%u "
@@ -1126,7 +1215,7 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
               apply_start_late_us, static_cast<unsigned>(apply_duration_us),
               apply_complete_late_us,
               static_cast<unsigned>(release_lateness_us),
-              static_cast<unsigned>(consumer_notifications),
+              static_cast<unsigned>(consumer_tick_backlog),
               static_cast<unsigned>(current_consumer_work_us),
               static_cast<int>(fin_angle),
               static_cast<int>(request.command_permille));
@@ -1136,8 +1225,9 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
     }
     const bool consumer_schedule_invalid =
         !release_deadline_missed &&
-        (consumer_notifications != 1U || release_us < epoch_end ||
-         release_us >= epoch_end + kEpochDurationUs);
+        (!tick_matches_epoch || tick_queue_overflow ||
+         consumer_tick_backlog > 2U ||
+         alarm_lateness_us >= kEpochDurationUs || release_us < epoch_end);
     if (consumer_schedule_invalid) {
       ++consumer_schedule_misses;
       ++runtime_deadline_misses;
@@ -1166,7 +1256,7 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
             static_cast<unsigned>(episode.phase), apply_start_late_us,
             static_cast<unsigned>(apply_duration_us), apply_complete_late_us,
             static_cast<unsigned>(release_lateness_us),
-            static_cast<unsigned>(consumer_notifications),
+            static_cast<unsigned>(consumer_tick_backlog),
             static_cast<unsigned>(current_consumer_work_us),
             static_cast<int>(fin_angle),
             static_cast<int>(request.command_permille));
