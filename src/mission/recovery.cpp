@@ -4,22 +4,25 @@ namespace mission {
 namespace {
 
 constexpr uint32_t kRecoveryMagic = 0x39394C52;
-constexpr uint16_t kRecoveryVersion = 1;
+constexpr uint16_t kRecoveryVersion = 2;
 
 } // 無名名前空間
 
 uint16_t recoveryMarkerChecksum(const RecoveryMarker &marker) {
-  uint32_t value = marker.magic ^
+  uint64_t value = marker.magic ^
                    (static_cast<uint32_t>(marker.version) << 16U) ^
-                   marker.wake_sequence ^
+                   marker.wake_sequence ^ marker.entry_rtc_time_us ^
+                   (marker.entry_rtc_time_us >> 32U) ^
                    (marker.recovery_requested ? 0xA55AA55AU : 0U);
+  value ^= value >> 32U;
   value ^= value >> 16U;
   return static_cast<uint16_t>(value);
 }
 
-RecoveryMarker makeRecoveryMarker(uint32_t wake_sequence) {
+RecoveryMarker makeRecoveryMarker(uint32_t wake_sequence,
+                                  uint64_t entry_rtc_time_us) {
   RecoveryMarker marker{kRecoveryMagic, kRecoveryVersion, 0, wake_sequence,
-                        true};
+                        entry_rtc_time_us, true};
   marker.checksum = recoveryMarkerChecksum(marker);
   return marker;
 }
