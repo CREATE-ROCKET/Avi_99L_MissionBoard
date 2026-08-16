@@ -13,22 +13,18 @@ enum class StartMode : uint8_t { normal, forced };
 
 enum class PreflightReadinessBit : uint8_t {
   fin_zero_configured = 0,
-  parachute_open_configured = 1,
-  parachute_close_configured = 2,
-  motor_profile_valid = 3,
-  gyro_bias_valid = 4,
-  gravity_reference_valid = 5,
-  ssc_zero_valid = 6,
+  motor_profile_valid = 1,
+  gyro_bias_valid = 2,
+  gravity_reference_valid = 3,
+  ssc_zero_valid = 4,
 };
 
-constexpr uint8_t kPreflightReadinessMask = 0x7FU;
+constexpr uint8_t kPreflightReadinessMask = 0x1FU;
 
 struct PreflightReadinessSnapshot {
   uint32_t generation{};
   uint64_t captured_at_us{};
   bool fin_zero_configured{};
-  bool parachute_open_configured{};
-  bool parachute_close_configured{};
   bool motor_profile_valid{};
   bool gyro_bias_valid{};
   bool gravity_reference_valid{};

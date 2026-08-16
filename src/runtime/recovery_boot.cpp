@@ -32,20 +32,6 @@ struct FlightCheckpointRecord {
 };
 RTC_DATA_ATTR FlightCheckpointRecord flight_checkpoint{};
 
-constexpr uint32_t kParachuteCheckpointMagic = 0x39395043;
-constexpr uint8_t kParachuteCheckpointVersion = 2;
-constexpr uint8_t kOpenValid = 1U << 0U;
-constexpr uint8_t kCloseValid = 1U << 1U;
-struct ParachuteCheckpointRecord {
-  uint32_t magic{};
-  uint8_t version{};
-  uint8_t valid_mask{};
-  uint16_t open_count{};
-  uint16_t close_count{};
-  uint16_t checksum{};
-};
-RTC_DATA_ATTR ParachuteCheckpointRecord parachute_checkpoint{};
-
 constexpr uint32_t kStartReadinessAuditMagic = 0x39395341;
 constexpr uint8_t kStartReadinessAuditVersion = 1;
 struct StartReadinessAuditRecord {
@@ -60,8 +46,7 @@ struct StartReadinessAuditRecord {
 };
 RTC_DATA_ATTR StartReadinessAuditRecord start_readiness_audit{};
 
-uint16_t startReadinessAuditChecksum(
-    const StartReadinessAuditRecord &record) {
+uint16_t startReadinessAuditChecksum(const StartReadinessAuditRecord &record) {
   uint64_t value = record.magic ^
                    (static_cast<uint32_t>(record.version) << 24U) ^
                    (static_cast<uint32_t>(record.ready_mask) << 16U) ^
@@ -80,20 +65,9 @@ bool validStartReadinessAudit(const StartReadinessAuditRecord &record) {
       mission::kPreflightReadinessMask);
   return record.magic == kStartReadinessAuditMagic &&
          record.version == kStartReadinessAuditVersion &&
-         record.generation != 0 &&
-         masks == mission::kPreflightReadinessMask &&
+         record.generation != 0 && masks == mission::kPreflightReadinessMask &&
          (record.ready_mask & record.missing_mask) == 0 &&
          record.checksum == startReadinessAuditChecksum(record);
-}
-
-uint16_t parachuteCheckpointChecksum(const ParachuteCheckpointRecord &record) {
-  uint32_t value = record.magic ^
-                   (static_cast<uint32_t>(record.version) << 24U) ^
-                   (static_cast<uint32_t>(record.valid_mask) << 16U) ^
-                   (static_cast<uint32_t>(record.open_count) << 16U) ^
-                   record.close_count;
-  value ^= value >> 16U;
-  return static_cast<uint16_t>(value);
 }
 
 uint16_t checkpointChecksum(const FlightCheckpointRecord &record) {
@@ -101,7 +75,8 @@ uint16_t checkpointChecksum(const FlightCheckpointRecord &record) {
                    (static_cast<uint32_t>(record.version) << 16U) ^
                    record.flight_epoch ^ record.elapsed_us ^
                    (record.elapsed_us >> 32U) ^ record.rtc_time_us ^
-                   (record.rtc_time_us >> 32U) ^ record.preflight_captured_at_us ^
+                   (record.rtc_time_us >> 32U) ^
+                   record.preflight_captured_at_us ^
                    (record.preflight_captured_at_us >> 32U) ^
                    record.preflight_generation ^
                    (static_cast<uint32_t>(record.state) << 24U) ^
@@ -133,8 +108,8 @@ bool validFlightCheckpoint(const FlightCheckpointRecord &record) {
   const bool masks_disjoint =
       (record.preflight_ready_mask & record.preflight_missing_mask) == 0;
   return record.magic == kFlightCheckpointMagic &&
-         record.version == kFlightCheckpointVersion && record.flight_epoch != 0 &&
-         state_valid && elapsed_contract &&
+         record.version == kFlightCheckpointVersion &&
+         record.flight_epoch != 0 && state_valid && elapsed_contract &&
          masks == mission::kPreflightReadinessMask && masks_disjoint &&
          record.checksum == checkpointChecksum(record);
 }
@@ -187,10 +162,12 @@ void storeStartReadinessAudit(
 void clearStartReadinessAudit() { start_readiness_audit = {}; }
 
 bool markerValid() { return mission::validRecoveryMarker(recovery_marker); }
+
 bool wakeCauseValid() {
   return (esp_sleep_get_wakeup_causes() &
           (uint32_t{1} << ESP_SLEEP_WAKEUP_TIMER)) != 0;
 }
+
 uint32_t wakeSequence() {
   return mission::validRecoveryMarker(recovery_marker)
              ? recovery_marker.wake_sequence
@@ -248,6 +225,7 @@ void prepareMarker() {
   recovery_marker = mission::makeRecoveryMarker(
       wakeSequence() + 1U, recovery_marker.entry_rtc_time_us);
 }
+
 void clearMarker() { recovery_marker = {}; }
 
 bool loadFlightCheckpoint(mission::ResetCheckpoint &checkpoint) {
@@ -259,13 +237,15 @@ bool loadFlightCheckpoint(mission::ResetCheckpoint &checkpoint) {
     const uint64_t rtc_now_us = esp_rtc_get_time_us();
     if (rtc_now_us < flight_checkpoint.rtc_time_us)
       return false;
-    const uint64_t reset_elapsed_us = rtc_now_us - flight_checkpoint.rtc_time_us;
+    const uint64_t reset_elapsed_us =
+        rtc_now_us - flight_checkpoint.rtc_time_us;
     if (UINT64_MAX - elapsed < reset_elapsed_us)
       return false;
     elapsed += reset_elapsed_us;
   }
   checkpoint.valid = true;
-  checkpoint.state = static_cast<protocol::MissionState>(flight_checkpoint.state);
+  checkpoint.state =
+      static_cast<protocol::MissionState>(flight_checkpoint.state);
   checkpoint.flight_epoch = flight_checkpoint.flight_epoch;
   checkpoint.elapsed_valid = flight_checkpoint.elapsed_valid;
   checkpoint.elapsed_us = elapsed;
@@ -309,54 +289,13 @@ void storeFlightCheckpoint(const mission::MissionSnapshot &snapshot) {
   record.checksum = checkpointChecksum(record);
   flight_checkpoint = record;
 }
+
 void clearFlightCheckpoint() { flight_checkpoint = {}; }
-
-bool loadFlightParachuteConfiguration(
-    actuators::FlightParachuteConfiguration &configuration) {
-  configuration = {};
-  if (!resetPreservesRtcMemory() ||
-      parachute_checkpoint.magic != kParachuteCheckpointMagic ||
-      parachute_checkpoint.version != kParachuteCheckpointVersion ||
-      (parachute_checkpoint.valid_mask & ~(kOpenValid | kCloseValid)) != 0 ||
-      parachute_checkpoint.checksum !=
-          parachuteCheckpointChecksum(parachute_checkpoint))
-    return false;
-  if ((parachute_checkpoint.valid_mask & kOpenValid) != 0) {
-    configuration.open = actuators::AbsoluteParachuteAngle::fromCanonicalCount(
-        parachute_checkpoint.open_count);
-    if (!configuration.open.has_value())
-      return false;
-  }
-  if ((parachute_checkpoint.valid_mask & kCloseValid) != 0) {
-    configuration.close = actuators::AbsoluteParachuteAngle::fromCanonicalCount(
-        parachute_checkpoint.close_count);
-    if (!configuration.close.has_value())
-      return false;
-  }
-  return true;
-}
-
-void storeFlightParachuteConfiguration(
-    const actuators::FlightParachuteConfiguration &configuration) {
-  ParachuteCheckpointRecord record{};
-  record.magic = kParachuteCheckpointMagic;
-  record.version = kParachuteCheckpointVersion;
-  if (configuration.open.has_value()) {
-    record.valid_mask |= kOpenValid;
-    record.open_count = configuration.open->count();
-  }
-  if (configuration.close.has_value()) {
-    record.valid_mask |= kCloseValid;
-    record.close_count = configuration.close->count();
-  }
-  record.checksum = parachuteCheckpointChecksum(record);
-  parachute_checkpoint = record;
-}
-void clearFlightParachuteConfiguration() { parachute_checkpoint = {}; }
 
 [[noreturn]] void enterPeriodicDeepSleep() {
   prepareMarker();
-  (void)esp_sleep_enable_timer_wakeup(mission::RecoveryRuntime::periodicWakeUs());
+  (void)esp_sleep_enable_timer_wakeup(
+      mission::RecoveryRuntime::periodicWakeUs());
   esp_deep_sleep_start();
 }
 

@@ -31,6 +31,12 @@ bool commandKnown(CommandCode code) {
          (raw >= 0x30 && raw <= 0x31) || raw == 0x33;
 }
 
+bool unsupportedParachuteCommand(CommandCode code) {
+  const uint8_t raw = static_cast<uint8_t>(code);
+  return raw >= static_cast<uint8_t>(CommandCode::para_free) &&
+         raw <= static_cast<uint8_t>(CommandCode::set_para_close);
+}
+
 CommandDomain domainFor(CommandCode code) {
   switch (code) {
   case CommandCode::start_sequence:
@@ -68,13 +74,6 @@ bool argumentsValid(const GenericCommandRequest &request, CommandCode code) {
     // 0x13は旧relative-move実装を0deg移動として利用し、受信時の現在角を
     // targetへcaptureしてその位置を保持する。任意相対移動は公開しない。
     return allZero(request, 0);
-  case CommandCode::para_move_relative: {
-    if (!allZero(request, 2))
-      return false;
-    const auto raw = static_cast<uint16_t>(request.arguments[0]) |
-                     static_cast<uint16_t>(request.arguments[1]) << 8U;
-    return std::abs(static_cast<int32_t>(static_cast<int16_t>(raw))) < 1800;
-  }
   default:
     return allZero(request, 0);
   }
@@ -88,11 +87,6 @@ bool stateValid(CommandCode code, MissionState state) {
   case CommandCode::set_fin_zero:
   case CommandCode::start_fin_zero_hold:
   case CommandCode::fin_move_relative:
-  case CommandCode::para_free:
-  case CommandCode::para_hold:
-  case CommandCode::para_move_relative:
-  case CommandCode::set_para_open:
-  case CommandCode::set_para_close:
   case CommandCode::para_open:
   case CommandCode::para_close:
   case CommandCode::run_preflight_calibration:
@@ -150,6 +144,9 @@ CommandDecision CommandExecutor::begin(const GenericCommandRequest &request,
   CommandReason rejection = CommandReason::none;
   if (!commandKnown(code))
     rejection = CommandReason::not_supported;
+  else if (unsupportedParachuteCommand(code))
+    // 廃止commandは引数/state/busyに依存せず、常に副作用なしNotSupported。
+    rejection = CommandReason::not_supported;
   else if (!argumentsValid(request, code))
     rejection = CommandReason::invalid_argument;
   else if (!stateValid(code, context.state))
@@ -166,10 +163,6 @@ CommandDecision CommandExecutor::begin(const GenericCommandRequest &request,
     rejection = CommandReason::busy;
   else if (isStart(code) && !context.resources_preallocated)
     rejection = CommandReason::internal_error;
-  else if (isStart(code) && !context.persistence_load_complete)
-    rejection = CommandReason::busy;
-  else if (isStart(code) && !context.persistence_runtime_available)
-    rejection = CommandReason::persistence_error;
   else if (domain == CommandDomain::parachute && busy(CommandDomain::sequence))
     rejection = CommandReason::busy;
   else if ((domain == CommandDomain::fin && !context.fin_available) ||
@@ -202,7 +195,8 @@ CommandDecision CommandExecutor::begin(const GenericCommandRequest &request,
     remember(request, result, false, domain);
     return {result, false, false, domain};
   }
-  const auto result = resultFor(request, CommandPhase::accepted, CommandReason::none);
+  const auto result =
+      resultFor(request, CommandPhase::accepted, CommandReason::none);
   remember(request, result, true, domain);
   return {result, true, false, domain};
 }
@@ -230,14 +224,16 @@ CommandResult CommandExecutor::finish(uint8_t transaction_id,
 EmergencyDecision CommandExecutor::actuatorEmergency(uint8_t transaction_id,
                                                       MissionState state) {
   EmergencyDecision decision{};
-  const bool accepted = transaction_id != 0 && state == MissionState::command_receive;
-  decision.result = {transaction_id,
-                     static_cast<uint8_t>(CommandCode::actuator_emergency_result),
-                     accepted ? CommandPhase::completed : CommandPhase::rejected,
-                     accepted ? CommandReason::none
-                              : (transaction_id == 0 ? CommandReason::invalid_argument
-                                                     : CommandReason::invalid_state),
-                     0};
+  const bool accepted =
+      transaction_id != 0 && state == MissionState::command_receive;
+  decision.result = {
+      transaction_id,
+      static_cast<uint8_t>(CommandCode::actuator_emergency_result),
+      accepted ? CommandPhase::completed : CommandPhase::rejected,
+      accepted ? CommandReason::none
+               : (transaction_id == 0 ? CommandReason::invalid_argument
+                                      : CommandReason::invalid_state),
+      0};
   decision.execute = accepted;
   if (!decision.execute)
     return decision;
@@ -269,43 +265,57 @@ CommandResult CommandExecutor::liftoffEmergencyResult(uint8_t transaction_id,
 }
 
 bool CommandExecutor::busy(CommandDomain domain) const {
-  return std::any_of(entries_.begin(), entries_.end(), [domain](const Entry &entry) {
-    return entry.valid && entry.pending && entry.domain == domain;
-  });
+  return std::any_of(entries_.begin(), entries_.end(),
+                     [domain](const Entry &entry) {
+                       return entry.valid && entry.pending &&
+                              entry.domain == domain;
+                     });
 }
 
 std::size_t CommandExecutor::cachedCount() const {
   return static_cast<std::size_t>(std::count_if(
-      entries_.begin(), entries_.end(), [](const Entry &entry) { return entry.valid; }));
+      entries_.begin(), entries_.end(),
+      [](const Entry &entry) { return entry.valid; }));
 }
 
 CommandExecutor::Entry *CommandExecutor::find(uint8_t transaction_id) {
   const auto iterator = std::find_if(entries_.begin(), entries_.end(),
                                      [transaction_id](const Entry &entry) {
-    return entry.valid && entry.request.transaction_id == transaction_id;
-  });
+                                       return entry.valid &&
+                                              entry.request.transaction_id ==
+                                                  transaction_id;
+                                     });
   return iterator == entries_.end() ? nullptr : &*iterator;
 }
-const CommandExecutor::Entry *CommandExecutor::find(uint8_t transaction_id) const {
+
+const CommandExecutor::Entry *
+CommandExecutor::find(uint8_t transaction_id) const {
   const auto iterator = std::find_if(entries_.begin(), entries_.end(),
                                      [transaction_id](const Entry &entry) {
-    return entry.valid && entry.request.transaction_id == transaction_id;
-  });
+                                       return entry.valid &&
+                                              entry.request.transaction_id ==
+                                                  transaction_id;
+                                     });
   return iterator == entries_.end() ? nullptr : &*iterator;
 }
+
 CommandExecutor::Entry *CommandExecutor::allocate() {
   const auto unused = std::find_if(entries_.begin(), entries_.end(),
-                                   [](const Entry &entry) { return !entry.valid; });
+                                   [](const Entry &entry) {
+                                     return !entry.valid;
+                                   });
   if (unused != entries_.end())
     return &*unused;
   auto oldest = entries_.end();
-  for (auto iterator = entries_.begin(); iterator != entries_.end(); ++iterator) {
+  for (auto iterator = entries_.begin(); iterator != entries_.end();
+       ++iterator) {
     if (!iterator->pending &&
         (oldest == entries_.end() || iterator->age < oldest->age))
       oldest = iterator;
   }
   return oldest == entries_.end() ? nullptr : &*oldest;
 }
+
 void CommandExecutor::remember(const GenericCommandRequest &request,
                                const CommandResult &result, bool pending,
                                CommandDomain domain) {

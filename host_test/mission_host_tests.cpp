@@ -381,7 +381,7 @@ void testMissionStateMachine() {
   using protocol::MissionState;
 
   const PreflightReadinessSnapshot ready{1, 1234, true, true, true, true,
-                                         true, true, true, true};
+                                         true, true};
 
   MissionStateMachine cancelled;
   assert(cancelled.startSequence(0, ready, StartMode::normal) ==
@@ -399,9 +399,8 @@ void testMissionStateMachine() {
 
   auto missing = ready;
   missing.generation = 2;
-  missing.parachute_close_configured = false;
   missing.gyro_bias_valid = false;
-  assert(missing.missingMask() == ((1U << 2U) | (1U << 4U)));
+  assert(missing.missingMask() == (1U << 2U));
   MissionStateMachine normal_missing;
   assert(normal_missing.startSequence(0, missing, StartMode::normal) ==
          TransitionResult::not_configured);
@@ -599,10 +598,27 @@ void testCommandExecutor() {
 
   CommandContext context{};
   context.resources_preallocated = true;
-  context.persistence_load_complete = true;
-  context.persistence_runtime_available = true;
   context.fin_safe_commands_supported = true;
   context.calibration_supported = true;
+
+
+  // 旧パラシュートcommandはstate/argsより先にNotSupportedとし、
+  // 同一transaction replayでもservo操作へ到達させない。
+  CommandExecutor retired_executor;
+  for (uint8_t raw = static_cast<uint8_t>(CommandCode::para_free);
+       raw <= static_cast<uint8_t>(CommandCode::set_para_close); ++raw) {
+    CommandContext retired_context = context;
+    retired_context.state = MissionState::engine_burn;
+    auto retired = command(static_cast<uint8_t>(0xD0U + raw - 0x20U), raw);
+    retired.arguments[0] = 0xA5;
+    auto retired_decision = retired_executor.begin(retired, retired_context);
+    assert(!retired_decision.execute && !retired_decision.replay);
+    assert(retired_decision.result.phase == CommandPhase::rejected);
+    assert(retired_decision.result.reason == CommandReason::not_supported);
+    retired_decision = retired_executor.begin(retired, retired_context);
+    assert(!retired_decision.execute && retired_decision.replay);
+    assert(retired_decision.result.reason == CommandReason::not_supported);
+  }
 
   CommandExecutor executor;
   auto decision = executor.begin(
@@ -635,25 +651,7 @@ void testCommandExecutor() {
                     no_resources)
              .result.reason == CommandReason::internal_error);
 
-  CommandExecutor load_gate;
-  auto loading = context;
-  loading.persistence_load_complete = false;
-  assert(load_gate
-             .begin(command(4,
-                            static_cast<uint8_t>(
-                                CommandCode::force_start_sequence)),
-                    loading)
-             .result.reason == CommandReason::busy);
 
-  CommandExecutor persistence_gate;
-  auto persistence_failed = context;
-  persistence_failed.persistence_runtime_available = false;
-  assert(persistence_gate
-             .begin(command(5,
-                            static_cast<uint8_t>(
-                                CommandCode::force_start_sequence)),
-                    persistence_failed)
-             .result.reason == CommandReason::persistence_error);
 
   CommandExecutor force_accept;
   auto force = command(6, static_cast<uint8_t>(CommandCode::force_start_sequence));
@@ -666,7 +664,6 @@ void testCommandExecutor() {
   assert(forced_complete.detail == 0x55);
 
   auto fin = command(7, static_cast<uint8_t>(CommandCode::fin_move_relative));
-  fin.arguments[0] = 10;
   decision = executor.begin(fin, context);
   assert(decision.execute && decision.result.phase == CommandPhase::accepted);
   decision = executor.begin(fin, context);
@@ -704,27 +701,13 @@ void testCommandExecutor() {
   para_limit.arguments[0] = 0x08;
   para_limit.arguments[1] = 0x07;
   assert(executor.begin(para_limit, context).result.reason ==
-         CommandReason::invalid_argument);
+         CommandReason::not_supported);
 
-  CommandExecutor parachute_arguments;
-  auto set_open =
-      command(14, static_cast<uint8_t>(CommandCode::set_para_open));
-  assert(parachute_arguments.begin(set_open, context).execute);
-  (void)parachute_arguments.finish(14, CommandPhase::completed);
-  set_open = command(15, static_cast<uint8_t>(CommandCode::set_para_open));
-  set_open.arguments[0] = 1;
-  assert(parachute_arguments.begin(set_open, context).result.reason ==
-         CommandReason::invalid_argument);
-  auto negative_relative =
-      command(16, static_cast<uint8_t>(CommandCode::para_move_relative));
-  negative_relative.arguments[0] = 0xFF;
-  negative_relative.arguments[1] = 0xFF;
-  assert(parachute_arguments.begin(negative_relative, context).execute);
 
   CommandExecutor start_busy;
   assert(start_busy
              .begin(command(17,
-                            static_cast<uint8_t>(CommandCode::para_hold)),
+                            static_cast<uint8_t>(CommandCode::para_open)),
                     context)
              .execute);
   assert(start_busy
@@ -744,7 +727,7 @@ void testCommandExecutor() {
              .begin(command(20,
                             static_cast<uint8_t>(CommandCode::para_free)),
                     context)
-             .result.reason == CommandReason::busy);
+             .result.reason == CommandReason::not_supported);
 
   CommandExecutor calibration;
   const auto calibration_decision = calibration.begin(

@@ -7,7 +7,7 @@
 namespace {
 
 mission::PreflightReadinessSnapshot readyReadiness() {
-  return {1, 1234, true, true, true, true, true, true, true, true};
+  return {1, 1234, true, true, true, true, true, true};
 }
 
 mission::ControlAvailability readyControl() {
