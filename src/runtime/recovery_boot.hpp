@@ -25,6 +25,9 @@ void clearStartReadinessAudit();
 [[nodiscard]] bool markerValid();
 [[nodiscard]] bool wakeCauseValid();
 [[nodiscard]] uint32_t wakeSequence();
+[[nodiscard]] bool commitRecoveryEntryMarker();
+[[nodiscard]] uint16_t recoveryElapsedRaw(bool recovery_requested,
+                                          bool recovery_only);
 void prepareMarker();
 void clearMarker();
 [[nodiscard]] bool loadFlightCheckpoint(mission::ResetCheckpoint &checkpoint);
