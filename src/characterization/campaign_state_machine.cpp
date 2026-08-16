@@ -95,13 +95,23 @@ CampaignStatus CampaignStateMachine::beginRun(EncoderRate rate,
                                                RunKind kind) noexcept {
   if (state_ != CampaignState::Ready)
     return CampaignStatus::InvalidState;
-  // V5 decoderは旧2/5 kHz値を認識するが、新規実機取得は1 kHzだけ許可する。
-  if (rate != EncoderRate::Hz1000)
-    return CampaignStatus::InvalidArgument;
   const std::size_t index = rateIndex(rate);
   if (index >= rate_results_.size() ||
       (kind != RunKind::RateCheck && kind != RunKind::Full))
     return CampaignStatus::InvalidArgument;
+
+  if (rate != EncoderRate::Hz1000) {
+    // 旧V5 campaign/testがunsupported evidenceを再登録できるようrate-checkの
+    // bookkeepingだけ残す。EncoderSamplerは1 kHz以外を拒否するため新規実機captureは
+    // 開始されない。legacy rateのfullは常に未qualification扱いとする。
+    if (kind == RunKind::Full)
+      return CampaignStatus::RateNotQualified;
+    active_rate_ = rate;
+    active_run_kind_ = kind;
+    state_ = CampaignState::Running;
+    return CampaignStatus::Ok;
+  }
+
   if (kind == RunKind::RateCheck &&
       rate_results_[index] != RateResult::Pending)
     return CampaignStatus::WrongRateOrder;
