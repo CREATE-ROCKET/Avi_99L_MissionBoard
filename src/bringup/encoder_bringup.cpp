@@ -134,6 +134,8 @@ esp_err_t EncoderBringup::recoverPipelinedImpl() {
     AS5047D::Status status{};
     result = sensors::as5047d_health::validateStatus(
         encoder_.getStatus(status), status);
+    if (result == ESP_OK && sensors::as5047d_health::statusFaulted(status))
+      result = ESP_ERR_INVALID_RESPONSE;
   }
   if (result == ESP_OK)
     result = encoder_.startPipelinedRead();
@@ -157,7 +159,12 @@ esp_err_t EncoderBringup::endImpl() { return encoder_.end(); }
 
 esp_err_t EncoderBringup::begin(SpiBringup &spi) {
   ExclusiveGuard guard{busy_};
-  return guard.acquired() ? beginImpl(spi) : ESP_ERR_INVALID_STATE;
+  if (!guard.acquired())
+    return ESP_ERR_INVALID_STATE;
+  const esp_err_t result = beginImpl(spi);
+  if (result != ESP_OK)
+    scheduleRecovery();
+  return result;
 }
 
 esp_err_t EncoderBringup::read(EncoderSample &sample) {
@@ -181,6 +188,9 @@ esp_err_t EncoderBringup::readPipelined(EncoderSample &sample) {
   if (!guard.acquired())
     return ESP_ERR_INVALID_STATE;
 
+  // readPipelined()を呼ぶruntimeはpipeline継続を要求している。
+  // boot時begin/status失敗後もこの要求を記録して1秒retryへ入る。
+  pipeline_requested_ = true;
   if (recovery_required_) {
     const uint64_t now = nowUs();
     if (now < next_recovery_us_)
