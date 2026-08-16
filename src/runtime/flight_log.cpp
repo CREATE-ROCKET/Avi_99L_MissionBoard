@@ -13,7 +13,10 @@ constexpr uint8_t kValidityAirspeed = 1U << 1U;
 constexpr uint8_t kValidityPowerCutoff = 1U << 2U;
 constexpr uint8_t kValidityControlReference = 1U << 3U;
 constexpr uint8_t kValidityFinZero = 1U << 4U;
-constexpr std::size_t kCrcOffset = 172;
+// schema headerのrecord lengthは1 byteなので、v2では0を256 byteのcodeとする。
+constexpr uint8_t kRecordLengthCode = 0U;
+constexpr std::size_t kCrcOffset = 252;
+static_assert(kSerializedRecordBytes == 256U);
 
 void putU16(SerializedRecord &out, std::size_t offset, uint16_t value) {
   out[offset] = static_cast<uint8_t>(value);
@@ -60,7 +63,7 @@ SerializedRecord serialize(const Sample &sample) {
   SerializedRecord out{};
   std::copy(kMagic.begin(), kMagic.end(), out.begin());
   out[4] = kSchemaVersion;
-  out[5] = static_cast<uint8_t>(kSerializedRecordBytes);
+  out[5] = kRecordLengthCode;
   out[6] = sample.state;
   out[7] = (sample.lps_valid ? kValidityLps : 0U) |
            (sample.airspeed_valid ? kValidityAirspeed : 0U) |
@@ -116,15 +119,14 @@ SerializedRecord serialize(const Sample &sample) {
   putU32(out, 148, sample.encoder_sample_age_us);
   putU32(out, 152, sample.encoder_reconnect_count);
   putU32(out, 156, sample.encoder_error_count);
-  // 160..171 reserved for schema v2 extension and kept zero.
+  // 160..251 reserved for schema v2 extension and kept zero.
   putU32(out, kCrcOffset, crc32(out.data(), kCrcOffset));
   return out;
 }
 
 bool validate(const SerializedRecord &record) {
   if (!std::equal(kMagic.begin(), kMagic.end(), record.begin()) ||
-      record[4] != kSchemaVersion ||
-      record[5] != static_cast<uint8_t>(kSerializedRecordBytes))
+      record[4] != kSchemaVersion || record[5] != kRecordLengthCode)
     return false;
   return getU32(record, kCrcOffset) == crc32(record.data(), kCrcOffset);
 }
