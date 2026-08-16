@@ -35,9 +35,9 @@ ICM42688のfreshnessは取得時の`host_timestamp_us`と`esp_timer_get_time()`�
 | motor抵抗 / torque定数 / 無負荷速度 | 3.48 Ω / 0.00855 N·m/A / 1120 rpm | `TODO(HW_TEST)`で個体同定 |
 | drivetrain効率 / motor電流 / 出力torque上限 | 0.60 / 2.0 A / 1.21208 N·m | `TODO(HW_TEST)`で効率・温度・機構負荷を確認 |
 | 用途別requested torque | HoldPosition 0.30 / ZeroHold 0.80 / Roll Gentle 1.21208 / High-authority comparator 3.0 N·m | generic limitとして共用せず、実機同定後に再評価 |
-| motor bus / PWM duty上限 | 9.0 V / 15% | `TODO(HW_TEST)`でADC実測と安全上限を確定 |
+| motor bus / PWM duty上限 | 9.0 V / production追加clamp 100%（bring-up 15%） | `TODO(HW_TEST)`でADC実測と安全上限を確定。productionはTorqueMapperのcurrent/torque/angle制限を維持 |
 | fin software limit | ±14° | `TODO(HW_TEST)`でstopper余裕を確認 |
-| fin zero | production起動後の最初の有効AS5047D角を0°とする | `TODO(HW_TEST)`で機械zero取得手順へ置換 |
+| fin zero | `SetFinZero`正常完了時だけ現在のmotor-side AS5047D位置を0°とする | boot時の最初のsampleから自動設定しない。機械zero手順は`TODO(HW_TEST)`で確定 |
 | para Open / Close / 許容差 | NVSに保存するoptionalな1回転絶対角 / ±2° | Open/Closeは`SetParaOpen` / `SetParaClose`で実機位置を設定し、許容差は`TODO(HW_TEST)`で確定 |
 | para速度 / 加速度 / torque | 180°/s / 360°/s² / 20% | `TODO(HW_TEST)`で開放時間とstall余裕を確認 |
 | para電源安定 / 初期化目安 / retry | 100 ms / 1.5 s / 飛行中20 ms・CommandReceive再接続1 s | `TODO(HW_TEST)`で電源立上り分布を確認 |
@@ -46,7 +46,7 @@ ICM42688のfreshnessは取得時の`host_timestamp_us`と`esp_timer_get_time()`�
 | encoder pipeline | acquisition 1 kHz / consumer 1 kHzの暫定config | 1/2 kHzの最終選択はsystem ID後にconfig差替え |
 | Roll gain | 60〜180 m/sの全点で`{0.08, 2.32, 0.04, 0.296}` | `TODO(SIMULATION)`でSpica/HIL同定値へ置換 |
 
-`config_flags`はbit0=MotorProfile、bit1=fin zero取得、bit2=para Open/Closeの両方設定済み、bit3=SSC zero取得を示します。bit7は暫定値を含みflight qualification未完了であることを常時示します。SSC zeroはCommandReceive中の400 sampleを自動取得する暫定実装です。`StartSequence`自体はbit3未取得でも受理されますが、そのflightではControl gateを通過できないため、bench/HILではbit3を確認してから開始します。再度CommandReceiveへ戻った場合は前flightのzeroを破棄して取り直します。
+`config_flags`はbit0=MotorProfile、bit1=fin zero取得、bit2=para Open/Closeの両方設定済み、bit3=SSC zero取得を示します。bit7は暫定値を含みflight qualification未完了であることを常時示します。SSC zeroはCommandReceive中にrolling更新せず、`RunPreflightCalibration`開始時に旧値をinvalid化し、そのattempt中に取得した400 sampleだけから再取得して完了後freezeします。最新attemptの失敗項目を古い成功値へrollbackしません。通常`StartSequence`はpreflight readinessのmissing bitが残っていれば拒否し、`ForceStartSequence`だけが仕様で定めたbitをbypassします。
 
 Control遷移時には、同じtickで最新かつ未来時刻ではないunwrapped roll角を一度だけ基準角として取得します。角度偏差は最短角へwrapしません。flight epoch更新、CancelSequence、DisableFinControl、LiftoffDetectionEmergencyStop、reset/recovery rollbackで基準角を無効化します。Control input喪失後の再entryは禁止し、保持した基準角を再取得しません。
 
@@ -289,8 +289,8 @@ CANはstandard 11-bit、125 kbit/s、DLC 8以下、multi-byteはlittle-endianで
 
 - NVS para設定は`InternalFlashTask`を唯一ownerとして接続済みです。`SetParaOpen` / `SetParaClose`はfreshなSTS絶対角を保存・commit・readback検証した後だけactive設定を更新します。flight中はOpen target取得のためにNVSを読みません。Internal Flash append logとSD production loggerはowner taskの安全stubまでで、flight pathへ未接続です。software/watchdog reset用checkpointはversion/CRC付きRTC memoryで復旧し、POR後の絶対時刻復旧は未接続のため安全側に飛行再開しません。
 - production runtimeは暫定flight設定で有効ですが、値はsimulation/HIL/実機で未確定です。bit7が立っているbuildを飛行認定済みとして扱ってはいけません。
-- ICM history/replay、AS5047D unwrap、quadratic fin rate、ZeroHold/Roll、TorqueMapper、TB67H450 PWMは接続済みです。起動時AS5047D角をzeroとするため、電源投入時の翼角がずれていれば、そのずれを0°として制御します。
-- productionの手動Para commandは接続済みです。`SetParaOpen` / `SetParaClose`は全argumentを0とし、現在位置だけを保存します。通常`StartSequence`は両endpointとhalf-turn条件を検証します。`ForceStartSequence`、Force用optional snapshot、Force時の未設定Open処理はStage 2であり、今回未実装です。productionの手動Fin commandと明示PreflightCalibration commandは未接続で、差圧zeroはCommandReceive中の自動取得で代用しています。
+- ICM history/replay、AS5047D unwrap、quadratic fin rate、ZeroHold/Roll、TorqueMapper、TB67H450 PWMは接続済みです。FinZeroは起動時に自動設定せず、`SetFinZero`正常完了時だけ現在のmotor-side AS5047D位置をzero referenceとして設定します。
+- productionの手動Para commandは接続済みです。`SetParaOpen` / `SetParaClose`は全argumentを0とし、現在位置だけを保存します。通常`StartSequence`は両endpointとhalf-turn条件を検証します。`ForceStartSequence`とForce用optional snapshot、未設定Openのfail-safe処理も接続済みです。productionの`FinFree` / `SetFinZero` / `StartFinZeroHold` / `FinMoveRelative`と明示`RunPreflightCalibration`も接続済みで、SSC zeroはCalibration attempt中だけ取得し完了後freezeします。
 - ADCによるmotor/logic電圧監視とbattery present threshold/debounceはproduction flight gateへ未接続です。
 - AS5047DではDIAG/AGC/magnitudeが全て0の応答を一度確認しましたが、最終再試験では`offset_done=1`、AGC 61、magnitude 4616で正常化しました。bring-upとproduction startupは共通health判定でall-zeroを`ESP_ERR_INVALID_RESPONSE`とし、productionはpipelineを開始せずfin angle/rateをunavailable、motorをcoastに保ちます。角度0度そのものは故障条件ではありません。実機productionでは正常status時のpipeline開始と、一時診断buildでall-zeroを注入した際のstatus拒否/pipeline未開始を確認しました。確認を妨げていたMissionRealtimeTaskのstack overflowは、task専有の大型history/FIFO wrapperをstatic storageへ移して解消し、startup時点の最小空き2,504 byteを実測しています。このgateはstartupと明示reinitialize時だけで、1 kHz loopへ周期的なpipeline停止を追加していません。飛行中にMISOがstuck-lowへ遷移した場合のDIAG検出は残TODOです。
 - ESP-IDF 6.0.1のlocal `esp_twai_onchip.c`にはEspressif issue [#18803](https://github.com/espressif/esp-idf/issues/18803)の修正がありません。TX完了通知のevent-group更新がtimer taskへ遅延したままnodeを削除するuse-after-freeを実機で再現したため、Avi_ESP_Libsの`CANCREATE::test()`はESP-IDF 6以上を既知safe release確認まで`ESP_ERR_NOT_SUPPORTED`で拒否します。常駐ownerを使うproduction CANとはlifecycleが異なります。

@@ -13,7 +13,8 @@
 - `|fin_angle| <= 20 deg`: overtravel faultではない。
 - `|fin_angle| > 20 deg`: `FinOvertravelFault`を成立させる。
 - 正負両方向を同じ条件で判定する。
-- NaN / Inf、encoder invalid、zero未設定は「20 deg以内へ戻った」とみなさない。これらは既存の別fault/invalid条件で扱う。
+- fault成立・解除判定に使うsampleは、encoderがvalid/freshでzero設定済みかつ有限な`fin_angle`に限る。
+- NaN / Inf、encoder invalid/stale、zero未設定のsampleは`FinOvertravelFault`を新規成立させず、既存faultの解除にも使わない。これらは既存の別fault/invalid条件で扱う。
 
 ```text
 TODO(HW_TEST): 実機のたわみ、backlash、stopper位置、encoder zero誤差を含め、20 degの最終fault閾値を確定する。
@@ -49,7 +50,7 @@ CommandReceiveでは`FinOvertravelFault`を永久latchとしない。
 
 fault中でもCommandReceiveの`FinFree`は使用可能とし、手動で安全範囲へ戻せるようにする。`StartFinZeroHold`や`FinMoveRelative`等の駆動commandは、overtravel faultが解除されるまで開始しない。
 
-`SetFinZero`はoperatorが現在位置を新しい基準として明示的に採用する操作であるため、overtravel中でもencoderが利用可能なら実行を許可する。正常完了した場合だけovertravel faultを解除する。
+`SetFinZero`はoperatorが現在位置を新しい基準として明示的に採用する操作であるため、overtravel中でもencoderが利用可能なら実行を許可する。正常完了直後は論理角0 degとなり、overtravel faultを解除する。
 
 ## 6. telemetry
 
@@ -70,7 +71,8 @@ telemetryが15 deg超を数値表現できないことと、20 deg overtravel fa
 - 飛行中のfault成立でControlを停止し、そのflight epochでは20 deg以内へ戻ってもControl再entryしない。
 - CommandReceiveではvalid/freshな角度が20 deg以内へ戻るとfaultを解除する。
 - CommandReceiveの`SetFinZero`成功でfaultを解除する。
-- `SetFinZero`失敗、encoder invalid/stale、NaN/Infではfaultを解除しない。
+- `SetFinZero`失敗ではfaultを解除しない。
+- encoder invalid/stale、zero未設定、NaN/Infではfaultを新規成立させず、既存faultも解除しない。
 - overtravel faultの解除で別のdevice/transport faultを解除しない。
 - fault中も`FinFree`を受理できる。
 - fault中の`StartFinZeroHold` / `FinMoveRelative`は拒否する。
