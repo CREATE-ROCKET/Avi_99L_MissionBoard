@@ -7,10 +7,12 @@
 #include "characterization/record_validation.hpp"
 #include "config/board_config.hpp"
 #include "driver/sdmmc_host.h"
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -75,8 +77,7 @@ esp_err_t writeDescriptor(void *context, const std::uint8_t *data,
     return ESP_ERR_INVALID_STATE;
   std::size_t offset = 0U;
   while (offset < size) {
-    const ssize_t written =
-        ::write(descriptor, data + offset, size - offset);
+    const ssize_t written = ::write(descriptor, data + offset, size - offset);
     if (written > 0) {
       offset += static_cast<std::size_t>(written);
       continue;
@@ -133,6 +134,10 @@ void LogWriterV5::taskEntry(void *context) {
   static_cast<LogWriterV5 *>(context)->taskLoop();
 }
 
+void LogWriterV5::sdTaskEntry(void *context) {
+  static_cast<LogWriterV5 *>(context)->sdTaskLoop();
+}
+
 esp_err_t LogWriterV5::initializeStorage() noexcept {
   sdmmc_host_t host = SDMMC_HOST_DEFAULT();
   sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
@@ -162,15 +167,23 @@ esp_err_t LogWriterV5::initializeStorage() noexcept {
 void LogWriterV5::resetRunMetrics() noexcept {
   xQueueReset(queue_);
   xQueueReset(control_queue_);
+  xQueueReset(sd_control_queue_);
   while (xSemaphoreTake(control_ack_, 0U) == pdTRUE) {
+  }
+  while (xSemaphoreTake(sd_control_ack_, 0U) == pdTRUE) {
   }
   control_pending_.store(false);
   first_error_.store(ESP_OK);
+  sd_write_failed_.store(false);
   records_written_.store(0U);
   first_sequence_.store(0U);
   last_sequence_.store(0U);
   queue_overflows_.store(0U);
   queue_high_water_.store(0U);
+  psram_write_index_.store(0U, std::memory_order_relaxed);
+  psram_read_index_.store(0U, std::memory_order_relaxed);
+  psram_high_water_.store(0U);
+  psram_overflows_.store(0U);
   max_batch_records_.store(0U);
   max_validate_us_.store(0U);
   max_encode_us_.store(0U);
@@ -184,6 +197,8 @@ void LogWriterV5::resetRunMetrics() noexcept {
 void LogWriterV5::cleanupPreparedFile(bool remove_file) noexcept {
   accepting_.store(false);
   synced_.store(false);
+  psram_write_index_.store(0U, std::memory_order_relaxed);
+  psram_read_index_.store(0U, std::memory_order_relaxed);
   if (file_descriptor_ >= 0) {
     (void)::close(file_descriptor_);
     file_descriptor_ = -1;
@@ -195,22 +210,44 @@ void LogWriterV5::cleanupPreparedFile(bool remove_file) noexcept {
   prepared_ = false;
 }
 
+bool LogWriterV5::stageEncodedRecord(
+    std::uint64_t sequence, const wire_v5::RecordBytes &bytes) noexcept {
+  if (psram_stage_ == nullptr)
+    return false;
+
+  const std::uint64_t write_index =
+      psram_write_index_.load(std::memory_order_relaxed);
+  const std::uint64_t read_index =
+      psram_read_index_.load(std::memory_order_acquire);
+  const std::uint64_t occupancy = write_index - read_index;
+  if (occupancy >= kPsramStagingCapacity) {
+    psram_overflows_.fetch_add(1U, std::memory_order_relaxed);
+    rememberFirst(ESP_ERR_NO_MEM);
+    return false;
+  }
+
+  StagedRecord &slot = psram_stage_[write_index % kPsramStagingCapacity];
+  slot.sequence = sequence;
+  std::memcpy(slot.bytes.data(), bytes.data(), bytes.size());
+  psram_write_index_.store(write_index + 1U, std::memory_order_release);
+  updateAtomicMaximum(
+      psram_high_water_,
+      static_cast<std::uint32_t>(std::min<std::uint64_t>(
+          occupancy + 1U, std::numeric_limits<std::uint32_t>::max())));
+  return true;
+}
+
 void LogWriterV5::processRecordBatch(ImmutableLogRecord current_record) {
   std::size_t count = 0U;
-  std::uint64_t batch_first_sequence = 0U;
-  std::uint64_t batch_last_sequence = 0U;
-  bool encoded = true;
-
   for (;;) {
-    // queueから取り出した1件をその場でstrict validation/encodeする。
-    // ImmutableLogRecordのbatch copyを保持せず、wire batchだけをDRAMに残す。
+    // DRAM ingress queueから取り出したrecordをvalidation/encodeし、SD I/Oとは分離して
+    // 4 MiB PSRAM ringへ退避する。SD stall中もこのtaskはrecordを吸収し続ける。
     const std::int64_t validate_started_us = esp_timer_get_time();
     const bool record_valid = !hasError(validateRecordStrict(current_record));
     const std::uint32_t validate_elapsed_us = elapsedUs(validate_started_us);
     updateAtomicMaximum(max_validate_us_, validate_elapsed_us);
     addAtomicTotal(total_validate_us_, validate_elapsed_us);
     if (!record_valid) {
-      encoded = false;
       rememberFirst(ESP_ERR_INVALID_RESPONSE);
       break;
     }
@@ -222,16 +259,12 @@ void LogWriterV5::processRecordBatch(ImmutableLogRecord current_record) {
     updateAtomicMaximum(max_encode_us_, encode_elapsed_us);
     addAtomicTotal(total_encode_us_, encode_elapsed_us);
     if (!record_encoded) {
-      encoded = false;
       rememberFirst(ESP_ERR_INVALID_RESPONSE);
       break;
     }
 
-    std::memcpy(encoded_batch_.data() + count * wire_v5::kRecordBytes,
-                bytes.data(), bytes.size());
-    if (count == 0U)
-      batch_first_sequence = current_record.sequence;
-    batch_last_sequence = current_record.sequence;
+    if (!stageEncodedRecord(current_record.sequence, bytes))
+      break;
     ++count;
 
     if (count >= kBatchRecords ||
@@ -239,36 +272,65 @@ void LogWriterV5::processRecordBatch(ImmutableLogRecord current_record) {
       break;
   }
 
-  updateAtomicMaximum(max_batch_records_, static_cast<std::uint32_t>(count));
-  if (!encoded)
-    return;
-
-  if (file_descriptor_ >= 0) {
-    const std::size_t byte_count = count * wire_v5::kRecordBytes;
-    const std::int64_t fwrite_started_us = esp_timer_get_time();
-    const esp_err_t write_result =
-        writeDescriptor(&file_descriptor_, encoded_batch_.data(), byte_count);
-    const std::uint32_t fwrite_elapsed_us = elapsedUs(fwrite_started_us);
-    updateAtomicMaximum(max_fwrite_us_, fwrite_elapsed_us);
-    addAtomicTotal(total_fwrite_us_, fwrite_elapsed_us);
-    batch_count_.fetch_add(1U, std::memory_order_relaxed);
-    if (write_result != ESP_OK) {
-      rememberFirst(write_result);
-    } else {
-      // previous_crc chainingは連結データのCRCと等価なので、batch全体を1回で更新する。
-      file_crc32_ = wire_v5::crc32(encoded_batch_.data(), byte_count,
-                                   file_crc32_);
-      const std::uint64_t before = records_written_.fetch_add(count);
-      if (before == 0U)
-        first_sequence_.store(batch_first_sequence);
-      last_sequence_.store(batch_last_sequence);
-    }
-  } else {
-    rememberFirst(ESP_ERR_INVALID_STATE);
-  }
+  if (count != 0U && sd_task_ != nullptr)
+    xTaskNotifyGive(sd_task_);
 }
 
-void LogWriterV5::processControl(const ControlRequest &request) {
+bool LogWriterV5::drainStagedBatch() noexcept {
+  if (sd_write_failed_.load(std::memory_order_acquire))
+    return false;
+  if (psram_stage_ == nullptr || file_descriptor_ < 0)
+    return false;
+
+  const std::uint64_t read_index =
+      psram_read_index_.load(std::memory_order_relaxed);
+  const std::uint64_t write_index =
+      psram_write_index_.load(std::memory_order_acquire);
+  if (read_index == write_index)
+    return false;
+
+  const std::size_t count = static_cast<std::size_t>(
+      std::min<std::uint64_t>(write_index - read_index, kBatchRecords));
+  std::uint64_t first_sequence = 0U;
+  std::uint64_t last_sequence = 0U;
+  for (std::size_t index = 0U; index < count; ++index) {
+    const StagedRecord &slot =
+        psram_stage_[(read_index + index) % kPsramStagingCapacity];
+    std::memcpy(sd_batch_.data() + index * wire_v5::kRecordBytes,
+                slot.bytes.data(), slot.bytes.size());
+    if (index == 0U)
+      first_sequence = slot.sequence;
+    last_sequence = slot.sequence;
+  }
+
+  const std::size_t byte_count = count * wire_v5::kRecordBytes;
+  const std::int64_t fwrite_started_us = esp_timer_get_time();
+  const esp_err_t write_result =
+      writeDescriptor(&file_descriptor_, sd_batch_.data(), byte_count);
+  const std::uint32_t fwrite_elapsed_us = elapsedUs(fwrite_started_us);
+  updateAtomicMaximum(max_fwrite_us_, fwrite_elapsed_us);
+  addAtomicTotal(total_fwrite_us_, fwrite_elapsed_us);
+  updateAtomicMaximum(max_batch_records_, static_cast<std::uint32_t>(count));
+  batch_count_.fetch_add(1U, std::memory_order_relaxed);
+
+  if (write_result != ESP_OK) {
+    sd_write_failed_.store(true, std::memory_order_release);
+    rememberFirst(write_result);
+    return false;
+  }
+
+  // SDへ完全に書けたbatchだけread indexを進める。PSRAMからのcopy中・write中は
+  // そのslotを未消費扱いにしてproducerによる上書きを防ぐ。
+  file_crc32_ = wire_v5::crc32(sd_batch_.data(), byte_count, file_crc32_);
+  const std::uint64_t before = records_written_.fetch_add(count);
+  if (before == 0U)
+    first_sequence_.store(first_sequence);
+  last_sequence_.store(last_sequence);
+  psram_read_index_.store(read_index + count, std::memory_order_release);
+  return true;
+}
+
+void LogWriterV5::processSdControl(const ControlRequest &request) {
   esp_err_t result = first_error_.load();
   if (request.kind == ControlKind::Sync) {
     bool synchronized = file_descriptor_ >= 0;
@@ -290,8 +352,7 @@ void LogWriterV5::processControl(const ControlRequest &request) {
     finalized.first_sequence = first_sequence_.load();
     finalized.last_sequence = last_sequence_.load();
     finalized.file_crc32 = file_crc32_;
-    finalized.statistics.writer_queue_overflows =
-        queue_overflows_.load();
+    finalized.statistics.writer_queue_overflows = writerQueueOverflows();
     wire_v5::FooterBytes bytes{};
     const bool footer_valid = wire_v5::encodeFooter(finalized, bytes);
     if (!footer_valid)
@@ -308,14 +369,52 @@ void LogWriterV5::processControl(const ControlRequest &request) {
     accepting_.store(false);
   }
   rememberFirst(result);
+  sd_control_result_.store(result);
+  (void)xSemaphoreGive(sd_control_ack_);
+}
+
+void LogWriterV5::processControl(const ControlRequest &request) {
+  esp_err_t result = first_error_.load();
+  while (xSemaphoreTake(sd_control_ack_, 0U) == pdTRUE) {
+  }
+  if (sd_task_ == nullptr ||
+      xQueueSend(sd_control_queue_, &request, portMAX_DELAY) != pdTRUE) {
+    rememberOperation(ESP_FAIL, result);
+  } else {
+    xTaskNotifyGive(sd_task_);
+    if (xSemaphoreTake(sd_control_ack_, portMAX_DELAY) != pdTRUE)
+      rememberOperation(ESP_FAIL, result);
+    else
+      rememberOperation(sd_control_result_.load(), result);
+  }
+  rememberFirst(result);
   control_result_.store(result);
   control_pending_.store(false);
   (void)xSemaphoreGive(control_ack_);
 }
 
 void LogWriterV5::taskLoop() {
-  // SDMMC hostのinterrupt allocationをchar_runtimeと分離するため、
-  // mountをCore 1にpinされたchar_writer task自身から実行する。
+  // このtaskはSDへ触れない。DRAM ingress queueを優先してPSRAMへ逃がし、
+  // accepting=false後にqueueが空になってからcontrolをSD taskへ渡す。
+  for (;;) {
+    ImmutableLogRecord first{};
+    if (xQueueReceive(queue_, &first, 0U) == pdTRUE) {
+      processRecordBatch(first);
+      continue;
+    }
+    ControlRequest request{};
+    if (xQueueReceive(control_queue_, &request, 0U) == pdTRUE) {
+      processControl(request);
+      continue;
+    }
+    if (xQueueReceive(queue_, &first, pdMS_TO_TICKS(10)) == pdTRUE)
+      processRecordBatch(first);
+  }
+}
+
+void LogWriterV5::sdTaskLoop() {
+  // SDMMC hostのinterrupt allocationをchar_runtimeと分離するため、mountは
+  // Core 1の低優先度char_writer自身から実行する。
   const esp_err_t storage_result = initializeStorage();
   startup_result_.store(storage_result, std::memory_order_release);
   (void)xSemaphoreGive(startup_ack_);
@@ -325,14 +424,22 @@ void LogWriterV5::taskLoop() {
   }
 
   for (;;) {
-    ImmutableLogRecord first{};
-    if (xQueueReceive(queue_, &first, pdMS_TO_TICKS(10)) == pdTRUE) {
-      processRecordBatch(first);
+    bool drained = false;
+    while (drainStagedBatch())
+      drained = true;
+
+    ControlRequest request{};
+    if (xQueueReceive(sd_control_queue_, &request, 0U) == pdTRUE) {
+      // controlはstagerがDRAM ingressを全てPSRAMへ移した後に到着する。
+      // SD stallから復帰した後、残るPSRAM recordを全て書いてからsync/finalizeする。
+      while (drainStagedBatch()) {
+      }
+      processSdControl(request);
       continue;
     }
-    ControlRequest request{};
-    if (xQueueReceive(control_queue_, &request, 0U) == pdTRUE)
-      processControl(request);
+
+    if (!drained)
+      (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
   }
 }
 
@@ -346,7 +453,6 @@ esp_err_t LogWriterV5::submitControl(const ControlRequest &request) {
     control_pending_.store(false);
     return ESP_FAIL;
   }
-  // descriptorへ触れるcallerはなく、writer taskのfinalize ackまで安全側で待機する。
   if (xSemaphoreTake(control_ack_, portMAX_DELAY) != pdTRUE) {
     control_pending_.store(false);
     return ESP_FAIL;
@@ -357,42 +463,63 @@ esp_err_t LogWriterV5::submitControl(const ControlRequest &request) {
 esp_err_t LogWriterV5::initialize() {
   if (initialized_)
     return ESP_OK;
-  if (task_ != nullptr) {
-    const esp_err_t previous =
-        startup_result_.load(std::memory_order_acquire);
+  if (task_ != nullptr || sd_task_ != nullptr) {
+    const esp_err_t previous = startup_result_.load(std::memory_order_acquire);
     return previous == ESP_ERR_NOT_FINISHED ? ESP_ERR_INVALID_STATE : previous;
   }
 
-  // queue storage/control block/task stackはobject lifetime中保持される。
+  // PSRAM ringはrun中に確保しない。4 MiBをboot時に明示的にexternal RAMから確保し、
+  // SDの数秒級tail latencyを吸収する。SDへ渡すbatchだけは内部DRAMに置く。
+  psram_stage_ = static_cast<StagedRecord *>(heap_caps_malloc(
+      kPsramStagingBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (psram_stage_ == nullptr)
+    return ESP_ERR_NO_MEM;
+
   queue_ = xQueueCreateStatic(
       kQueueDepth, sizeof(ImmutableLogRecord), queue_storage_.data(),
       &queue_control_);
-  if (queue_ == nullptr)
-    return ESP_ERR_NO_MEM;
   control_queue_ = xQueueCreateStatic(
       1U, sizeof(ControlRequest), control_queue_storage_.data(),
       &control_queue_control_);
+  sd_control_queue_ = xQueueCreateStatic(
+      1U, sizeof(ControlRequest), sd_control_queue_storage_.data(),
+      &sd_control_queue_control_);
   control_ack_ = xSemaphoreCreateBinaryStatic(&control_ack_storage_);
+  sd_control_ack_ = xSemaphoreCreateBinaryStatic(&sd_control_ack_storage_);
   startup_ack_ = xSemaphoreCreateBinaryStatic(&startup_ack_storage_);
-  if (control_queue_ == nullptr || control_ack_ == nullptr ||
-      startup_ack_ == nullptr)
+  if (queue_ == nullptr || control_queue_ == nullptr ||
+      sd_control_queue_ == nullptr || control_ack_ == nullptr ||
+      sd_control_ack_ == nullptr || startup_ack_ == nullptr) {
+    heap_caps_free(psram_stage_);
+    psram_stage_ = nullptr;
     return ESP_ERR_NO_MEM;
+  }
 
   startup_result_.store(ESP_ERR_NOT_FINISHED, std::memory_order_release);
-  // Core 0はpriority 21のchar_runtime専用に近い状態へ保つ。
-  // char_writerはCore 1へ置き、同coreのchar_encoder(priority 23)を常に優先する。
-  // SDMMC mountもこのtaskの先頭で行い、storage ISRをCore 1側へ割り当てる。
-  task_ = xTaskCreateStaticPinnedToCore(
-      taskEntry, "char_writer", sizeof(task_stack_), this, 10,
-      task_stack_, &task_tcb_, 1);
-  if (task_ == nullptr)
+  // char_writerはSD I/O専用の低優先度task。write()が数秒blockしても、
+  // char_log_stage(priority 12)とchar_encoder(priority 23)はCore 1で実行を続けられる。
+  sd_task_ = xTaskCreateStaticPinnedToCore(
+      sdTaskEntry, "char_writer", sizeof(sd_task_stack_), this, 10,
+      sd_task_stack_, &sd_task_tcb_, 1);
+  if (sd_task_ == nullptr) {
+    heap_caps_free(psram_stage_);
+    psram_stage_ = nullptr;
     return ESP_ERR_NO_MEM;
+  }
   if (xSemaphoreTake(startup_ack_, portMAX_DELAY) != pdTRUE)
     return ESP_FAIL;
 
-  const esp_err_t result = startup_result_.load(std::memory_order_acquire);
-  if (result != ESP_OK)
-    return result;
+  const esp_err_t storage_result =
+      startup_result_.load(std::memory_order_acquire);
+  if (storage_result != ESP_OK)
+    return storage_result;
+
+  task_ = xTaskCreateStaticPinnedToCore(
+      taskEntry, "char_log_stage", sizeof(task_stack_), this, 12,
+      task_stack_, &task_tcb_, 1);
+  if (task_ == nullptr)
+    return ESP_ERR_NO_MEM;
+
   initialized_ = true;
   return ESP_OK;
 }
@@ -425,8 +552,8 @@ esp_err_t LogWriterV5::prepare(const char *base_name,
     if (length <= 0 ||
         static_cast<std::size_t>(length) >= current_path_.size())
       return ESP_ERR_INVALID_SIZE;
-    const int placeholder = ::open(current_path_.data(),
-                                   O_WRONLY | O_CREAT | O_EXCL, 0664);
+    const int placeholder =
+        ::open(current_path_.data(), O_WRONLY | O_CREAT | O_EXCL, 0664);
     if (placeholder >= 0) {
       if (::close(placeholder) != 0) {
         (void)::unlink(current_path_.data());
@@ -501,13 +628,11 @@ esp_err_t LogWriterV5::open(const LogHeaderV5 &header) {
   return ESP_OK;
 }
 
-esp_err_t LogWriterV5::enqueue(
-    const ImmutableLogRecord &record) {
+esp_err_t LogWriterV5::enqueue(const ImmutableLogRecord &record) {
   if (!accepting_.load() || file_descriptor_ < 0 ||
       first_error_.load() != ESP_OK)
     return ESP_ERR_INVALID_STATE;
-  // 完成済みimmutable recordを値copyするだけに留める。
-  // strict validationはchar_writerのprocessRecordBatch()でencode直前に行う。
+  // realtime callerは完成済みimmutable recordをDRAM queueへ値copyするだけに留める。
   RateCheckStageScope timing(RateCheckStage::WriterEnqueue);
   if (xQueueSend(queue_, &record, 0U) != pdTRUE) {
     updateAtomicMaximum(queue_high_water_,
@@ -582,8 +707,9 @@ esp_err_t LogWriterV5::close(const LogFooterV5 &footer) {
                   static_cast<std::uint64_t>(fwrite_total);
     std::printf(
         "CHAR_WRITER_TIMING rate=%u queue-depth=%u queue-high-water=%u "
-        "batch-capacity=%u max-batch-records=%u batch-count=%u "
-        "preallocate-us=%u planned-bytes=%llu contiguous=%u "
+        "psram-bytes=%u psram-capacity-records=%u psram-high-water=%u "
+        "psram-overflow=%llu batch-capacity=%u max-batch-records=%u "
+        "batch-count=%u preallocate-us=%u planned-bytes=%llu contiguous=%u "
         "validate-max-us=%u validate-total-us=%u validate-avg-us=%u "
         "encode-max-us=%u encode-total-us=%u encode-avg-us=%u "
         "fwrite-max-us=%u fwrite-total-us=%u fwrite-avg-us=%u "
@@ -591,6 +717,10 @@ esp_err_t LogWriterV5::close(const LogFooterV5 &footer) {
         static_cast<unsigned>(diagnostics.rate),
         static_cast<unsigned>(kQueueDepth),
         static_cast<unsigned>(queue_high_water_.load()),
+        static_cast<unsigned>(kPsramStagingBytes),
+        static_cast<unsigned>(kPsramStagingCapacity),
+        static_cast<unsigned>(psram_high_water_.load()),
+        static_cast<unsigned long long>(psram_overflows_.load()),
         static_cast<unsigned>(kBatchRecords),
         static_cast<unsigned>(max_batch_records_.load()),
         static_cast<unsigned>(batches),

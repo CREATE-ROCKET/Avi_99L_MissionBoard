@@ -46,7 +46,11 @@ public:
     return records_written_.load();
   }
   [[nodiscard]] std::uint64_t writerQueueOverflows() const noexcept {
+#if defined(ESP_PLATFORM)
+    return queue_overflows_.load() + psram_overflows_.load();
+#else
     return queue_overflows_.load();
+#endif
   }
   [[nodiscard]] const char *currentPath() const noexcept {
     return current_path_.data();
@@ -60,12 +64,28 @@ private:
     LogFooterV5 footer{};
   };
 
+  struct StagedRecord {
+    std::uint64_t sequence{0U};
+    wire_v5::RecordBytes bytes{};
+  };
+
+  static constexpr std::size_t kPsramStagingBytes = 4U * 1024U * 1024U;
+  static constexpr std::size_t kPsramStagingCapacity =
+      kPsramStagingBytes / sizeof(StagedRecord);
+  static_assert(kPsramStagingCapacity > 0U);
+
   static void taskEntry(void *context);
+  static void sdTaskEntry(void *context);
   void taskLoop();
+  void sdTaskLoop();
   [[nodiscard]] esp_err_t initializeStorage() noexcept;
   void rememberFirst(esp_err_t error) noexcept;
   void processRecordBatch(ImmutableLogRecord first_record);
+  [[nodiscard]] bool stageEncodedRecord(
+      std::uint64_t sequence, const wire_v5::RecordBytes &bytes) noexcept;
+  [[nodiscard]] bool drainStagedBatch() noexcept;
   void processControl(const ControlRequest &request);
+  void processSdControl(const ControlRequest &request);
   [[nodiscard]] esp_err_t submitControl(const ControlRequest &request);
   void resetRunMetrics() noexcept;
   void cleanupPreparedFile(bool remove_file) noexcept;
@@ -75,26 +95,49 @@ private:
              kQueueDepth * sizeof(ImmutableLogRecord)>
       queue_storage_{};
   QueueHandle_t queue_{nullptr};
+
   StaticQueue_t control_queue_control_{};
   std::array<std::uint8_t, sizeof(ControlRequest)>
       control_queue_storage_{};
   QueueHandle_t control_queue_{nullptr};
   StaticSemaphore_t control_ack_storage_{};
   SemaphoreHandle_t control_ack_{nullptr};
+
+  StaticQueue_t sd_control_queue_control_{};
+  std::array<std::uint8_t, sizeof(ControlRequest)>
+      sd_control_queue_storage_{};
+  QueueHandle_t sd_control_queue_{nullptr};
+  StaticSemaphore_t sd_control_ack_storage_{};
+  SemaphoreHandle_t sd_control_ack_{nullptr};
+
   StaticSemaphore_t startup_ack_storage_{};
   SemaphoreHandle_t startup_ack_{nullptr};
+
   StaticTask_t task_tcb_{};
   StackType_t task_stack_[4096]{};
   TaskHandle_t task_{nullptr};
-  // queueから1件ずつstrict validation/encodeし、wire batchだけを保持する。
-  // ImmutableLogRecordの64件二重bufferはDRAMを浪費するため持たない。
+  StaticTask_t sd_task_tcb_{};
+  StackType_t sd_task_stack_[4096]{};
+  TaskHandle_t sd_task_{nullptr};
+
+  // realtime側はDRAM queueへImmutableLogRecordを短時間copyするだけに留める。
+  // char_log_stageがvalidation/encode後のwire recordを4 MiB PSRAM ringへ移し、
+  // char_writerだけがPSRAMからDRAM batchへcopyしてSDへ書く。
+  StagedRecord *psram_stage_{nullptr};
+  std::atomic<std::uint64_t> psram_write_index_{0U};
+  std::atomic<std::uint64_t> psram_read_index_{0U};
+  std::atomic<std::uint32_t> psram_high_water_{0U};
+  std::atomic<std::uint64_t> psram_overflows_{0U};
   std::array<std::uint8_t,
              wire_v5::kRecordBytes * kBatchRecords>
-      encoded_batch_{};
+      sd_batch_{};
+
   std::atomic<bool> control_pending_{false};
   std::atomic<esp_err_t> control_result_{ESP_OK};
+  std::atomic<esp_err_t> sd_control_result_{ESP_OK};
   std::atomic<esp_err_t> startup_result_{ESP_ERR_NOT_FINISHED};
   std::atomic<TaskHandle_t> failure_notification_task_{nullptr};
+  std::atomic<bool> sd_write_failed_{false};
   std::atomic<std::uint32_t> queue_high_water_{0U};
   std::atomic<std::uint32_t> max_batch_records_{0U};
   std::atomic<std::uint32_t> max_validate_us_{0U};

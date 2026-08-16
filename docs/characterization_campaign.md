@@ -78,9 +78,13 @@ epoch n = [epoch_zero_us + n*1000,
 
 motor system identificationとflight realtime qualificationを分離します。
 
-productionの100 us realtime requirementは変更しません。motor-IDでは100 usをcommand applyの診断targetとし、必要なcommand変更が100 usを超えても**同じ1 ms epoch内で完了する限り**actual `command_apply_timestamp_us`を保存してrunを継続します。
+productionの100 us realtime requirementは変更しません。motor-IDでは100 usをcommand applyの診断targetとし、actual timestampとepoch順序を保持できる限りrunを継続します。
 
-command apply開始または完了が`epoch_start + 1000 us`以上へ達した場合はfatalです。まだDrive/Brakeを出していない場合は遅れた指令を出さずCoastへ倒し、適用後に境界超過が判明した場合も直ちにCoastへ倒して`AbortReason::Deadline`で停止します。
+予定epoch内でcommand applyが完了する場合は、そのactual `command_apply_timestamp_us`を当該epochのcommand evidenceとして保存します。
+
+command apply開始または完了が予定epoch終端を越え、かつ次epoch終端より前である場合は1 epoch command slipとして診断継続します。終了済みepochへ遅れて適用されたcommandを帰属させず、そのrecordには適用前command evidenceを保持します。遅れて適用されたcommandはactual timestampに従って次epoch側の実入力として扱います。
+
+command apply開始が`epoch_start + 2000 us`以上の場合は遅れたDrive/Brakeを出さずCoastへ倒します。開始時刻は2 ms未満でも適用完了が`epoch_start + 2000 us`以上に達した場合は直ちにCoastへ倒し、`AbortReason::Deadline`で停止します。
 
 consumer releaseがepoch終端から100 usを超えても、notificationがexactly 1で、releaseが1 epoch未満の遅延であり、raw sampleのepoch所属が壊れていない場合はmotor-ID診断として継続します。
 
@@ -88,7 +92,7 @@ release-only遅延は`consumer_lateness_us`、`CHAR_RATE_RESULT release-deadline
 
 次は引き続きfatalです。
 
-- command applyが1 epoch以上遅れる、またはgeneration/epoch順序を保持できない
+- command applyが2 epoch目へ達する、またはgeneration/epoch順序を保持できない
 - notification coalescing
 - 1 epoch以上のconsumer release遅延
 - encoder invalid / transport / status error
@@ -192,16 +196,41 @@ V5 binaryが正本です。
 - header: 256 byte
 - record: 320 byte / 1 ms
 - footer: 192 byte
-- writer queue: 512 records
-- writer batch: 最大64 records
+- realtime ingress queue: 内部DRAM 512 records
+- PSRAM staging: **4 MiB固定**
+- SD writer batch: 最大64 records
 - run前にplanned file全体をFATFS contiguous fileとして`alloc_now=true`で確保する
 - `esp_vfs_fat_test_contiguous_file()`で連続性を確認できない場合はcaptureを開始しない
 - record/header/footerはstdio bufferingを介さずPOSIX descriptorへshort-write/EINTR対応で書く
 - 終了時にactual footer終端へtruncateして`fsync`する
 
-2026-08-16の再試験では旧`ftruncate`事前確保経路で、553 record時点に`queue-high-water=512/512`、`writer-queue-overflow=1`、`fwrite-max-us=1333447`、約120 kB/s相当のrecord write throughputとなった。1 kHz V5が要求する320 kB/sを下回るため、queue増量ではなくstorage path自体を修正した。
+storage pipelineは次とします。
 
-`CHAR_WRITER_TIMING`は`contiguous`と`write-bps`を追加表示する。新経路はまず10秒rate-checkで`contiguous=1`、`writer-queue-overflow=0`、queue high-waterが512へ張り付かないことを確認してからfull profileへ進む。
+```text
+char_runtime
+  -> 512-record DRAM ingress queue
+  -> char_log_stage: strict validation + V5 encode
+  -> 4 MiB PSRAM SPSC wire-record ring
+  -> char_writer: 最大64 recordを内部DRAM batchへcopy
+  -> SDMMC/FATFS
+```
+
+PSRAM ringには320-byte wire recordとsequence metadataを保存します。実装容量は約12.8秒分で、PSRAMをSDMMC DMA bufferとして直接使用しません。SD書込み中も`char_log_stage`はPSRAMへの退避を継続できるよう、`char_log_stage`をCore 1 priority 12、SD I/O専用`char_writer`をCore 1 priority 10とします。既存`char_encoder` priority 23を最優先のまま維持します。
+
+2026-08-16にはcontiguous allocation後でも、同じSDで10秒rate-checkが正常完走する場合と、`fwrite-max-us=2322287`の単発stallにより577 record時点で512-record DRAM queueがoverflowする場合の両方を観測しました。これはFAT cluster allocationではなくSD/FAT write pathのtail latencyとして扱い、4 MiB PSRAM stagingで吸収します。
+
+PSRAM stagingが満杯になった場合はデータを上書きせず、`ESP_ERR_NO_MEM` / writer queue overflowとして従来どおりfail-safe停止します。SD write失敗、sync失敗、close失敗も従来どおりfatalです。
+
+`CHAR_WRITER_TIMING`は次を追加表示します。
+
+- `psram-bytes`
+- `psram-capacity-records`
+- `psram-high-water`
+- `psram-overflow`
+- `contiguous`
+- `write-bps`
+
+新経路はまず10秒rate-checkで`contiguous=1`、`writer-queue-overflow=0`、`psram-overflow=0`を確認してからfull profileへ進みます。SD stallが発生したrunでは`psram-high-water`が増えても、DRAM `queue-high-water`が512へ張り付かず最終的に10000 recordを保存できればstorage経路は正常と判定します。
 
 ## 9. Validation
 
