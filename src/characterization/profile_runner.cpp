@@ -18,6 +18,7 @@
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -116,8 +117,8 @@ void rememberOperation(esp_err_t operation, esp_err_t &first) noexcept {
     first = operation;
 }
 
-UnsupportedReason unsupportedReason(
-    const SamplerStatistics &statistics) noexcept {
+UnsupportedReason
+unsupportedReason(const SamplerStatistics &statistics) noexcept {
   if (statistics.trigger_coalesced_or_missed != 0U)
     return UnsupportedReason::TriggerCoalesced;
   if (statistics.pre_epoch_samples != 0U ||
@@ -160,9 +161,8 @@ AbortReason abortReasonForAcquisition(UnsupportedReason reason) noexcept {
 void makeSafeSessionToken(const SessionId &session_id,
                           std::array<char, kSessionIdBytes> &token) noexcept {
   token = {};
-  for (std::size_t index = 0U; index + 1U < token.size() &&
-                              session_id[index] != '\0';
-       ++index) {
+  for (std::size_t index = 0U;
+       index + 1U < token.size() && session_id[index] != '\0'; ++index) {
     const unsigned char value =
         static_cast<unsigned char>(session_id[index]);
     const bool safe = (value >= 'a' && value <= 'z') ||
@@ -626,7 +626,7 @@ esp_err_t ProfileRunner::runRateCheck(EncoderRate rate, std::uint32_t seconds) {
     return stop_result;
   }
   const CampaignStatus begin = campaign_.beginRun(rate, RunKind::RateCheck);
-  esp_err_t result =
+  const esp_err_t result =
       begin == CampaignStatus::Ok
           ? run(rate, RunKind::RateCheck, seconds * kConsumerRateHz)
           : ESP_ERR_INVALID_STATE;
@@ -654,7 +654,7 @@ esp_err_t ProfileRunner::runFullProfile(EncoderRate rate) {
   std::uint64_t total = 0U;
   for (const ProfileEpisode &episode : plan.commonEpisodes())
     total += episode.duration_epochs;
-  esp_err_t result =
+  const esp_err_t result =
       total <= std::numeric_limits<std::uint32_t>::max()
           ? run(rate, RunKind::Full, static_cast<std::uint32_t>(total))
           : ESP_ERR_INVALID_SIZE;
@@ -720,8 +720,8 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
     return first_error;
   }
 
-  // Motor-IDではVbus ADCは予備計測扱いとし、characterizationの取得対象から外す。
-  // PowerSampler taskを起動せず、V5には明示的なunavailable evidenceを保存する。
+  // Vbus ADCは今回のmotor-IDでは取得しない。wire互換のpower fieldは
+  // ESP_ERR_NOT_SUPPORTEDで明示的にunavailableとする。
   first_error = sampler_.begin(rate, epoch_zero);
   if (first_error != ESP_OK) {
     (void)journal_.apply({0, MotorMode::Coast}, nowUs());
@@ -734,7 +734,8 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
     return first_error;
   }
 
-  first_error = journal_.apply({0, MotorMode::Coast}, nowUs());
+  const std::uint64_t initial_apply_started_us = nowUs();
+  first_error = journal_.apply({0, MotorMode::Coast}, initial_apply_started_us);
   if (first_error != ESP_OK) {
     (void)journal_.disarm(nowUs());
     (void)sampler_.stop();
@@ -760,8 +761,6 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
   std::uint64_t sequence = 0U;
   std::uint32_t qualification_valid = 0U;
   std::uint32_t qualification_total = 0U;
-  std::uint32_t episode_offset = 0U;
-  std::size_t episode_index = 0U;
   ShutdownSequence shutdown{};
   bool qualification_stop = false;
   std::uint64_t runtime_deadline_misses = 0U;
@@ -778,6 +777,60 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
   std::uint64_t previous_release_us = 0U;
   bool have_previous_release = false;
   bool full_deadline_diagnostic_printed = false;
+
+  struct EpochCommandState {
+    ImmutableCommandEvidence evidence{};
+    GuardState guard_state{GuardState::Allow};
+    std::uint64_t apply_started_us{0U};
+    std::uint64_t apply_completed_us{0U};
+  };
+
+  EpochCommandState current_command_state{};
+  current_command_state.evidence = journal_.snapshot(nowUs());
+  current_command_state.apply_started_us = initial_apply_started_us;
+  current_command_state.apply_completed_us =
+      current_command_state.evidence.command_apply_timestamp_us;
+
+  const auto resolveEpisode = [&](std::uint32_t epoch_index,
+                                  std::uint32_t &local_epoch) {
+    if (!full) {
+      local_epoch = epoch_index;
+      return ProfileEpisode{ProfilePhase::StationaryBaseline,
+                            ApproachBranch::None, 1U, epochs, 0, false};
+    }
+    std::uint32_t offset = 0U;
+    for (const ProfileEpisode &candidate : plan.commonEpisodes()) {
+      if (epoch_index < offset + candidate.duration_epochs) {
+        local_epoch = epoch_index - offset;
+        return candidate;
+      }
+      offset += candidate.duration_epochs;
+    }
+    local_epoch = 0U;
+    return plan.commonEpisodes().back();
+  };
+
+  const auto approachForEpisode = [&](const ProfileEpisode &episode,
+                                      bool start_if_needed)
+      -> ZeroApproachController * {
+    if (episode.phase != ProfilePhase::ZeroApproach)
+      return nullptr;
+    if (episode.branch == ApproachBranch::FromPositive) {
+      if (start_if_needed && !positive_started) {
+        positive.reset(nowUs());
+        positive_started = true;
+      }
+      return &positive;
+    }
+    if (episode.branch == ApproachBranch::FromNegative) {
+      if (start_if_needed && !negative_started) {
+        negative.reset(nowUs());
+        negative_started = true;
+      }
+      return &negative;
+    }
+    return nullptr;
+  };
 
   portENTER_CRITICAL(&g_consumer_timing_lock);
   g_consumer_last_alarm_lateness_us = 0U;
@@ -817,6 +870,47 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
     return true;
   };
 
+  const auto reportDeadline = [&](std::uint32_t diagnostic_epoch,
+                                  const ProfileEpisode &diagnostic_episode,
+                                  std::uint64_t diagnostic_epoch_start,
+                                  const char *reason,
+                                  std::uint64_t apply_started_us,
+                                  std::uint64_t apply_completed_us,
+                                  std::uint32_t release_lateness_us,
+                                  std::uint32_t notifications,
+                                  std::uint32_t consumer_work_us,
+                                  std::int16_t command_permille) {
+    if (!full || full_deadline_diagnostic_printed)
+      return;
+    const long long apply_start_late_us =
+        apply_started_us >= diagnostic_epoch_start
+            ? static_cast<long long>(apply_started_us - diagnostic_epoch_start)
+            : -static_cast<long long>(diagnostic_epoch_start - apply_started_us);
+    const long long apply_complete_late_us =
+        apply_completed_us >= diagnostic_epoch_start
+            ? static_cast<long long>(apply_completed_us - diagnostic_epoch_start)
+            : -static_cast<long long>(diagnostic_epoch_start - apply_completed_us);
+    const std::uint32_t apply_duration_us =
+        apply_completed_us >= apply_started_us
+            ? saturateU32(apply_completed_us - apply_started_us)
+            : 0U;
+    std::printf(
+        "CHAR_FULL_ABORT_TIMING epoch=%u episode=%u phase=%u "
+        "reason=%s apply-start-late-us=%lld apply-duration-us=%u "
+        "apply-complete-late-us=%lld release-late-us=%u "
+        "notifications=%u consumer-work-us=%u fin-angle-mdeg=%d "
+        "command-permille=%d\n",
+        static_cast<unsigned>(diagnostic_epoch),
+        static_cast<unsigned>(diagnostic_episode.episode_index),
+        static_cast<unsigned>(diagnostic_episode.phase), reason,
+        apply_start_late_us, static_cast<unsigned>(apply_duration_us),
+        apply_complete_late_us, static_cast<unsigned>(release_lateness_us),
+        static_cast<unsigned>(notifications),
+        static_cast<unsigned>(consumer_work_us), static_cast<int>(fin_angle),
+        static_cast<int>(command_permille));
+    full_deadline_diagnostic_printed = true;
+  };
+
   first_error = startConsumerTimer(epoch_zero);
   if (first_error != ESP_OK) {
     (void)journal_.apply({0, MotorMode::Coast}, nowUs());
@@ -833,162 +927,18 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
   for (std::uint32_t epoch = 0U; epoch < epochs; ++epoch) {
     if (stopForLatchedFailure())
       break;
+
     const std::uint64_t epoch_start =
         epoch_zero + static_cast<std::uint64_t>(epoch) * kEpochDurationUs;
     const std::uint64_t epoch_end = epoch_start + kEpochDurationUs;
-    const std::uint64_t apply_hard_deadline = epoch_end + kEpochDurationUs;
-    ProfileEpisode episode{ProfilePhase::StationaryBaseline,
-                           ApproachBranch::None, 1U, epochs, 0, false};
-    std::uint32_t local_epoch = epoch;
-    if (full) {
-      while (episode_index + 1U < plan.commonEpisodes().size() &&
-             epoch >= episode_offset +
-                          plan.commonEpisodes()[episode_index].duration_epochs) {
-        episode_offset += plan.commonEpisodes()[episode_index].duration_epochs;
-        ++episode_index;
-      }
-      episode = plan.commonEpisodes()[episode_index];
-      local_epoch = epoch - episode_offset;
-    }
+    std::uint32_t local_epoch = 0U;
+    const ProfileEpisode episode = resolveEpisode(epoch, local_epoch);
+    ZeroApproachController *approach = approachForEpisode(episode, true);
+    const std::int32_t target_fin_angle =
+        approach == nullptr ? 0 : approach->targetMilliDeg();
 
-    MotorCommandRequest request = commandForEpisode(episode, local_epoch, fin_angle);
-    std::int32_t target_fin_angle = 0;
-    ZeroApproachController *approach = nullptr;
-    if (episode.phase == ProfilePhase::ZeroApproach) {
-      if (episode.branch == ApproachBranch::FromPositive) {
-        approach = &positive;
-        if (!positive_started) {
-          positive.reset(nowUs());
-          positive_started = true;
-        }
-      } else {
-        approach = &negative;
-        if (!negative_started) {
-          negative.reset(nowUs());
-          negative_started = true;
-        }
-      }
-      target_fin_angle = approach->targetMilliDeg();
-      if (!approach->complete()) {
-        const std::int64_t error =
-            static_cast<std::int64_t>(target_fin_angle) - fin_angle;
-        if (error > std::numeric_limits<std::int32_t>::max() ||
-            error < std::numeric_limits<std::int32_t>::min()) {
-          request = {0, MotorMode::Coast};
-        } else {
-          request = positionApproachCommand(
-              static_cast<std::int32_t>(error), fin_rate, local_epoch,
-              episode.command_limit_permille);
-        }
-      }
-    }
-
-    GuardState guard_state = GuardState::Allow;
-    esp_err_t preapply_error = ESP_OK;
-    AbortReason preapply_abort = AbortReason::None;
-    if (stop_requested_.load()) {
-      request = {0, MotorMode::Coast};
-      preapply_error = ESP_ERR_INVALID_STATE;
-      preapply_abort = AbortReason::StopRequested;
-    } else if (full && !have_angle && request.command_permille != 0) {
-      request = {0, MotorMode::Coast};
-      guard_state = GuardState::Abort;
-      preapply_error = ESP_ERR_INVALID_RESPONSE;
-      preapply_abort = AbortReason::EncoderInvalid;
-    } else if (have_angle) {
-      PositionGuardInput input{};
-      input.fin_angle_millideg = fin_angle;
-      input.fin_rate_millideg_s = fin_rate;
-      input.predicted_stopping_delta_millideg =
-          fin_rate / kPredictedStoppingRateDivisor;
-      input.requested = request;
-      input.encoder_valid = true;
-      input.consumer_deadline_met = true;
-      const PositionGuardDecision decision = guard.evaluate(input);
-      guard_state = decision.action;
-      request = decision.permitted;
-      if (decision.action == GuardState::Abort) {
-        preapply_error = ESP_ERR_INVALID_STATE;
-        preapply_abort = AbortReason::PositionGuard;
-      }
-    }
-
-    const bool command_change_required = !journal_.requestAlreadyApplied(request);
-    const ImmutableCommandEvidence before_command = journal_.snapshot(nowUs());
-    const std::uint64_t apply_started_us = nowUs();
-    bool apply_deadline_missed =
-        command_change_required && apply_started_us >= apply_hard_deadline;
-    bool apply_epoch_slipped =
-        command_change_required && !apply_deadline_missed &&
-        apply_started_us >= epoch_end;
-    esp_err_t apply_result = ESP_OK;
-    if (apply_deadline_missed) {
-      ++runtime_deadline_misses;
-      ++command_deadline_misses;
-      guard_state = GuardState::Abort;
-      apply_result = journal_.rejectAndCoast(
-          request, ESP_ERR_TIMEOUT, apply_started_us);
-    } else {
-      apply_result = journal_.apply(request, apply_started_us);
-    }
-    const ImmutableCommandEvidence applied_command = journal_.snapshot(nowUs());
-    const bool command_generation_changed =
-        applied_command.command_generation != before_command.command_generation;
-    const std::uint64_t apply_completed_us =
-        applied_command.command_apply_timestamp_us;
-    if (!apply_deadline_missed && command_generation_changed &&
-        apply_completed_us >= apply_hard_deadline) {
-      apply_deadline_missed = true;
-      apply_epoch_slipped = false;
-      ++runtime_deadline_misses;
-      ++command_deadline_misses;
-      guard_state = GuardState::Abort;
-    } else if (!apply_deadline_missed && command_generation_changed &&
-               apply_completed_us >= epoch_end) {
-      apply_epoch_slipped = true;
-      ++diagnostic_continuations;
-    }
-    ImmutableCommandEvidence epoch_command =
-        apply_epoch_slipped ? before_command : applied_command;
-    epoch_command.logger_snapshot_timestamp_us =
-        std::max(nowUs(), epoch_command.command_apply_timestamp_us);
-    if (preapply_error != ESP_OK)
-      stopForFatal(preapply_error, preapply_abort, nowUs());
-    if (apply_deadline_missed) {
-      stopForFatal(ESP_ERR_TIMEOUT, AbortReason::Deadline, nowUs());
-      if (full && !full_deadline_diagnostic_printed) {
-        const long long apply_start_late_us =
-            apply_started_us >= epoch_start
-                ? static_cast<long long>(apply_started_us - epoch_start)
-                : -static_cast<long long>(epoch_start - apply_started_us);
-        const long long apply_complete_late_us =
-            apply_completed_us >= epoch_start
-                ? static_cast<long long>(apply_completed_us - epoch_start)
-                : -static_cast<long long>(epoch_start - apply_completed_us);
-        const std::uint32_t apply_duration_us =
-            apply_completed_us >= apply_started_us
-                ? saturateU32(apply_completed_us - apply_started_us)
-                : 0U;
-        std::printf(
-            "CHAR_FULL_ABORT_TIMING epoch=%u episode=%u phase=%u "
-            "reason=command-hard apply-start-late-us=%lld "
-            "apply-duration-us=%u apply-complete-late-us=%lld "
-            "release-late-us=0 notifications=0 consumer-work-us=0 "
-            "fin-angle-mdeg=%d command-permille=%d\n",
-            static_cast<unsigned>(epoch),
-            static_cast<unsigned>(episode.episode_index),
-            static_cast<unsigned>(episode.phase), apply_start_late_us,
-            static_cast<unsigned>(apply_duration_us), apply_complete_late_us,
-            static_cast<int>(fin_angle),
-            static_cast<int>(request.command_permille));
-        full_deadline_diagnostic_printed = true;
-      }
-    } else if (apply_result != ESP_OK) {
-      stopForFatal(apply_result, AbortReason::MotorApplyError, nowUs());
-    }
-
-    if (preapply_error != ESP_OK && apply_deadline_missed)
-      break;
+    ImmutableCommandEvidence epoch_command = current_command_state.evidence;
+    GuardState guard_state = current_command_state.guard_state;
 
     const std::uint64_t wait_entry_us = nowUs();
     std::uint32_t current_consumer_work_us = 0U;
@@ -1010,25 +960,16 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
         ++consumer_schedule_misses;
         ++runtime_deadline_misses;
         stopForFatal(ESP_ERR_TIMEOUT, AbortReason::Deadline, nowUs());
-        if (full && !full_deadline_diagnostic_printed) {
-          std::printf(
-              "CHAR_FULL_ABORT_TIMING epoch=%u episode=%u phase=%u "
-              "reason=tick-queue-overflow apply-start-late-us=0 "
-              "apply-duration-us=0 apply-complete-late-us=0 "
-              "release-late-us=0 notifications=%u consumer-work-us=%u "
-              "fin-angle-mdeg=%d command-permille=%d\n",
-              static_cast<unsigned>(epoch),
-              static_cast<unsigned>(episode.episode_index),
-              static_cast<unsigned>(episode.phase),
-              consumer_tick_queue_ == nullptr
-                  ? 0U
-                  : static_cast<unsigned>(
-                        uxQueueMessagesWaiting(consumer_tick_queue_)),
-              static_cast<unsigned>(current_consumer_work_us),
-              static_cast<int>(fin_angle),
-              static_cast<int>(request.command_permille));
-          full_deadline_diagnostic_printed = true;
-        }
+        reportDeadline(
+            epoch, episode, epoch_start, "tick-queue-overflow",
+            current_command_state.apply_started_us,
+            current_command_state.apply_completed_us, 0U,
+            consumer_tick_queue_ == nullptr
+                ? 0U
+                : static_cast<std::uint32_t>(
+                      uxQueueMessagesWaiting(consumer_tick_queue_)),
+            current_consumer_work_us,
+            epoch_command.requested_command_permille);
         break;
       }
       if (consumer_tick_queue_ != nullptr &&
@@ -1070,17 +1011,15 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
       first_release_lateness_us = release_lateness_us;
     max_release_lateness_us =
         std::max(max_release_lateness_us, release_lateness_us);
-    if (epoch != 0U) {
+    if (epoch != 0U)
       max_steady_release_lateness_us =
           std::max(max_steady_release_lateness_us, release_lateness_us);
-    }
     previous_release_us = release_us;
     have_previous_release = true;
 
-    if (stop_requested_.load() && last_abort_reason_ == AbortReason::None) {
+    if (stop_requested_.load() && last_abort_reason_ == AbortReason::None)
       stopForFatal(ESP_ERR_INVALID_STATE, AbortReason::StopRequested,
                    release_us);
-    }
     if (last_abort_reason_ == AbortReason::StopRequested &&
         release_us < epoch_end)
       break;
@@ -1099,49 +1038,25 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
       } else {
         ++runtime_deadline_misses;
         stopForFatal(ESP_ERR_TIMEOUT, AbortReason::Deadline, release_us);
-        if (full && !full_deadline_diagnostic_printed) {
-          const long long apply_start_late_us =
-              apply_started_us >= epoch_start
-                  ? static_cast<long long>(apply_started_us - epoch_start)
-                  : -static_cast<long long>(epoch_start - apply_started_us);
-          const long long apply_complete_late_us =
-              apply_completed_us >= epoch_start
-                  ? static_cast<long long>(apply_completed_us - epoch_start)
-                  : -static_cast<long long>(epoch_start - apply_completed_us);
-          const std::uint32_t apply_duration_us =
-              apply_completed_us >= apply_started_us
-                  ? saturateU32(apply_completed_us - apply_started_us)
-                  : 0U;
-          const char *deadline_reason =
-              tick_queue_overflow
-                  ? "tick-queue-overflow"
-                  : (!tick_matches_epoch
-                         ? "tick-order"
-                         : (consumer_tick_backlog > 2U
-                                ? "tick-backlog"
-                                : (alarm_lateness_us >= kEpochDurationUs
-                                       ? "alarm-hard"
-                                       : "release-hard")));
-          std::printf(
-              "CHAR_FULL_ABORT_TIMING epoch=%u episode=%u phase=%u "
-              "reason=%s apply-start-late-us=%lld apply-duration-us=%u "
-              "apply-complete-late-us=%lld release-late-us=%u "
-              "notifications=%u consumer-work-us=%u fin-angle-mdeg=%d "
-              "command-permille=%d\n",
-              static_cast<unsigned>(epoch),
-              static_cast<unsigned>(episode.episode_index),
-              static_cast<unsigned>(episode.phase), deadline_reason,
-              apply_start_late_us, static_cast<unsigned>(apply_duration_us),
-              apply_complete_late_us,
-              static_cast<unsigned>(release_lateness_us),
-              static_cast<unsigned>(consumer_tick_backlog),
-              static_cast<unsigned>(current_consumer_work_us),
-              static_cast<int>(fin_angle),
-              static_cast<int>(request.command_permille));
-          full_deadline_diagnostic_printed = true;
-        }
+        const char *reason =
+            tick_queue_overflow
+                ? "tick-queue-overflow"
+                : (!tick_matches_epoch
+                       ? "tick-order"
+                       : (consumer_tick_backlog > 2U
+                              ? "tick-backlog"
+                              : (alarm_lateness_us >= kEpochDurationUs
+                                     ? "alarm-hard"
+                                     : "release-hard")));
+        reportDeadline(epoch, episode, epoch_start, reason,
+                       current_command_state.apply_started_us,
+                       current_command_state.apply_completed_us,
+                       release_lateness_us, consumer_tick_backlog,
+                       current_consumer_work_us,
+                       epoch_command.requested_command_permille);
       }
     }
+
     const bool consumer_schedule_invalid =
         !release_deadline_missed &&
         (!tick_matches_epoch || tick_queue_overflow ||
@@ -1151,45 +1066,16 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
       ++consumer_schedule_misses;
       ++runtime_deadline_misses;
       stopForFatal(ESP_ERR_TIMEOUT, AbortReason::Deadline, release_us);
-      if (full && !full_deadline_diagnostic_printed) {
-        const long long apply_start_late_us =
-            apply_started_us >= epoch_start
-                ? static_cast<long long>(apply_started_us - epoch_start)
-                : -static_cast<long long>(epoch_start - apply_started_us);
-        const long long apply_complete_late_us =
-            apply_completed_us >= epoch_start
-                ? static_cast<long long>(apply_completed_us - epoch_start)
-                : -static_cast<long long>(epoch_start - apply_completed_us);
-        const std::uint32_t apply_duration_us =
-            apply_completed_us >= apply_started_us
-                ? saturateU32(apply_completed_us - apply_started_us)
-                : 0U;
-        std::printf(
-            "CHAR_FULL_ABORT_TIMING epoch=%u episode=%u phase=%u "
-            "reason=schedule apply-start-late-us=%lld "
-            "apply-duration-us=%u apply-complete-late-us=%lld "
-            "release-late-us=%u notifications=%u consumer-work-us=%u "
-            "fin-angle-mdeg=%d command-permille=%d\n",
-            static_cast<unsigned>(epoch),
-            static_cast<unsigned>(episode.episode_index),
-            static_cast<unsigned>(episode.phase), apply_start_late_us,
-            static_cast<unsigned>(apply_duration_us), apply_complete_late_us,
-            static_cast<unsigned>(release_lateness_us),
-            static_cast<unsigned>(consumer_tick_backlog),
-            static_cast<unsigned>(current_consumer_work_us),
-            static_cast<int>(fin_angle),
-            static_cast<int>(request.command_permille));
-        full_deadline_diagnostic_printed = true;
-      }
+      reportDeadline(epoch, episode, epoch_start, "schedule",
+                     current_command_state.apply_started_us,
+                     current_command_state.apply_completed_us,
+                     release_lateness_us, consumer_tick_backlog,
+                     current_consumer_work_us,
+                     epoch_command.requested_command_permille);
     }
 
-    const std::uint64_t snapshot_us = nowUs();
     PowerEvidence power_evidence{};
-    power_evidence.capture_timestamp_us = 0U;
-    power_evidence.motor_millivolts = 0U;
     power_evidence.read_result = ESP_ERR_NOT_SUPPORTED;
-    power_evidence.valid = false;
-    epoch_command.logger_snapshot_timestamp_us = snapshot_us;
 
     if (writer_.firstError() != ESP_OK) {
       stopForFatal(writer_.firstError(), AbortReason::WriterError, release_us);
@@ -1208,16 +1094,15 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
         break;
       }
     }
+
     EncoderEpochBlock block{};
     if (!assembler.release(epoch, release_us, block)) {
       stopForFatal(ESP_ERR_INVALID_SIZE, AbortReason::ValidationError,
                    nowUs());
       break;
     }
-    if (release_deadline_missed && !apply_deadline_missed)
+    if (release_deadline_missed)
       block.flags = static_cast<std::uint16_t>(block.flags & ~EpochDeadline);
-    if (apply_deadline_missed)
-      block.flags = static_cast<std::uint16_t>(block.flags | EpochDeadline);
 
     if ((block.flags & EpochAggregateValid) != 0U) {
       std::int32_t converted_angle = 0;
@@ -1229,18 +1114,18 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
       } else {
         previous_fin_angle = fin_angle;
         fin_angle = converted_angle;
-        const std::int64_t rate =
+        const std::int64_t measured_rate =
             have_angle
                 ? static_cast<std::int64_t>(fin_angle - previous_fin_angle) *
                       1'000
                 : 0;
-        if (rate < std::numeric_limits<std::int32_t>::min() ||
-            rate > std::numeric_limits<std::int32_t>::max()) {
+        if (measured_rate < std::numeric_limits<std::int32_t>::min() ||
+            measured_rate > std::numeric_limits<std::int32_t>::max()) {
           stopForFatal(ESP_ERR_INVALID_SIZE, AbortReason::PositionGuard,
                        nowUs());
           guard_state = GuardState::Abort;
         } else {
-          fin_rate = static_cast<std::int32_t>(rate);
+          fin_rate = static_cast<std::int32_t>(measured_rate);
           have_angle = true;
         }
       }
@@ -1250,6 +1135,7 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
       stopForFatal(ESP_ERR_INVALID_RESPONSE, AbortReason::EncoderInvalid,
                    nowUs());
     }
+
     if (sampler_.firstError() != ESP_OK) {
       if (full)
         stopForFatal(sampler_.firstError(), AbortReason::SamplerError,
@@ -1278,6 +1164,140 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
         first_error == ESP_OK) {
       stopForFatal(ESP_ERR_TIMEOUT, AbortReason::Timeout, nowUs());
     }
+
+    EpochCommandState next_command_state = current_command_state;
+    bool next_command_state_valid = false;
+    if (epoch + 1U < epochs && first_error == ESP_OK && !qualification_stop) {
+      const std::uint32_t next_epoch = epoch + 1U;
+      const std::uint64_t next_epoch_start = epoch_end;
+      const std::uint64_t next_epoch_end =
+          next_epoch_start + kEpochDurationUs;
+      const std::uint64_t next_apply_hard_deadline =
+          next_epoch_end + kEpochDurationUs;
+      std::uint32_t next_local_epoch = 0U;
+      const ProfileEpisode next_episode =
+          resolveEpisode(next_epoch, next_local_epoch);
+
+      MotorCommandRequest next_request =
+          commandForEpisode(next_episode, next_local_epoch, fin_angle);
+      ZeroApproachController *next_approach =
+          approachForEpisode(next_episode, true);
+      if (next_approach != nullptr && !next_approach->complete()) {
+        const std::int32_t next_target = next_approach->targetMilliDeg();
+        const std::int64_t error =
+            static_cast<std::int64_t>(next_target) - fin_angle;
+        if (error > std::numeric_limits<std::int32_t>::max() ||
+            error < std::numeric_limits<std::int32_t>::min()) {
+          next_request = {0, MotorMode::Coast};
+        } else {
+          next_request = positionApproachCommand(
+              static_cast<std::int32_t>(error), fin_rate, next_local_epoch,
+              next_episode.command_limit_permille);
+        }
+      }
+
+      GuardState next_guard_state = GuardState::Allow;
+      esp_err_t next_preapply_error = ESP_OK;
+      AbortReason next_preapply_abort = AbortReason::None;
+      if (stop_requested_.load()) {
+        next_request = {0, MotorMode::Coast};
+        next_preapply_error = ESP_ERR_INVALID_STATE;
+        next_preapply_abort = AbortReason::StopRequested;
+      } else if (full && !have_angle && next_request.command_permille != 0) {
+        next_request = {0, MotorMode::Coast};
+        next_guard_state = GuardState::Abort;
+        next_preapply_error = ESP_ERR_INVALID_RESPONSE;
+        next_preapply_abort = AbortReason::EncoderInvalid;
+      } else if (have_angle) {
+        PositionGuardInput input{};
+        input.fin_angle_millideg = fin_angle;
+        input.fin_rate_millideg_s = fin_rate;
+        input.predicted_stopping_delta_millideg =
+            fin_rate / kPredictedStoppingRateDivisor;
+        input.requested = next_request;
+        input.encoder_valid = true;
+        input.consumer_deadline_met = true;
+        const PositionGuardDecision decision = guard.evaluate(input);
+        next_guard_state = decision.action;
+        next_request = decision.permitted;
+        if (decision.action == GuardState::Abort) {
+          next_preapply_error = ESP_ERR_INVALID_STATE;
+          next_preapply_abort = AbortReason::PositionGuard;
+        }
+      }
+
+      if (next_preapply_error != ESP_OK) {
+        stopForFatal(next_preapply_error, next_preapply_abort, nowUs());
+      } else {
+        const ImmutableCommandEvidence before_command =
+            journal_.snapshot(nowUs());
+        const bool command_change_required =
+            !journal_.requestAlreadyApplied(next_request);
+        const std::uint64_t apply_started_us = nowUs();
+        bool apply_deadline_missed =
+            command_change_required &&
+            apply_started_us >= next_apply_hard_deadline;
+        esp_err_t apply_result = ESP_OK;
+        if (apply_deadline_missed) {
+          ++runtime_deadline_misses;
+          ++command_deadline_misses;
+          apply_result = journal_.rejectAndCoast(
+              next_request, ESP_ERR_TIMEOUT, apply_started_us);
+        } else {
+          apply_result = journal_.apply(next_request, apply_started_us);
+        }
+
+        const ImmutableCommandEvidence applied_command =
+            journal_.snapshot(nowUs());
+        const bool command_generation_changed =
+            applied_command.command_generation !=
+            before_command.command_generation;
+        const std::uint64_t apply_completed_us =
+            applied_command.command_apply_timestamp_us;
+        if (!apply_deadline_missed && command_generation_changed &&
+            apply_completed_us >= next_apply_hard_deadline) {
+          apply_deadline_missed = true;
+          ++runtime_deadline_misses;
+          ++command_deadline_misses;
+        }
+
+        const bool apply_epoch_slipped =
+            !apply_deadline_missed && command_generation_changed &&
+            apply_completed_us >= next_epoch_end;
+        if (apply_epoch_slipped)
+          ++diagnostic_continuations;
+
+        if (apply_deadline_missed) {
+          stopForFatal(ESP_ERR_TIMEOUT, AbortReason::Deadline, nowUs());
+          reportDeadline(next_epoch, next_episode, next_epoch_start,
+                         "command-hard", apply_started_us,
+                         apply_completed_us, 0U, 0U, 0U,
+                         next_request.command_permille);
+        } else if (apply_result != ESP_OK) {
+          stopForFatal(apply_result, AbortReason::MotorApplyError, nowUs());
+        } else {
+          if (apply_epoch_slipped) {
+            next_command_state = current_command_state;
+            next_command_state.evidence = before_command;
+          } else {
+            next_command_state.evidence = applied_command;
+            next_command_state.guard_state = next_guard_state;
+            if (command_generation_changed) {
+              next_command_state.apply_started_us = apply_started_us;
+              next_command_state.apply_completed_us = apply_completed_us;
+            } else if (applied_command.command_generation !=
+                       current_command_state.evidence.command_generation) {
+              next_command_state.apply_started_us = apply_completed_us;
+              next_command_state.apply_completed_us = apply_completed_us;
+            }
+          }
+          next_command_state_valid = true;
+        }
+      }
+    }
+
+    epoch_command.logger_snapshot_timestamp_us =
+        std::max(nowUs(), epoch_command.command_apply_timestamp_us);
 
     if ((first_error != ESP_OK || qualification_stop) && journal_.armed())
       (void)journal_.disarm(nowUs());
@@ -1318,10 +1338,19 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
           ++qualification_valid;
       }
     }
+
     if (writer_.firstError() != ESP_OK)
       stopForFatal(writer_.firstError(), AbortReason::WriterError, nowUs());
     if (first_error != ESP_OK || qualification_stop)
       break;
+    if (epoch + 1U < epochs) {
+      if (!next_command_state_valid) {
+        stopForFatal(ESP_ERR_INVALID_STATE, AbortReason::ValidationError,
+                     nowUs());
+        break;
+      }
+      current_command_state = next_command_state;
+    }
   }
 
   std::uint32_t wire_shutdown_mask = 0U;
@@ -1334,7 +1363,8 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
     rememberOperation(operation, first_error);
   };
 
-  const esp_err_t coast_result = journal_.apply({0, MotorMode::Coast}, nowUs());
+  const esp_err_t coast_result =
+      journal_.apply({0, MotorMode::Coast}, nowUs());
   markShutdown(coast_result);
   (void)shutdown.mark(ShutdownStep::Coast);
   const esp_err_t disarm_result = journal_.disarm(nowUs());
