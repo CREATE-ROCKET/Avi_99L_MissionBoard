@@ -44,13 +44,21 @@ private:
 
 class SdFlightLog {
 public:
-  static constexpr std::size_t kWriteBatchRecords = 64U;
+  // 8 KiBをSD writeの上限目標とし、serialized recordを途中で分断しない。
+  // schema v1 (128 B)では64 records = 8192 B、schema v2 (192 B)では
+  // 42 records = 8064 Bとなる。record size変更時もcompile-timeで追従する。
+  static constexpr std::size_t kWriteBatchTargetBytes = 8192U;
+  static constexpr std::size_t kWriteBatchRecords =
+      kWriteBatchTargetBytes / flight_log::kSerializedRecordBytes;
   static constexpr std::size_t kWriteBatchBytes =
       flight_log::kSerializedRecordBytes * kWriteBatchRecords;
   static constexpr std::size_t kPsramReserveBytes = 512U * 1024U;
   static constexpr std::size_t kMaxPsramStagingBytes = 8U * 1024U * 1024U;
 
-  static_assert(kWriteBatchBytes == 8192U);
+  static_assert(kWriteBatchRecords > 0U);
+  static_assert(kWriteBatchBytes <= kWriteBatchTargetBytes);
+  static_assert(kWriteBatchTargetBytes - kWriteBatchBytes <
+                flight_log::kSerializedRecordBytes);
 
   ~SdFlightLog();
   [[nodiscard]] esp_err_t prepareForFlight();

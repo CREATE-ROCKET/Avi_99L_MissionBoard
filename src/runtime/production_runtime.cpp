@@ -491,30 +491,6 @@ esp_err_t writeFrame(CANCREATE &can, const protocol::CanFrame &frame) {
   return can.write(output, avi::Timeout::milliseconds(5));
 }
 
-bool estimatePreflightGyroBias(const sensors::GyroHistoryRing &history,
-                               uint64_t liftoff_time_us, double &bias) {
-  constexpr uint64_t kBiasWindowUs = 1'000'000;
-  const uint64_t first_time = liftoff_time_us > kBiasWindowUs
-                                  ? liftoff_time_us - kBiasWindowUs
-                                  : 0;
-  double sum = 0.0;
-  std::size_t count = 0;
-  for (std::size_t index = 0; index < history.size(); ++index) {
-    const auto &sample = history.at(index);
-    if (sample.timestamp_us < first_time ||
-        sample.timestamp_us > liftoff_time_us || !sample.valid ||
-        sample.saturated || sample.format_fault || sample.lost_packets != 0)
-      continue;
-    sum += sample.roll_rate_rad_s;
-    ++count;
-  }
-  // TODO(SIMULATION): 1秒/500 sample条件をpreflight noiseで再評価する。
-  if (count < 500)
-    return false;
-  bias = sum / static_cast<double>(count);
-  return true;
-}
-
 void safetyTask(void *) {
   addWatchdog();
   bool cutoff_latched = false;
@@ -2437,7 +2413,7 @@ void missionRealtimeTask(void *) {
         std::isfinite(fin_rate_rad_s);
     const bool fin_sample_valid =
         fin_observation_valid && fin_zero_available && std::isfinite(fin_angle_rad);
-    if (mission_snapshot.state == protocol::MissionState::command_receive &&
+    if (detector_state == protocol::MissionState::command_receive &&
         command_fin_auto_hold_allowed && command_fin_mode == CommandFinMode::free &&
         fin_observation_valid &&
         !actuator_output_inhibited.load(std::memory_order_acquire)) {
