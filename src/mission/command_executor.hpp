@@ -13,10 +13,18 @@ enum class CommandCode : uint8_t {
   cancel_sequence = 0x02,
   disable_fin_control = 0x03,
   force_start_sequence = 0x04,
-  fin_free = 0x10,
+
+  // CommandReceiveで地上局へ公開する動翼操作はこの2つだけとする。
+  fin_release_hold = 0x10,
+  fin_hold_current = 0x13,
+
+  // production_runtime内部の既存分岐を維持するための互換名。
+  // 0x11/0x12はwire commandとしてはCommandExecutorで拒否する。
+  fin_free = fin_release_hold,
   set_fin_zero = 0x11,
   start_fin_zero_hold = 0x12,
-  fin_move_relative = 0x13,
+  fin_move_relative = fin_hold_current,
+
   para_free = 0x20,
   para_hold = 0x21,
   para_move_relative = 0x22,
