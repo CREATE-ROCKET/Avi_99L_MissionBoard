@@ -7,7 +7,8 @@
 namespace runtime::flight_log {
 
 inline constexpr uint8_t kSchemaVersion = 2;
-inline constexpr std::size_t kSerializedRecordBytes = 176;
+// 256 byte固定にして4 KiB Flash scanと8 KiB SD batchへ整数個で整列させる。
+inline constexpr std::size_t kSerializedRecordBytes = 256;
 inline constexpr uint32_t kInvalidDropCounter = 0xFFFF'FFFFU;
 inline constexpr uint16_t kUnknownEncoderZeroCount = 0xFFFFU;
 
