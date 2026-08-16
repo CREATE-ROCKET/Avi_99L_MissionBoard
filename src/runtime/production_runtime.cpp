@@ -2312,14 +2312,22 @@ void missionRealtimeTask(void *) {
     const bool imu_stale = last_imu_host_sample_us == 0 ||
                            imu_now_us < last_imu_host_sample_us ||
                            imu_now_us - last_imu_host_sample_us > 3'000;
-    if (imu_data_loss_latched || imu_stale) {
+    if (imu_data_loss_latched || imu_stale || !imu.initialized()) {
       imu_ready.store(false, std::memory_order_release);
       if (attitude.state().valid)
         attitude.invalidateForReset();
-      if (imu.initialized() &&
-          imu_now_us - last_imu_recovery_attempt_us >= 100'000) {
+      const uint64_t imu_retry_interval_us =
+          detector_state == protocol::MissionState::command_receive
+              ? static_cast<uint64_t>(
+                    flight_config::kCommandReceiveDeviceReconnectMs) *
+                    1'000ULL
+              : 100'000ULL;
+      if (imu_now_us >= last_imu_recovery_attempt_us &&
+          imu_now_us - last_imu_recovery_attempt_us >=
+              imu_retry_interval_us) {
         last_imu_recovery_attempt_us = imu_now_us;
-        (void)imu.end();
+        if (imu.initialized())
+          (void)imu.end();
         ++timestamp_epoch;
         if (timestamp_epoch == 0)
           timestamp_epoch = 1;
@@ -3002,16 +3010,16 @@ void airDataTask(void *) {
   config.lock_timeout = avi::Timeout::noWait();
   config.operation_timeout =
       avi::Timeout::milliseconds(board::kAirDataOperationTimeoutMs);
-  const esp_err_t bus_result = bus.begin(config);
+  esp_err_t bus_result = bus.begin(config);
   LPS25HB lps;
   SSCDRRN005PD2A5 ssc;
+  LPS25HB::Config lps_config{};
+  lps_config.odr = LPS25HB::Odr::hz25;
+  lps_config.pressure_average = LPS25HB::PressureAverage::samples8;
+  lps_config.temperature_average = LPS25HB::TemperatureAverage::samples8;
   esp_err_t lps_result = ESP_ERR_NOT_FOUND;
   esp_err_t ssc_result = ESP_ERR_NOT_FOUND;
   if (bus_result == ESP_OK) {
-    LPS25HB::Config lps_config{};
-    lps_config.odr = LPS25HB::Odr::hz25;
-    lps_config.pressure_average = LPS25HB::PressureAverage::samples8;
-    lps_config.temperature_average = LPS25HB::TemperatureAverage::samples8;
     if (bus.probe(0x5C) == ESP_OK)
       lps_result = lps.begin(bus, LPS25HB::Address::low, lps_config);
     else if (bus.probe(0x5D) == ESP_OK)
@@ -3035,7 +3043,10 @@ void airDataTask(void *) {
   mission::MissionSnapshot mission_snapshot{};
   uint64_t last_ssc_us = 0;
   uint64_t last_lps_us = 0;
+  uint64_t last_reconnect_us = 0;
   uint32_t calibration_generation = 0;
+  uint8_t lps_consecutive_errors = 0;
+  uint8_t ssc_consecutive_errors = 0;
 
   auto updateMissionSnapshot = [&]() {
     if (xSemaphoreTake(state_mutex, 0) == pdTRUE) {
@@ -3050,6 +3061,49 @@ void airDataTask(void *) {
       xSemaphoreGive(state_mutex);
     }
   };
+  auto reconnectAirData = [&](uint64_t now_us) {
+    if (now_us < last_reconnect_us ||
+        now_us - last_reconnect_us <
+            static_cast<uint64_t>(
+                flight_config::kCommandReceiveDeviceReconnectMs) *
+                1'000ULL)
+      return;
+    last_reconnect_us = now_us;
+
+    if (!bus.initialized())
+      bus_result = bus.begin(config);
+    if (!bus.initialized()) {
+      lps_ready.store(false, std::memory_order_release);
+      ssc_ready.store(false, std::memory_order_release);
+      return;
+    }
+
+    if (!lps.initialized()) {
+      if (bus.probe(0x5C) == ESP_OK)
+        lps_result = lps.begin(bus, LPS25HB::Address::low, lps_config);
+      else if (bus.probe(0x5D) == ESP_OK)
+        lps_result = lps.begin(bus, LPS25HB::Address::high, lps_config);
+      else
+        lps_result = ESP_ERR_NOT_FOUND;
+      lps_ready.store(lps_result == ESP_OK, std::memory_order_release);
+      if (lps_result == ESP_OK)
+        lps_consecutive_errors = 0;
+    }
+
+    if (!ssc.initialized()) {
+      ssc_result = bus.probe(0x28) == ESP_OK ? ssc.begin(bus)
+                                             : ESP_ERR_NOT_FOUND;
+      ssc_ready.store(ssc_result == ESP_OK, std::memory_order_release);
+      if (ssc_result == ESP_OK) {
+        ssc_consecutive_errors = 0;
+        // 再接続後に古い差圧zeroを新device sampleへ暗黙適用しない。
+        pressure_conditioner.reset();
+        snapshot.ssc_zero_valid = false;
+        snapshot.airspeed_valid = false;
+      }
+    }
+  };
+
   auto setInitialSscError = [&](esp_err_t result) {
     if (snapshot.ssc_monotonic_us != 0)
       return;
@@ -3073,6 +3127,10 @@ void airDataTask(void *) {
 
   for (;;) {
     const uint64_t now_us = static_cast<uint64_t>(esp_timer_get_time());
+    updateMissionSnapshot();
+    // LPS/SSC recovery itself may continue in flight. Control loss remains
+    // one-shot inhibited by MissionStateMachine and does not re-enter after recovery.
+    reconnectAirData(now_us);
     const bool calibration_active =
         preflight_calibration_active.load(std::memory_order_acquire);
     const uint32_t requested_generation =
@@ -3091,6 +3149,7 @@ void airDataTask(void *) {
         SSCDRRN005PD2A5::Data data{};
         const esp_err_t result = ssc.read(data);
         if (result == ESP_OK) {
+          ssc_consecutive_errors = 0;
           snapshot.ssc_monotonic_us = now_us;
           snapshot.ssc_valid = true;
           snapshot.ssc_temperature_celsius = data.temperature_celsius;
@@ -3154,6 +3213,16 @@ void airDataTask(void *) {
           }
         } else {
           setInitialSscError(result);
+          if (ssc_consecutive_errors != 0xFFU)
+            ++ssc_consecutive_errors;
+          if (ssc_consecutive_errors >= 3) {
+            (void)ssc.end();
+            ssc_ready.store(false, std::memory_order_release);
+            snapshot.ssc_valid = false;
+            snapshot.ssc_zero_valid = false;
+            snapshot.airspeed_valid = false;
+            pressure_conditioner.reset();
+          }
         }
       } else {
         setInitialSscError(ESP_ERR_INVALID_STATE);
@@ -3170,6 +3239,7 @@ void airDataTask(void *) {
       if (lps.initialized())
         read_result = lps.read(data);
       if (read_result == ESP_OK) {
+        lps_consecutive_errors = 0;
         snapshot.lps_monotonic_us = now_us;
         snapshot.lps_valid = true;
         snapshot.static_pressure_pa = data.pressure_pa;
@@ -3182,6 +3252,13 @@ void airDataTask(void *) {
                 protocol::quantization::LpsTemperatureError::unknown);
       } else {
         setInitialLpsError(read_result);
+        if (lps_consecutive_errors != 0xFFU)
+          ++lps_consecutive_errors;
+        if (lps_consecutive_errors >= 3) {
+          (void)lps.end();
+          lps_ready.store(false, std::memory_order_release);
+          snapshot.lps_valid = false;
+        }
       }
       snapshot.flight = flight_logic.update(
           mission_snapshot.flight_epoch, mission_snapshot.state,
