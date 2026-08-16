@@ -4,6 +4,7 @@
 #include <cmath>
 
 #include "control/fin_overtravel_guard.hpp"
+#include "control/motor_bus_voltage.hpp"
 
 namespace control {
 namespace {
@@ -28,7 +29,7 @@ bool finiteState(const RollState &state) {
          std::isfinite(state.fin_rate_rad_s);
 }
 
-} // 無名名前空間
+} // namespace
 
 TorqueRequest RollController::compute(const RollState &state,
                                       double airspeed_mps,
@@ -40,8 +41,8 @@ TorqueRequest RollController::compute(const RollState &state,
           ? limits.roll_control_gentle_limit_Nm
           : limits.roll_control_high_authority_limit_Nm;
   if (!schedule_.configured || !finiteState(state) ||
-      !std::isfinite(airspeed_mps) ||
-      !std::isfinite(output_limit_nm) || output_limit_nm <= 0.0)
+      !std::isfinite(airspeed_mps) || !std::isfinite(output_limit_nm) ||
+      output_limit_nm <= 0.0)
     return {};
   constexpr std::array<double, 7> kRequiredSpeeds{60.0, 80.0, 100.0, 120.0,
                                                   140.0, 160.0, 180.0};
@@ -58,8 +59,8 @@ TorqueRequest RollController::compute(const RollState &state,
   const std::size_t low = high == 0 ? 0 : high - 1;
   const auto &left = schedule_.points[low];
   const auto &right = schedule_.points[high];
-  if (right.airspeed_mps < left.airspeed_mps ||
-      left.airspeed_mps < 60.0 || right.airspeed_mps > 180.0)
+  if (right.airspeed_mps < left.airspeed_mps || left.airspeed_mps < 60.0 ||
+      right.airspeed_mps > 180.0)
     return {};
   const double denominator = right.airspeed_mps - left.airspeed_mps;
   const double fraction = denominator > 0.0
@@ -81,9 +82,6 @@ TorqueRequest RollController::compute(const RollState &state,
   }
   if (!std::isfinite(torque))
     return {};
-  // The matched Control-OFF path deliberately runs the same state, schedule,
-  // lookup and finite-value validation above.  Its only changed condition is
-  // the final requested torque.
   if (verification_mode == RollVerificationMode::matched_control_off)
     return {0.0, false, true};
   bool saturated = false;
@@ -170,10 +168,15 @@ MotorCommand TorqueMapper::map(double requested_output_torque_nm,
                                double fin_angle_rad,
                                double fin_rate_rad_s,
                                double motor_bus_voltage_v) const {
+  const auto measured_bus = motor_bus_voltage::snapshot();
+  if (measured_bus.status == motor_bus_voltage::Status::invalid)
+    return {};
+  if (measured_bus.status == motor_bus_voltage::Status::live)
+    motor_bus_voltage_v = measured_bus.voltage_v;
+
   if (!profile_.parameters_valid ||
       profile_.polarity == board::MotorPolarity::unconfigured ||
-      !limits_.configured ||
-      profile_.resistance_ohm <= 0.0 ||
+      !limits_.configured || profile_.resistance_ohm <= 0.0 ||
       profile_.torque_constant_nm_per_a <= 0.0 ||
       profile_.speed_constant_rpm_per_v <= 0.0 ||
       profile_.drivetrain_efficiency <= 0.0 ||
@@ -194,8 +197,6 @@ MotorCommand TorqueMapper::map(double requested_output_torque_nm,
   const bool lower_limit_brake =
       fin_angle_rad <= limits_.minimum_rad && torque <= 0.0;
   if (upper_limit_brake || lower_limit_brake) {
-    // limit位置でtorqueを0にするだけではback-EMF補償電圧が残り、
-    // stopper方向へPWMを出し続け得るため、明示的なbrake commandとする。
     return {0.0, 0.0, 0.0, 0.0, true, true, true, true};
   }
   const double motor_torque =
@@ -206,8 +207,8 @@ MotorCommand TorqueMapper::map(double requested_output_torque_nm,
   const double motor_speed_rpm = motor_speed_rad_s / kRadiansPerRpm;
   const double back_emf_v = motor_speed_rpm / profile_.speed_constant_rpm_per_v;
   const double voltage = current * profile_.resistance_ohm + back_emf_v;
-  const double duty = std::clamp(std::abs(voltage) / motor_bus_voltage_v,
-                                 0.0, 1.0);
+  const double duty =
+      std::clamp(std::abs(voltage) / motor_bus_voltage_v, 0.0, 1.0);
   if (std::abs(voltage) > motor_bus_voltage_v)
     saturated = true;
   const bool positive_voltage = voltage >= 0.0;
@@ -230,8 +231,7 @@ double DrivetrainStructuralModel::conservativeLostMotionRad() {
   return StructuralParameters::measured_backlash_full_width_rad;
 }
 
-StopperJudgement
-judgeStopperContact(const StopperObservation &observation) {
+StopperJudgement judgeStopperContact(const StopperObservation &observation) {
   if (!std::isfinite(observation.fin_angle_rad) ||
       !std::isfinite(observation.fin_rate_rad_s) ||
       !std::isfinite(observation.static_contact_torque_nm) ||
@@ -259,4 +259,4 @@ ControlMode MissionControlCoordinator::choose(bool roll_requested,
   return ControlMode::brake;
 }
 
-} // 名前空間 control
+} // namespace control
