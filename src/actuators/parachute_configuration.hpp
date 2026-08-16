@@ -13,6 +13,14 @@ constexpr int kParachuteHalfRevolutionCounts =
 constexpr double kParachuteDegreesPerCount =
     360.0 / static_cast<double>(kParachuteCountsPerRevolution);
 
+// STS3215 multi-turn position feedbackのbit15=sign、bit0..14=magnitudeを
+// 連続したsigned countへ変換する。保存済みendpointには使用しない。
+[[nodiscard]] constexpr int32_t
+decodeStsSignedMagnitudePositionCount(uint16_t raw_count) {
+  const int32_t magnitude = static_cast<int32_t>(raw_count & 0x7FFFU);
+  return (raw_count & 0x8000U) != 0U ? -magnitude : magnitude;
+}
+
 class AbsoluteParachuteAngle {
 public:
   // NVS/RTC endpointなど、既に1回転内へ正規化済みのcountだけを受理する。
@@ -23,15 +31,13 @@ public:
     return AbsoluteParachuteAngle{count};
   }
 
-  // STS3215のcurrent position rawはbit15=sign、bit0..14=magnitudeであり、
-  // step/multi-turn動作では1回転を越える。機構の絶対角として使う際は
-  // signed positionを1回転内の0..4095へwrapする。
-  // 保存済みendpoint/checkpointの検証にはfromCanonicalCount()を使うこと。
+  // STS3215のposition+multi-turn current positionを1回転内の
+  // 0..4095へwrapする。保存済みendpoint/checkpointの検証には
+  // fromCanonicalCount()を使うこと。
   [[nodiscard]] static constexpr std::optional<AbsoluteParachuteAngle>
   fromCount(uint16_t raw_count) {
-    const int32_t magnitude = static_cast<int32_t>(raw_count & 0x7FFFU);
     const int32_t signed_count =
-        (raw_count & 0x8000U) != 0U ? -magnitude : magnitude;
+        decodeStsSignedMagnitudePositionCount(raw_count);
     int32_t wrapped = signed_count % kParachuteCountsPerRevolution;
     if (wrapped < 0)
       wrapped += kParachuteCountsPerRevolution;

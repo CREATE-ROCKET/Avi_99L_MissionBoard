@@ -56,6 +56,14 @@ void testAbsoluteAnglesAndConfiguration() {
   require(angle(4095).count() == 4095, "count 4095 must be valid");
   require(!AbsoluteParachuteAngle::fromCanonicalCount(4096).has_value(),
           "canonical count 4096 must remain invalid");
+  require(actuators::decodeStsSignedMagnitudePositionCount(0x0000U) == 0,
+          "STS zero raw must decode to zero");
+  require(actuators::decodeStsSignedMagnitudePositionCount(0x1000U) == 4096,
+          "STS positive one-turn raw must remain unwrapped");
+  require(actuators::decodeStsSignedMagnitudePositionCount(0x8001U) == -1,
+          "STS negative one raw must decode signed magnitude");
+  require(actuators::decodeStsSignedMagnitudePositionCount(0x9000U) == -4096,
+          "STS negative one-turn raw must remain unwrapped");
 
   const auto one_turn = AbsoluteParachuteAngle::fromCount(4096);
   require(one_turn.has_value() && one_turn->count() == 0,

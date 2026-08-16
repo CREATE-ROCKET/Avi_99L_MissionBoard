@@ -16,6 +16,18 @@ Open/Closeは1回転内の絶対角であり、それぞれ独立したoptional�
 
 通常StartはOpen/Closeの両方を要求する。ForceStartではOpen/Closeを独立optionalのままflight snapshotへfreezeできる。
 
+### 2.1 STS3215 current/target座標系
+
+productionのパラシュートサーボは`OperatingMode::position`と`FeedbackMode::multi_turn`を使用する。`OperatingMode::step`は相対移動command向けであり、停止後のcurrent position feedbackを物理絶対角として扱えないfirmwareがあるため、productionのcurrent angle sourceには使用しない。
+
+- STS3215のfresh current positionはsigned multi-turn countとして取得する。
+- GUI/CAN/LoRaへ送る`parachute angle`とOpen/Close endpoint比較では、fresh multi-turn countを1回転内`0..4095`へwrapした物理絶対角を使う。
+- `ParaMoveRelative`はfresh multi-turn currentに要求変位を加えたabsolute multi-turn targetを`position` modeへ送る。要求変位は従来どおり`abs(delta) < 180 deg`とする。
+- `ParaOpen`/`ParaClose`はwrapped currentとendpointから`shortestParachuteDisplacement`を求め、その`(-180, +180) deg`の変位をfresh multi-turn currentへ加えたabsolute multi-turn targetを送る。exact 180 degは従来どおり拒否する。
+- Holdはfresh current position自体をabsolute targetとして保持する。
+- driver/deviceのmulti-turn有効範囲を越えるtargetはalternate long pathへ置換せずfailureとする。
+- 電源再投入後に過去のturn countをNVSから推測しない。毎回STSのfresh position feedbackをsource of truthとし、永続化するOpen/Closeは1回転内絶対角だけとする。
+
 ## 3. half-turn判定
 
 half-turnは保存済みOpenとCloseの相互関係ではなく、実際に移動するときのfreshな現在角とtargetとの関係で判定する。

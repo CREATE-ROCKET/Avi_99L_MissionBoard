@@ -654,6 +654,9 @@ void parachuteTask(void *) {
   uint64_t open_requested_at_us = 0;
   uint64_t last_position_read_attempt_us = 0;
   uint64_t last_position_valid_us = 0;
+  // ParachuteTaskだけが更新するfreshなSTS multi-turn物理位置。
+  // move commandは直前のreadCurrent成功後にだけこの値を使用する。
+  double last_position_unwrapped_degrees = 0.0;
   bool power_enabled = false;
   bool mode_prepared = false;
   bool controller_started = false;
@@ -814,19 +817,19 @@ void parachuteTask(void *) {
       return false;
     }
     if (!mode_prepared) {
-      last_initialization_error =
-          servo.verifyOperatingMode(STS3215::OperatingMode::step);
-      if (last_initialization_error != ESP_OK)
-        last_initialization_error = servo.configureStepMode(
-            STS3215::Persistence::volatile_only);
+      // Step modeでは停止後のcurrent positionが相対残量へ戻るfirmwareが
+      // あるため、productionでは絶対position + multi-turn feedbackを使う。
+      // configurePositionMode()は過去のStep設定で0になったposition limitも戻す。
+      last_initialization_error = servo.configurePositionMode(
+          STS3215::Persistence::volatile_only);
       if (last_initialization_error == ESP_OK)
         last_initialization_error = servo.setFeedbackMode(
-            STS3215::FeedbackMode::single_turn,
+            STS3215::FeedbackMode::multi_turn,
             STS3215::Persistence::volatile_only);
       if (last_initialization_error != ESP_OK)
         return false;
       mode_prepared =
-          servo.verifyOperatingMode(STS3215::OperatingMode::step) ==
+          servo.verifyOperatingMode(STS3215::OperatingMode::position) ==
           ESP_OK;
     }
     last_initialization_error =
@@ -881,6 +884,8 @@ void parachuteTask(void *) {
       }
       return result;
     }
+    const int32_t unwrapped_count =
+        actuators::decodeStsSignedMagnitudePositionCount(data.position);
     const auto current =
         actuators::AbsoluteParachuteAngle::fromCount(data.position);
     if (!current.has_value()) {
@@ -892,6 +897,9 @@ void parachuteTask(void *) {
     }
     angle = *current;
     moving = data.moving;
+    last_position_unwrapped_degrees =
+        static_cast<double>(unwrapped_count) *
+        actuators::kParachuteDegreesPerCount;
     const double degrees = static_cast<double>(current->count()) *
                            actuators::kParachuteDegreesPerCount;
     parachute_angle_raw.store(
@@ -909,8 +917,12 @@ void parachuteTask(void *) {
         actuators::shortestParachuteDisplacement(current, target);
     if (!displacement.valid())
       return ESP_ERR_INVALID_ARG;
-    return servo.moveRelativeDegrees(
-        static_cast<float>(displacement.degrees()), motion());
+    // wrapped currentから求めた最短変位だけをfreshなmulti-turn位置へ足す。
+    // これにより360度境界を跨いでも回転方向は常に180度未満になる。
+    const double target_unwrapped_degrees =
+        last_position_unwrapped_degrees + displacement.degrees();
+    return servo.moveAbsoluteDegrees(
+        static_cast<float>(target_unwrapped_degrees), motion());
   };
 
   auto requestFinish = [&](protocol::CommandReason reason,
@@ -1344,8 +1356,11 @@ void parachuteTask(void *) {
                 static_cast<uint16_t>(pending.request.command.arguments[1])
                     << 8U;
             const int16_t tenths = static_cast<int16_t>(raw);
-            const esp_err_t move = servo.moveRelativeDegrees(
-                static_cast<float>(tenths) * 0.1F, motion());
+            const double target_unwrapped_degrees =
+                last_position_unwrapped_degrees +
+                static_cast<double>(tenths) * 0.1;
+            const esp_err_t move = servo.moveAbsoluteDegrees(
+                static_cast<float>(target_unwrapped_degrees), motion());
             sts_ready.store(move == ESP_OK, std::memory_order_release);
             if (move == ESP_OK) {
               pending.stage = OperationStage::moving;
