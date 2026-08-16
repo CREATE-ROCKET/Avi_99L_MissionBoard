@@ -80,6 +80,17 @@ target_compile_options(mission_state_safety_regression_tests PRIVATE
 add_test(NAME mission_state_safety_regression_tests
          COMMAND mission_state_safety_regression_tests)
 
+add_executable(mission_snapshot_cache_tests
+  mission_snapshot_cache_tests.cpp
+)
+target_include_directories(mission_snapshot_cache_tests PRIVATE ../src)
+target_compile_features(mission_snapshot_cache_tests PRIVATE cxx_std_17)
+target_compile_options(mission_snapshot_cache_tests PRIVATE
+  -Wall -Wextra -Wpedantic -Werror
+)
+
+add_test(NAME mission_snapshot_cache_tests COMMAND mission_snapshot_cache_tests)
+
 add_executable(flight_log_tests
   flight_log_tests.cpp
   ../src/runtime/flight_log.cpp

@@ -44,6 +44,7 @@
 #include "runtime/flight_log.hpp"
 #include "runtime/flight_runtime_metadata.hpp"
 #include "runtime/flight_storage.hpp"
+#include "runtime/mission_snapshot_cache.hpp"
 #include "sensors/air_data_flight_logic.hpp"
 #include "sensors/airspeed_estimator.hpp"
 #include "sensors/as5047d_health.hpp"
@@ -1764,6 +1765,7 @@ void missionRealtimeTask(void *) {
               static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
 
   uint32_t timestamp_epoch = 1;
+  MissionSnapshotCache mission_snapshot_cache;
   TickType_t wake = xTaskGetTickCount();
   for (;;) {
     vTaskDelayUntil(&wake, 1);
@@ -2160,15 +2162,14 @@ void missionRealtimeTask(void *) {
                      transition_state);
     }
 
-    protocol::MissionState detector_state =
-        protocol::MissionState::command_receive;
-    uint32_t current_epoch = 0;
     if (xSemaphoreTake(state_mutex, 0) == pdTRUE) {
-      const auto snapshot = state_machine.snapshot();
-      detector_state = snapshot.state;
-      current_epoch = snapshot.flight_epoch;
+      mission_snapshot_cache.update(state_machine.snapshot());
       xSemaphoreGive(state_mutex);
     }
+    // mutex競合時はCommandReceiveへ偽装せず、最後のcoherent snapshotを使う。
+    const auto detector_snapshot = mission_snapshot_cache.value();
+    const protocol::MissionState detector_state = detector_snapshot.state;
+    const uint32_t current_epoch = detector_snapshot.flight_epoch;
     if (current_epoch != detector_epoch) {
       detector_epoch = current_epoch;
       if (current_epoch != 0) {
@@ -2538,21 +2539,23 @@ void missionRealtimeTask(void *) {
     bool power_cutoff = false;
     bool deployment_started = false;
     uint32_t flight_epoch = 0;
-    mission::MissionSnapshot mission_snapshot{};
     if (xSemaphoreTake(state_mutex, 0) == pdTRUE) {
-      mission_snapshot = state_machine.snapshot();
-      status.state = mission_snapshot.state;
-      status.fin_mode = mission_snapshot.fin == mission::FinDirective::zero_hold
-                            ? protocol::FinMode::zero_hold
-                            : (mission_snapshot.fin == mission::FinDirective::roll_control
-                                   ? protocol::FinMode::roll_control
-                                   : protocol::FinMode::brake);
-      status.para_mode = para_mode_actual.load(std::memory_order_acquire);
-      power_cutoff = mission_snapshot.deployment_power_cutoff_latched;
-      deployment_started = mission_snapshot.deployment_started;
-      flight_epoch = mission_snapshot.flight_epoch;
+      mission_snapshot_cache.update(state_machine.snapshot());
       xSemaphoreGive(state_mutex);
     }
+    // 取得失敗時にdefault構築値をpublish/制御へ流さず、一つ前の正常値を使う。
+    const auto mission_snapshot = mission_snapshot_cache.value();
+    status.state = mission_snapshot.state;
+    status.fin_mode = mission_snapshot.fin == mission::FinDirective::zero_hold
+                          ? protocol::FinMode::zero_hold
+                          : (mission_snapshot.fin == mission::FinDirective::roll_control
+                                 ? protocol::FinMode::roll_control
+                                 : protocol::FinMode::brake);
+    // Para modeは独立atomicなのでstate mutexの成否に依存させない。
+    status.para_mode = para_mode_actual.load(std::memory_order_acquire);
+    power_cutoff = mission_snapshot.deployment_power_cutoff_latched;
+    deployment_started = mission_snapshot.deployment_started;
+    flight_epoch = mission_snapshot.flight_epoch;
     if (mission_snapshot.liftoff_time_valid &&
         attitude_epoch != mission_snapshot.flight_epoch) {
       if (preflight_gyro_bias_valid &&
