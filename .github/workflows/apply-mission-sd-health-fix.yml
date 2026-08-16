@@ -1,0 +1,55 @@
+name: Apply Mission SD health fix
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - tools/apply_sd_health_fix.py
+      - .github/workflows/apply-mission-sd-health-fix.yml
+
+permissions:
+  contents: write
+
+env:
+  AVI_99L_MOTOR_PROFILE_ID: '1'
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Sync main
+        run: git pull --rebase origin main
+      - name: Apply targeted fix
+        run: python3 tools/apply_sd_health_fix.py
+      - name: Check diff
+        run: git diff --check
+      - name: Run host tests
+        run: |
+          cmake -S host_test -B /tmp/mission-host-test
+          cmake --build /tmp/mission-host-test -j2
+          ctest --test-dir /tmp/mission-host-test --output-on-failure
+      - name: Install PlatformIO
+        run: pip install platformio
+      - name: Build production firmware
+        run: pio run -e avi_99l_missionboard
+      - name: Commit verified fix
+        run: |
+          rm -f tools/apply_sd_health_fix.py
+          rm -f .github/workflows/apply-mission-sd-health-fix.yml
+          git diff --check
+          git config user.name "hotaru"
+          git config user.email "69021496+Natsu-B@users.noreply.github.com"
+          git add src/runtime/production_runtime.cpp src/protocol/can_protocol.cpp \
+                  host_test/mission_host_tests.cpp testdata/99l_protocol_golden_vectors.txt \
+                  docs/04_通信仕様.md tools/apply_sd_health_fix.py \
+                  .github/workflows/apply-mission-sd-health-fix.yml
+          git commit -m "fix(mission): publish SD logger health"
+          git pull --rebase origin main
+          git push origin HEAD:main
