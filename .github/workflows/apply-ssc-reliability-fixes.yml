@@ -30,7 +30,7 @@ jobs:
       - name: Check patch
         run: git diff --check
       - name: Build production firmware
-        run: pio run -e avi_99l_missionboard
+        run: AVI_99L_MOTOR_PROFILE_ID=1 pio run -e avi_99l_missionboard
       - name: Commit verified change
         run: |
           if git diff --quiet; then exit 0; fi
