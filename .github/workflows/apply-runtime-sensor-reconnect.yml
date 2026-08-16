@@ -1,0 +1,32 @@
+name: Apply runtime sensor reconnect
+
+on:
+  push:
+    branches:
+      - fix/vault-final-flight-readiness-20260816
+    paths:
+      - tools/apply_runtime_sensor_reconnect_patch.py
+      - .github/workflows/apply-runtime-sensor-reconnect.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch-runtime:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/vault-final-flight-readiness-20260816
+          fetch-depth: 0
+      - run: python3 tools/apply_runtime_sensor_reconnect_patch.py
+      - run: git diff --check
+      - name: Commit reconnect patch
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/runtime/production_runtime.cpp
+          git rm tools/apply_runtime_sensor_reconnect_patch.py
+          git rm .github/workflows/apply-runtime-sensor-reconnect.yml
+          git commit -m "feat(mission): retry disconnected sensors"
+          git push origin HEAD:fix/vault-final-flight-readiness-20260816
