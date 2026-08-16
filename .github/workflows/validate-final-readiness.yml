@@ -1,0 +1,38 @@
+name: Validate final readiness
+
+on:
+  push:
+    branches:
+      - fix/vault-final-flight-readiness-20260816
+    paths:
+      - .github/workflows/validate-final-readiness.yml
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/vault-final-flight-readiness-20260816
+          submodules: recursive
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install platformio
+      - name: Build production firmware
+        run: pio run -e avi_99l_missionboard
+      - name: Run native tests
+        run: pio test -e native
+      - run: git diff --check
+      - name: Remove temporary workflow
+        if: success()
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git rm .github/workflows/validate-final-readiness.yml
+          git commit -m "test(mission): validate final readiness build"
+          git push origin HEAD:fix/vault-final-flight-readiness-20260816
