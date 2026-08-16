@@ -41,8 +41,9 @@ void PowerSampler::taskLoop() {
               ? static_cast<std::uint64_t>(sample.timestamp_us)
               : 0U;
       // ADC計測の有効性とmotor電源の存在は別概念として扱う。
-      // 非駆動rate-checkでは0 Vは「有効に0 Vを測定した」結果であり、
-      // VbusInvalidへラッチしてencoder qualificationを壊してはいけない。
+      // characterizationではADCの単発timeout/read errorをmotor safety faultへ
+      // 昇格しない。正常sampleだけlatestへpublishし、失敗sampleは捨てて
+      // 直前の正常Vbus evidenceを保持する。
       const bool valid =
           result == ESP_OK && sample.motor.calibrated_valid &&
           std::isfinite(sample.motor.source_voltage_v) &&
@@ -56,18 +57,18 @@ void PowerSampler::taskLoop() {
             static_cast<std::uint16_t>(std::clamp<long>(
                 std::lround(sample.motor.source_voltage_v * 1'000.0F),
                 0L, std::numeric_limits<std::uint16_t>::max()));
-      } else {
-        rememberFirst(evidence.read_result);
+
+        // 公開APIはlatest()だけなので履歴queueは保持しない。
+        // valid sampleだけを上書きし、ADC失敗時に最後の正常値を失わない。
+        portENTER_CRITICAL(&latest_lock_);
+        latest_ = evidence;
+        have_latest_ = true;
+        portEXIT_CRITICAL(&latest_lock_);
       }
 
-      // 公開APIはlatest()だけなので履歴queueは保持しない。
-      // char_runtimeが長いrun-start lead中にまだlatest()を呼ばなくても、
-      // 最新snapshotを上書きし続けて古いsampleの蓄積で停止しない。
-      portENTER_CRITICAL(&latest_lock_);
-      latest_ = evidence;
-      have_latest_ = true;
-      portEXIT_CRITICAL(&latest_lock_);
-
+      // ADC取得失敗はこのcharacterization runのfatal errorではない。
+      // latest()の100 ms freshness判定により、正常値が長時間得られない場合だけ
+      // callerへVbus unavailableとして見える。単発timeoutではrunを止めない。
       (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
     }
     if (stop_waiting_.exchange(false)) {
