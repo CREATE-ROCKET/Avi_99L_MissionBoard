@@ -2,7 +2,7 @@
 
 ESP32-S3-WROOM-1-N16R8を搭載した99L Mission Board firmwareです。Vault 00〜07/04aに基づくMission FSM、CAN codec、command lifecycle、sensor continuity、制御pipeline、パラシュート安全coreをproduction moduleとして実装し、既存bring-up firmwareも明示選択できる形で維持しています。
 
-既定production buildは、未確定値へ`TODO(HW_TEST)`または`TODO(SIMULATION)`を残した暫定設定で`StartSequence`を受理し、ZeroHold/Roll制御からTB67H450 PWMまでの動翼経路と、STS3215の現在位置Hold/Open/retry/電源遮断経路を実行します。これはbench/HILで一連の動作を検証するための実装であり、飛行認定済みfirmwareではありません。`StartSequence`後は実際にmotorとパラシュートサーボが動作し得ます。
+既定production buildは、`MotorProfileValid=false`のため通常`StartSequence`を拒否します。`ForceStartSequence`でbit3をbypassした場合も、flight sequence中の動翼はBrake固定で、ZeroHold/Roll制御へ未認定motor profileを接続しません。パラシュートのHold/Open/retry/離床+25秒電源遮断経路は継続します。飛行認定済みfirmwareではなく、Forceはqualificationの代替ではありません。
 
 現在の99L source contractは[`docs/99l_source_contract.json`](docs/99l_source_contract.json)に固定しています。Control rollは離床相対の連続・unwrapped推定値からentry時に一度だけreferenceをcaptureし、full-turn差をそのまま制御・0x10A telemetryへ渡します。
 
@@ -53,7 +53,7 @@ Control遷移時には、同じtickで最新かつ未来時刻ではないunwrap
 ## 安全上の注意
 
 - 起動直後、他のdriverやtaskより先にGPIO38、39、40、44をLOWへ設定します。TB67H450は停止、+5 Vとpara電源はOFFです。
-- **production buildでは`StartSequence`によりactuatorが動作します。** 機体へ接続する前に、motor電源とpara電源を独立して物理遮断できるfixture上で確認してください。暫定値のまま飛行へ使用してはいけません。
+- **production buildではパラシュートactuatorが動作し得ます。** 機体へ接続する前にpara電源を物理遮断できるfixture上で確認してください。現行launch safety lockでは未認定motor profileによるflight中の動翼出力をBrake固定にしますが、CommandReceiveの明示motor試験は別経路として残ります。
 - bring-up buildのactuator試験は自動実行しません。USB consoleから対応commandを明示的に入力した場合だけ実行します。
 - production motorはcommand_receive、reset/recovery無効化、ActuatorEmergency、sensor/config不正時にcoastまたはbrakeへ移ります。±14°のsoftware limitでstopper方向またはzero torqueが要求された場合は、back-EMF補償PWMを残さず明示brakeとし、中心方向のtorqueだけを許可します。ActuatorEmergencyではmotorをcoast、Paraをtorque OFFかつGPIO44 OFFのFreeへ移し、差圧系GPIO40は維持します。driver APIが失敗した場合はmotor unavailableをlatchし、coastへ退避します。
 - production paraはCommandReceive起動後に現在位置Holdを要求し、SafetyTaskがGPIO44へのON適用に成功したことをParachuteTaskが観測してから100 msの電源安定待ちを開始します。AirDataTaskのGPIO40要求はPara railを上書きしません。CommandReceiveでSTSが未接続なら1秒周期で再接続し、明示`ParaHold`成功時はHold成立状態を保持します。ActuatorEmergency後はGPIO44をOFFへ安全化したうえでrequested modeをFreeのまま維持し、再接続後も自動Holdへ戻しません。通常`StartSequence`ではfreshな現在位置をHoldし、Close位置へは移動しません。Open/Closeを検証して成功時にflight RAM snapshotへfreezeし、Descent/OpenとretryはそのsnapshotのOpenだけを使用します。5秒のOpen試行deadline後も+25秒の絶対cutoffまではHold要求を維持し、SafetyTaskが離床+25秒でGPIO40/44の両方をUART taskと独立に遮断して再投入不能にラッチします。
@@ -104,7 +104,7 @@ AVI_99L_MOTOR_PROFILE_ID=1 pio run -e avi_99l_missionboard
 AVI_99L_MOTOR_PROFILE_ID=1 pio run -e avi_99l_missionboard_can_diag
 ```
 
-`avi_99l_missionboard_can_diag`だけが`MISSION_CAN_UNSAFE_DIAG=1`を定義します。通常のproduction/bring-up buildでは`can-test`とraw ESP-IDF lifecycle試験を`ESP_ERR_NOT_SUPPORTED`で拒否します。2026-08-13のbuild logで実際にcompileされたESP-IDFは6.0.1であり、PlatformIO platform versionから推測した値ではありません。既定production buildは暫定flight設定を有効化しているため、`StartSequence`後にactuator出力を実行します。
+`avi_99l_missionboard_can_diag`だけが`MISSION_CAN_UNSAFE_DIAG=1`を定義します。通常のproduction/bring-up buildでは`can-test`とraw ESP-IDF lifecycle試験を`ESP_ERR_NOT_SUPPORTED`で拒否します。2026-08-13のbuild logで実際にcompileされたESP-IDFは6.0.1であり、PlatformIO platform versionから推測した値ではありません。現行production buildはmotor profile未認定のため通常Startを拒否し、Force Startでもflight中の動翼をBrake固定にします。
 
 host testはworkspace外の実行可能なbuild directoryを指定します。
 
