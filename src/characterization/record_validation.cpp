@@ -73,15 +73,15 @@ validateRecordStrict(const ImmutableLogRecord &record) noexcept {
   const bool command_applied_this_epoch =
       record.command.command_apply_timestamp_us >=
       record.encoder.epoch_start_timestamp_us;
-  const bool command_apply_late =
+  const bool command_apply_target_late =
       command_applied_this_epoch &&
       record.command.command_apply_timestamp_us >
           record.encoder.epoch_start_timestamp_us +
               kConsumerDeadlineBudgetUs;
-  if (command_apply_late && record.run_kind == RunKind::Full &&
-      (record.first_error == 0 ||
-       record.abort_reason != AbortReason::Deadline))
-    error = error | RecordValidationError::InvalidCommandTimestamp;
+  const bool command_apply_hard_deadline_missed =
+      command_applied_this_epoch &&
+      record.command.command_apply_timestamp_us >=
+          record.encoder.epoch_start_timestamp_us + kEpochDurationUs;
 
   if (block.epoch_end_timestamp_us !=
           block.epoch_start_timestamp_us + kEpochDurationUs ||
@@ -119,9 +119,12 @@ validateRecordStrict(const ImmutableLogRecord &record) noexcept {
   const bool release_late =
       block.consumer_lateness_us >
       static_cast<std::int32_t>(kConsumerDeadlineBudgetUs);
-  // 旧V5 captureではrelease遅延もEpochDeadlineを立てているため、その形式は
-  // 引き続き受理する。新しい1 kHz motor-ID captureではrelease遅延は数値診断だけを
-  // 残し、100 us command apply deadlineだけをfatalなEpochDeadlineとする。
+  // 旧V5は100 us command遅延やrelease遅延にもEpochDeadlineを付けていた。
+  // 新しいfull motor-IDは100 usを診断targetとして扱い、1 epoch以上のcommand遅延だけ
+  // fatal flagにする。rate-checkの旧strict契約はdecode互換のため維持する。
+  const bool legacy_command_deadline =
+      deadline_flag && command_apply_target_late &&
+      !command_apply_hard_deadline_missed;
   if (complete != aggregate_valid || complete == incomplete ||
       startup_incomplete != (block.epoch_index == 0U && incomplete) ||
       ((block.flags & EpochRepeated) != 0U) !=
@@ -130,10 +133,17 @@ validateRecordStrict(const ImmutableLogRecord &record) noexcept {
           (block.skipped_sample_count != 0U) ||
       ((block.flags & EpochInvalid) != 0U) !=
           (block.invalid_sample_count != 0U) ||
-      (command_apply_late && !deadline_flag) ||
-      (deadline_flag && !command_apply_late && !release_late) ||
+      (command_apply_hard_deadline_missed && !deadline_flag) ||
+      (record.run_kind == RunKind::RateCheck && command_apply_target_late &&
+       !deadline_flag) ||
+      (deadline_flag && !command_apply_target_late && !release_late) ||
       (block.flags & ~0x00FFU) != 0U)
     error = error | RecordValidationError::InconsistentFlags;
+  if (record.run_kind == RunKind::Full &&
+      (command_apply_hard_deadline_missed || legacy_command_deadline) &&
+      (record.first_error == 0 ||
+       record.abort_reason != AbortReason::Deadline))
+    error = error | RecordValidationError::InvalidCommandTimestamp;
 
   std::uint64_t previous_generation = 0U;
   std::uint64_t previous_scheduled = 0U;

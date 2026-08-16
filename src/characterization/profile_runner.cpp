@@ -135,7 +135,7 @@ UnsupportedReason unsupportedReason(
       statistics.encoder_transport_errors != 0U)
     return UnsupportedReason::InvalidRead;
   // 1 kHz motor-IDではconsumer releaseの100 us超過はUART/record timestampで診断し、
-  // rate qualificationを落とさない。command apply deadlineとschedule lossは別経路でfatal。
+  // rate qualificationを落とさない。commandのepoch跨ぎとschedule lossは別経路でfatal。
   if (statistics.raw_queue_overflows != 0U ||
       statistics.writer_queue_overflows != 0U ||
       statistics.bucket_collisions != 0U)
@@ -355,6 +355,8 @@ esp_err_t ProfileRunner::motorApply(
     break;
   }
   }
+  // これはMCU/TB67H入力側へcommandを適用した実時刻であり、TB67H内部の
+  // standby復帰後にOUTが有効になるまでの最大30 usは含めない。
   completed_at_us = nowUs();
   return result;
 }
@@ -862,8 +864,9 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
       break;
     const std::uint64_t epoch_start =
         epoch_zero + static_cast<std::uint64_t>(epoch) * kEpochDurationUs;
-    const std::uint64_t apply_deadline =
-        epoch_start + kConsumerDeadlineBudgetUs;
+    // 100 usはflight realtime評価のtargetであり、motor-IDではactual timestampを
+    // 保持して同一epoch内を継続する。epoch境界を跨ぐcommandだけfatalとする。
+    const std::uint64_t apply_deadline = epoch_start + kEpochDurationUs;
     ProfileEpisode episode{ProfilePhase::StationaryBaseline,
                            ApproachBranch::None, 1U, epochs, 0, false};
     std::uint32_t local_epoch = epoch;
@@ -944,19 +947,20 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
       }
     }
 
-    // 100 us command apply deadlineはmotor-IDでも緩和しない。
+    // motor-IDでは100 us超過を診断値として許容し、同一1 ms epoch内なら実際の
+    // apply timestampを残して継続する。1 epoch以上の遅延だけ安全停止する。
     const bool command_change_required =
         !journal_.requestAlreadyApplied(request);
     const ImmutableCommandEvidence before_command = journal_.snapshot(nowUs());
     const std::uint64_t apply_started_us = nowUs();
     bool apply_deadline_missed =
-        command_change_required && apply_started_us > apply_deadline;
+        command_change_required && apply_started_us >= apply_deadline;
     esp_err_t apply_result = ESP_OK;
     if (apply_deadline_missed) {
       ++runtime_deadline_misses;
       ++command_deadline_misses;
       guard_state = GuardState::Abort;
-      // 遅れたDrive/Brakeを実機へ出さない。requestedは元指令のまま残し、
+      // epochを跨いだDrive/Brakeを実機へ出さない。requestedは元指令のまま残し、
       // applied=Coast/result=timeoutとして一つのgenerationへ記録する。
       apply_result = journal_.rejectAndCoast(
           request, ESP_ERR_TIMEOUT, apply_started_us);
@@ -969,7 +973,7 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
     const std::uint64_t apply_completed_us =
         epoch_command.command_apply_timestamp_us;
     if (!apply_deadline_missed && command_generation_changed &&
-        apply_completed_us > apply_deadline) {
+        apply_completed_us >= apply_deadline) {
       apply_deadline_missed = true;
       ++runtime_deadline_misses;
       ++command_deadline_misses;
@@ -1117,7 +1121,7 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
       break;
     }
     // FixedEpochAssemblerは旧V5契約どおりrelease遅延でもEpochDeadlineを立てる。
-    // 新規1 kHz motor-IDではrelease-only遅延を数値診断へ分離し、command deadlineだけを
+    // 新規1 kHz motor-IDではrelease-only遅延を数値診断へ分離し、commandのepoch跨ぎだけを
     // fatal flagとして残す。旧captureのdecode互換はvalidator側で維持する。
     if (release_deadline_missed && !apply_deadline_missed)
       block.flags = static_cast<std::uint16_t>(block.flags & ~EpochDeadline);

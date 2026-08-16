@@ -332,11 +332,27 @@ def _decode_record(raw: bytes, header: dict[str, object], index: int) -> dict[st
     _need(bool(epoch_flags & EPOCH_REPEATED) == (repeated != 0), f"record {index} repeated flag tears")
     _need(bool(epoch_flags & EPOCH_SKIPPED) == (skipped != 0), f"record {index} skipped flag tears")
     _need(bool(epoch_flags & EPOCH_INVALID) == (invalid != 0), f"record {index} invalid flag tears")
-    command_apply_late = apply_us >= epoch_start and apply_us > epoch_start + 100
+    command_applied_this_epoch = apply_us >= epoch_start
+    command_apply_target_late = command_applied_this_epoch and apply_us > epoch_start + 100
+    command_apply_hard_deadline_missed = command_applied_this_epoch and apply_us >= epoch_start + 1000
+    deadline_flag = bool(epoch_flags & EPOCH_DEADLINE)
+    release_late = lateness > 100
     _need(
-        bool(epoch_flags & EPOCH_DEADLINE)
-        == (lateness > 100 or command_apply_late),
+        not command_apply_hard_deadline_missed or deadline_flag,
+        f"record {index} hard command deadline lacks deadline flag",
+    )
+    _need(
+        run_kind != 1 or not command_apply_target_late or deadline_flag,
+        f"record {index} rate-check late command lacks deadline flag",
+    )
+    _need(
+        not deadline_flag or release_late or command_apply_target_late,
         f"record {index} deadline flag tears",
+    )
+    legacy_command_deadline = (
+        deadline_flag
+        and command_apply_target_late
+        and not command_apply_hard_deadline_missed
     )
     _need(
         bool(epoch_flags & EPOCH_STARTUP_INCOMPLETE)
@@ -346,7 +362,7 @@ def _decode_record(raw: bytes, header: dict[str, object], index: int) -> dict[st
     _need((first_error == 0) == (abort_reason == 0), f"record {index} first error/abort reason tear")
     _need(
         run_kind != 2
-        or not command_apply_late
+        or not (command_apply_hard_deadline_missed or legacy_command_deadline)
         or (first_error != 0 and abort_reason == 6),
         f"record {index} late full-run command lacks deadline abort evidence",
     )
