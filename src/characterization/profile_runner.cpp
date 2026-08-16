@@ -135,7 +135,7 @@ UnsupportedReason unsupportedReason(
       statistics.encoder_transport_errors != 0U)
     return UnsupportedReason::InvalidRead;
   // 1 kHz motor-IDではconsumer releaseの100 us超過はUART/record timestampで診断し、
-  // rate qualificationを落とさない。commandのepoch跨ぎとschedule lossは別経路でfatal。
+  // rate qualificationを落とさない。commandのfatal slipとschedule lossは別経路で扱う。
   if (statistics.raw_queue_overflows != 0U ||
       statistics.writer_queue_overflows != 0U ||
       statistics.bucket_collisions != 0U)
@@ -864,9 +864,10 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
       break;
     const std::uint64_t epoch_start =
         epoch_zero + static_cast<std::uint64_t>(epoch) * kEpochDurationUs;
-    // 100 usはflight realtime評価のtargetであり、motor-IDではactual timestampを
-    // 保持して同一epoch内を継続する。epoch境界を跨ぐcommandだけfatalとする。
-    const std::uint64_t apply_deadline = epoch_start + kEpochDurationUs;
+    const std::uint64_t epoch_end = epoch_start + kEpochDurationUs;
+    // 100 usはflight realtime評価のtarget。motor-IDでは1 epochだけの遅れは
+    // actual apply timestampを次epochの実入力として保持し、2 epoch目へ入る前にfatalとする。
+    const std::uint64_t apply_hard_deadline = epoch_end + kEpochDurationUs;
     ProfileEpisode episode{ProfilePhase::StationaryBaseline,
                            ApproachBranch::None, 1U, epochs, 0, false};
     std::uint32_t local_epoch = epoch;
@@ -947,42 +948,53 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
       }
     }
 
-    // motor-IDでは100 us超過を診断値として許容し、同一1 ms epoch内なら実際の
-    // apply timestampを残して継続する。1 epoch以上の遅延だけ安全停止する。
+    // 1 epochだけ遅れたcommandは適用を継続する。ただし、そのcommandは既に終了した
+    // current epochの入力ではないためcurrent recordには適用前evidenceを残す。
+    // 次epoch recordがactual apply timestamp付きの新commandを正本として保持する。
     const bool command_change_required =
         !journal_.requestAlreadyApplied(request);
     const ImmutableCommandEvidence before_command = journal_.snapshot(nowUs());
     const std::uint64_t apply_started_us = nowUs();
     bool apply_deadline_missed =
-        command_change_required && apply_started_us >= apply_deadline;
+        command_change_required && apply_started_us >= apply_hard_deadline;
+    bool apply_epoch_slipped =
+        command_change_required && !apply_deadline_missed &&
+        apply_started_us >= epoch_end;
     esp_err_t apply_result = ESP_OK;
     if (apply_deadline_missed) {
       ++runtime_deadline_misses;
       ++command_deadline_misses;
       guard_state = GuardState::Abort;
-      // epochを跨いだDrive/Brakeを実機へ出さない。requestedは元指令のまま残し、
+      // 2 epoch目へ入ったDrive/Brakeは実機へ出さない。requestedは元指令のまま残し、
       // applied=Coast/result=timeoutとして一つのgenerationへ記録する。
       apply_result = journal_.rejectAndCoast(
           request, ESP_ERR_TIMEOUT, apply_started_us);
     } else {
       apply_result = journal_.apply(request, apply_started_us);
     }
-    ImmutableCommandEvidence epoch_command = journal_.snapshot(nowUs());
+    const ImmutableCommandEvidence applied_command = journal_.snapshot(nowUs());
     const bool command_generation_changed =
-        epoch_command.command_generation != before_command.command_generation;
+        applied_command.command_generation != before_command.command_generation;
     const std::uint64_t apply_completed_us =
-        epoch_command.command_apply_timestamp_us;
+        applied_command.command_apply_timestamp_us;
     if (!apply_deadline_missed && command_generation_changed &&
-        apply_completed_us >= apply_deadline) {
+        apply_completed_us >= apply_hard_deadline) {
       apply_deadline_missed = true;
+      apply_epoch_slipped = false;
       ++runtime_deadline_misses;
       ++command_deadline_misses;
       guard_state = GuardState::Abort;
+    } else if (!apply_deadline_missed && command_generation_changed &&
+               apply_completed_us >= epoch_end) {
+      apply_epoch_slipped = true;
+      ++diagnostic_continuations;
     }
+    ImmutableCommandEvidence epoch_command =
+        apply_epoch_slipped ? before_command : applied_command;
     // command generation/requested/applied/mode/apply timestampは同じrealtime ownerで
     // 一度だけ値copyし、writer taskはこのimmutable evidenceしか見ない。
     epoch_command.logger_snapshot_timestamp_us =
-        std::max(nowUs(), apply_completed_us);
+        std::max(nowUs(), epoch_command.command_apply_timestamp_us);
     if (preapply_error != ESP_OK)
       stopForFatal(preapply_error, preapply_abort, nowUs());
     if (apply_deadline_missed) {
@@ -991,13 +1003,10 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
       stopForFatal(apply_result, AbortReason::MotorApplyError, nowUs());
     }
 
-    // 先行異常とcommand deadlineが競合したepochは証拠を混同せず終了する。
+    // 先行異常とcommand hard deadlineが競合したepochは証拠を混同せず終了する。
     if (preapply_error != ESP_OK && apply_deadline_missed)
       break;
 
-    const std::uint64_t epoch_end =
-        epoch_zero + (static_cast<std::uint64_t>(epoch) + 1U) *
-                         kEpochDurationUs;
     const std::uint64_t wait_entry_us = nowUs();
     if (have_previous_release && wait_entry_us >= previous_release_us) {
       max_consumer_work_us =
@@ -1121,8 +1130,8 @@ esp_err_t ProfileRunner::run(EncoderRate rate, RunKind run_kind,
       break;
     }
     // FixedEpochAssemblerは旧V5契約どおりrelease遅延でもEpochDeadlineを立てる。
-    // 新規1 kHz motor-IDではrelease-only遅延を数値診断へ分離し、commandのepoch跨ぎだけを
-    // fatal flagとして残す。旧captureのdecode互換はvalidator側で維持する。
+    // 新規1 kHz motor-IDではrelease-only遅延と1 epochだけのcommand slipを数値診断へ分離し、
+    // 2 epoch目へ入るcommandだけfatal flagとして残す。旧captureのdecode互換はvalidator側で維持する。
     if (release_deadline_missed && !apply_deadline_missed)
       block.flags = static_cast<std::uint16_t>(block.flags & ~EpochDeadline);
     if (apply_deadline_missed)
