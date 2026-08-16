@@ -10,6 +10,9 @@ on:
 permissions:
   contents: write
 
+env:
+  AVI_99L_MOTOR_PROFILE_ID: '1'
+
 jobs:
   apply:
     runs-on: ubuntu-latest
