@@ -77,13 +77,17 @@ public:
       }
     }
 
-    if (frame.identifier == 0x107 && frame.data_length == 3) {
-      const auto tilt = sensors::display_attitude_runtime::wireTelemetry(now_us);
+    if (frame.identifier == 0x107 &&
+        (frame.data_length == 3 || frame.data_length == 5)) {
+      const auto attitude = sensors::display_attitude_runtime::wireTelemetry(now_us);
       const uint16_t packed =
-          static_cast<uint16_t>(tilt.magnitude_raw & 0x7FU) |
-          static_cast<uint16_t>((tilt.direction_raw & 0x01FFU) << 7U);
+          static_cast<uint16_t>(attitude.magnitude_raw & 0x7FU) |
+          static_cast<uint16_t>((attitude.direction_raw & 0x01FFU) << 7U);
+      frame.data_length = 5;
       frame.data[1] = static_cast<uint8_t>(packed);
       frame.data[2] = static_cast<uint8_t>(packed >> 8U);
+      frame.data[3] = static_cast<uint8_t>(attitude.roll_raw);
+      frame.data[4] = static_cast<uint8_t>(attitude.roll_raw >> 8U);
     }
 
     if (frame.identifier == 0x014 && frame.data_length == 3) {
