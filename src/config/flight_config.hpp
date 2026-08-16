@@ -53,6 +53,9 @@ inline constexpr ParachuteMotionConfig kParachute{
 // Vault 01: CommandReceiveの未接続STSは1秒周期で再接続する。
 // 飛行中の初期化retryは従来のkParachute.retry_interval_msを維持する。
 inline constexpr uint32_t kParachuteCommandReceiveReconnectMs = 1'000;
+// CommandReceiveのICM/AS5047D/LPS/SSC再接続周期。飛行中のsensor lossは
+// Control再entryを許可する意味ではなく、health/telemetry/ZeroHold復帰用である。
+inline constexpr uint32_t kCommandReceiveDeviceReconnectMs = 1'000;
 
 // source nominalは0.92。true 0.60..1.20は飛行中同定用ではなく、
 // TODO(SIMULATION/AERO_VALIDATION): coefficient robustness診断用の暫定範囲。
@@ -80,8 +83,12 @@ inline constexpr bool kActiveFlightMotorProfileQualified =
 #error "AVI_99L_MOTOR_PROFILE_ID must be 1 or 2"
 #endif
 
-// TODO(HW_TEST): ADCによる実測値へ置換し、電圧低下時の制御停止条件を決定する。
+// nominal値。production TorqueMapperはHousekeepingTaskの最新calibrated ADC値を使う。
+// この値はconfiguration sanity checkとcharacterizationの基準値にのみ残す。
 inline constexpr double kMotorBusVoltageV = 9.0;
+// 100 ms ADC更新に対して5 sample分の一時errorを許容する。
+// TODO(HW_TEST): 実測scheduler jitterとADC fault injectionで確定する。
+inline constexpr uint64_t kMotorBusVoltageFreshnessUs = 500'000;
 #if defined(AVI_99L_CHARACTERIZATION) && AVI_99L_CHARACTERIZATION
 // Characterization profileは最大30%までを実測し、wire contractは35%を上限とする。
 // production flightの15%暫定limitを流用すると、logger上30%でも実PWMが15%へ
@@ -117,7 +124,8 @@ inline constexpr control::RollGainSchedule kRollGainSchedule{
              board::kFinSoftwareLimits.maximum_rad &&
          kParachute.ready() && kAirData.ready() &&
          board::kControlAuthorityLimits.valid() &&
-         board::kEncoderPipeline.valid() &&
+         board::kProductionEncoderAcquisitionHz == board::kSensorRateHz &&
+         board::kProductionEncoderConsumerHz == board::kSensorRateHz &&
          kRollGainSchedule.configured && kMotorBusVoltageV > 0.0 &&
          kProductionMotorMaximumDuty > 0.0 &&
          kProductionMotorMaximumDuty <= 1.0;
@@ -127,4 +135,4 @@ inline constexpr control::RollGainSchedule kRollGainSchedule{
   return motorProfileValid() && nonBypassFlightConfigurationReady();
 }
 
-} // 名前空間 flight_config
+} // namespace flight_config
