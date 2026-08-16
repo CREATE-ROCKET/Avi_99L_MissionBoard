@@ -28,6 +28,18 @@ target_compile_definitions(mission_host_tests PRIVATE
 
 add_test(NAME mission_host_tests COMMAND mission_host_tests)
 
+add_executable(display_attitude_tests
+  display_attitude_tests.cpp
+  ../src/sensors/display_attitude_estimator.cpp
+)
+target_include_directories(display_attitude_tests PRIVATE ../src)
+target_compile_features(display_attitude_tests PRIVATE cxx_std_17)
+target_compile_options(display_attitude_tests PRIVATE
+  -Wall -Wextra -Wpedantic -Werror
+)
+
+add_test(NAME display_attitude_tests COMMAND display_attitude_tests)
+
 add_executable(fin_overtravel_tests
   fin_overtravel_tests.cpp
   ../src/control/control_pipeline.cpp
