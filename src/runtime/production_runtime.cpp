@@ -1004,7 +1004,6 @@ void parachuteTask(void *) {
               persistence_response.transaction_id)
         continue;
       if (persistence_response.success) {
-        // Emergency後でもcommit済みならRAMをNVSへ合わせ、Completedは送らない。
         configuration.activatePersistedCandidate(pending.candidate);
         updateConfigurationMirrors();
         if (!pending.interrupted) {
@@ -1067,7 +1066,6 @@ void parachuteTask(void *) {
                    free_requested ? protocol::ParaMode::free
                                   : protocol::ParaMode::powered_off);
           if (free_requested) {
-            // Emergency後もrequested modeはFreeのまま維持し、1秒後に再接続する。
             desired = DesiredState::free;
             next_power_request_us =
                 static_cast<uint64_t>(esp_timer_get_time()) +
@@ -1097,7 +1095,6 @@ void parachuteTask(void *) {
 
       const uint64_t now_us = static_cast<uint64_t>(esp_timer_get_time());
       const bool same_epoch = active_epoch == request.flight_epoch;
-      // SafetyTaskとFSMからの重複Openでは最初の5秒deadlineを延長しない。
       if (same_epoch && desired == DesiredState::open)
         continue;
       if (!configuration.flightSnapshotValid()) {
@@ -1228,7 +1225,6 @@ void parachuteTask(void *) {
             requestFinish(protocol::CommandReason::not_configured,
                           pending.request.readiness.missingMask());
           } else if (forced) {
-            // ForceではSTS失敗をvalidへ偽装せず、snapshotだけはoptionalのままfreezeする。
             if (read == ESP_OK) {
               const esp_err_t hold = servo.holdCurrentPosition(
                   {STS3215::TorqueLimit::percent(
@@ -1462,7 +1458,6 @@ void parachuteTask(void *) {
       }
     };
 
-    // Hold要求中はpower-on/reconnectを継続し、fresh currentを取得できた時点でHoldする。
     if (desired == DesiredState::holding && !pending.active) {
       if (!requestPower(now_us)) {
         sts_ready.store(false, std::memory_order_release);
@@ -1588,7 +1583,6 @@ void parachuteTask(void *) {
         }
       }
 
-      // 5秒はOpen retryだけを終了する。電源は+25秒cutoffまで維持する。
       if (desired == DesiredState::open && open_requested_at_us != 0 &&
           now_us >= open_requested_at_us &&
           now_us - open_requested_at_us >= 5'000'000) {
@@ -1601,8 +1595,6 @@ void parachuteTask(void *) {
       }
     }
 
-    // コマンド処理がSTSを読んでいない期間も、現在角を0.5秒周期で更新する。
-    // UARTへのアクセスはParachuteTaskだけが行い、CanTaskはatomic snapshotだけを読む。
     if (servo.initialized() && mode_prepared &&
         parachute_power_applied.load(std::memory_order_acquire) &&
         (last_position_read_attempt_us == 0 ||
@@ -1641,10 +1633,8 @@ void missionRealtimeTask(void *) {
   std::printf("MissionRealtimeTask start\n");
   addWatchdog();
   bringup::SpiBringup spi;
-  // FIFO bufferを持つwrapperはtask専有だが、6 KiBのstackには置かない。
   static bringup::ImuBringup imu;
   bringup::EncoderBringup encoder;
-  // 1200 sampleのhistoryは約38 KiBあり、6 KiBのtask stackへ置かない。
   static sensors::GyroHistoryRing gyro_history;
   sensors::ImuLiftoffDetector liftoff_detector;
   sensors::AttitudeEstimator attitude;
@@ -1806,8 +1796,6 @@ void missionRealtimeTask(void *) {
           pending_fin_move = {};
           command_fin_mode = CommandFinMode::free;
           (void)motor_driver.coast();
-          // ActuatorEmergencyはmotor/ParaをFreeにするcommandであり、
-          // 差圧系のGPIO40までpower cycleしない。
           const PowerRequest power{true, false, false};
           const ParaRequest para{ParaRequest::Kind::free, 0, false};
           (void)xQueueSend(power_queue, &power, 0);
@@ -1825,7 +1813,6 @@ void missionRealtimeTask(void *) {
     if (liftoff_emergency_latch.take(emergency_transaction)) {
       const EmergencyEnvelope envelope{emergency_transaction, true};
       if (xQueueSendToFront(emergency_queue, &envelope, 0) != pdTRUE) {
-        // RealtimeTask自身がconsumerなので次tickまでlatchを保持する。
         if (liftoff_emergency_latch.signal(emergency_transaction))
           emergency_metadata_overflow.fetch_add(1,
                                                 std::memory_order_relaxed);
@@ -2079,7 +2066,6 @@ void missionRealtimeTask(void *) {
           calibration.transaction_id = command_envelope.request.transaction_id;
           calibration.started_at_us =
               static_cast<uint64_t>(esp_timer_get_time());
-          // 最新attemptだけを有効にする。途中失敗時に古い値へrollbackしない。
           preflight_gyro_bias_valid = false;
           gravity_reference_valid = false;
           latest_air_data.ssc_zero_valid = false;
@@ -2108,7 +2094,6 @@ void missionRealtimeTask(void *) {
       }
       if (post_transition_para_valid &&
           xQueueSendToFront(para_queue, &post_transition_para, 0) != pdTRUE) {
-        // Cancel後の電源OFFはqueue飽和時も物理出力へ直接反映する。
         (void)setTrackedParaPower(false);
       }
       const auto reason = direct_reason == protocol::CommandReason::none
@@ -2167,7 +2152,6 @@ void missionRealtimeTask(void *) {
       if (fifo_status_result == ESP_OK) {
         if (status.lost_packets != 0 || status.faulted)
           imu_data_loss_latched = true;
-        // FIFO full/data lossをtimestamp epoch破棄と同一扱いせず、読出しを継続する。
         std::array<bringup::ImuSample, bringup::ImuBringup::kMaximumFifoBatch>
             samples{};
         std::size_t count{};
@@ -2243,7 +2227,6 @@ void missionRealtimeTask(void *) {
     const uint64_t imu_now_us = static_cast<uint64_t>(esp_timer_get_time());
     if (calibration.active && imu_now_us >= calibration.started_at_us &&
         imu_now_us - calibration.started_at_us >= 3'000'000) {
-      // TODO(HW_TEST): sample数・静置判定・gravity norm閾値を実機で確定する。
       const bool gyro_samples_ok = calibration.gyro_samples >= 1'500;
       const bool accel_samples_ok = calibration.accel_samples >= 1'500;
       if (gyro_samples_ok) {
@@ -2259,7 +2242,8 @@ void missionRealtimeTask(void *) {
         const double y = calibration.accel_sum_y_g / calibration.accel_samples;
         const double z = calibration.accel_sum_z_g / calibration.accel_samples;
         const double norm = std::sqrt(x * x + y * y + z * z);
-        gravity_reference_valid = std::isfinite(norm) && norm >= 0.8 && norm <= 1.2;
+        gravity_reference_valid =
+            std::isfinite(norm) && norm >= 0.8 && norm <= 1.2;
       }
       preflight_calibration_active.store(false, std::memory_order_release);
       uint32_t detail = 0;
@@ -2316,7 +2300,6 @@ void missionRealtimeTask(void *) {
         const double wrapped = static_cast<double>(sample.angle_radians);
         if (!fin_angle_available) {
           if (fin_zero_available) {
-            // transient後は直前unwrapped角に最も近いturnへ復帰する。
             const double turns =
                 std::round((unwrapped_fin_rad - wrapped) / kTwoPi);
             unwrapped_fin_rad = wrapped + turns * kTwoPi;
@@ -2339,7 +2322,6 @@ void missionRealtimeTask(void *) {
                                                fin_angle_rad,
                                                fin_rate_rad_s);
         } else {
-          // zero設定前の仮の0 rad系列を速度推定historyへ混ぜない。
           fin_rate_valid = false;
           fin_velocity.reset();
         }
@@ -2771,9 +2753,6 @@ void missionRealtimeTask(void *) {
         (status.fin_mode == protocol::FinMode::brake ? (1U << 13U) : 0U) |
         (mission_snapshot.reset_invalidated ? (1U << 14U) : 0U) |
         (mission_snapshot.control_reentry_inhibited ? (1U << 15U) : 0U);
-    // config_flagsは暫定flight設定の可視化に使用する。
-    // bit0 MotorProfile、bit1 Fin zero、bit2 Para設定、bit3 SSC zero、
-    // bit7は未qualificationの暫定値を含むことを示す。
     status.config_flags =
         (flight_config::motorProfileValid() ? (1U << 0U) : 0U) |
         (fin_zero_configured.load(std::memory_order_acquire) ? (1U << 1U)
@@ -2902,7 +2881,6 @@ void missionRealtimeTask(void *) {
 
 void airDataTask(void *) {
   addWatchdog();
-  // AirDataTaskはGPIO40だけを所有し、Para railの要求状態を上書きしない。
   PowerRequest power{true, false, false, true, false};
   (void)xQueueSend(power_queue, &power, 0);
   vTaskDelay(pdMS_TO_TICKS(100));
@@ -2931,7 +2909,6 @@ void airDataTask(void *) {
       lps_result = lps.begin(bus, LPS25HB::Address::low, lps_config);
     else if (bus.probe(0x5D) == ESP_OK)
       lps_result = lps.begin(bus, LPS25HB::Address::high, lps_config);
-    // SSCが未接続でもMission runtimeを停止しない。
     if (bus.probe(0x28) == ESP_OK)
       ssc_result = ssc.begin(bus);
   }
@@ -2958,8 +2935,6 @@ void airDataTask(void *) {
       const auto updated = state_machine.snapshot();
       if (updated.state == protocol::MissionState::command_receive &&
           mission_snapshot.state != protocol::MissionState::command_receive) {
-        // benchでsequenceをやり直す場合は、前flightのzeroを流用しない。
-        // TODO(HW_TEST): 明示PreflightCalibrationへ移行後はcommand側でresetする。
         pressure_conditioner.reset();
         snapshot.ssc_zero_valid = false;
         snapshot.airspeed_valid = false;
@@ -3192,7 +3167,6 @@ void canTask(void *) {
           if (protocol::decode(input, protocol::CanId::actuator_emergency_stop,
                                emergency) == protocol::CodecError::none) {
             if (emergency.transaction_id != 0) {
-              // state mutexの一時競合で安全側commandを取りこぼさない。
               latchPhysicalEmergency(emergency.transaction_id, false);
             } else {
               mission::EmergencyDecision result{};
@@ -3217,7 +3191,6 @@ void canTask(void *) {
                   protocol::CanId::liftoff_detection_emergency_stop,
                   emergency) == protocol::CodecError::none) {
             if (emergency.transaction_id != 0) {
-              // 実state判定はmutex取得をretryするRealtimeTaskへ一元化する。
               latchPhysicalEmergency(emergency.transaction_id, true);
             } else {
               enqueueResult(command_executor.liftoffEmergencyResult(
@@ -3426,11 +3399,15 @@ void canTask(void *) {
           persistence_flags |= 1U << 2U;
         if (result_queue_overflow.load(std::memory_order_relaxed) != 0)
           persistence_flags |= 1U << 7U;
+        const bool flight_elapsed_valid =
+            latest.state == protocol::MissionState::engine_burn ||
+            latest.state == protocol::MissionState::control ||
+            latest.state == protocol::MissionState::descent;
         const protocol::PowerTimeTelemetry power{
             sequences.next(protocol::CanId::power_time_telemetry),
             logic_voltage_raw.load(std::memory_order_acquire),
             motor_voltage_raw.load(std::memory_order_acquire),
-            latest.state == protocol::MissionState::descent
+            flight_elapsed_valid
                 ? protocol::quantization::encodeDescentElapsed(
                       static_cast<double>(latest.flight_elapsed_us) / 1.0e6,
                       protocol::quantization::TimeError::unavailable)
@@ -3438,7 +3415,10 @@ void canTask(void *) {
                       0xFFF0U |
                       static_cast<uint8_t>(
                           protocol::quantization::TimeError::pre_liftoff)),
-            0xFFF1, persistence_flags};
+            recovery_boot::recoveryElapsedRaw(
+                recovery_requested.load(std::memory_order_acquire),
+                recovery_only),
+            persistence_flags};
         (void)writeFrame(can, protocol::encode(power));
         if (!recovery_only) {
           const protocol::AttitudeTiltTelemetry tilt{
@@ -3491,7 +3471,6 @@ void commandWorkerTask(void *) {
       resetWatchdog();
       continue;
     }
-    // CommandWorkerはpolicy/cacheだけを所有し、FSM更新はRealtimeTaskへ委譲する。
     {
       mission::CommandContext context{};
       if (xSemaphoreTake(state_mutex, pdMS_TO_TICKS(2)) == pdTRUE) {
@@ -3512,10 +3491,7 @@ void commandWorkerTask(void *) {
           parachute_config_load_complete.load(std::memory_order_acquire);
       context.persistence_runtime_available =
           parachute_persistence_ready.load(std::memory_order_acquire);
-      // FinFree/SetFinZeroはmotor/zero未準備でも意味を持つため、
-      // 個別device gateはMissionRealtimeTaskで判定する。
       context.fin_available = true;
-      // 入口ではSTS接続状態ではなく、owner taskへの経路だけを判定する。
       context.parachute_available = parachute_command_queue != nullptr;
       context.fin_safe_commands_supported = true;
       context.calibration_supported = true;
@@ -3845,7 +3821,6 @@ void internalFlashTask(void *) {
         std::memory_order_release);
     recovery_mode_command_sent.store(false, std::memory_order_release);
     recovery_mode_command_pending.store(true, std::memory_order_release);
-    // TODO(HW_TEST): CAN command windowを実測後に確定する。
     recovery_wake_deadline_us =
         static_cast<uint64_t>(esp_timer_get_time()) + 2'000'000;
   }
@@ -3873,7 +3848,6 @@ void internalFlashTask(void *) {
           persistence_request.transaction_id, persistence_request.endpoint,
           saved, load_response.persistence_ready, false};
       if (!saved) {
-        // bit15=1はblob corruptionではなくpersistence runtime failureを表す。
         enqueueEvent(protocol::eventFlag(
                          protocol::MissionEventFlag::persistence_error),
                      protocol::MissionState::command_receive, 0,
@@ -4011,15 +3985,16 @@ void internalFlashTask(void *) {
         recovery_motor_safe.load(std::memory_order_acquire) &&
         recovery_sd_flushed.load(std::memory_order_acquire) &&
         persistence_flushed.load(std::memory_order_acquire)) {
-      if (recovery.markResourcesSafeAndFlushed()) {
+      if (recovery_boot::commitRecoveryEntryMarker() &&
+          recovery.markResourcesSafeAndFlushed()) {
         recovery_mode_reason.store(static_cast<uint8_t>(enter_reason),
                                    std::memory_order_release);
         recovery_mode_command_sent.store(false, std::memory_order_release);
         recovery_mode_command_pending.store(true, std::memory_order_release);
         recovery_entry_deadline_us =
             static_cast<uint64_t>(esp_timer_get_time()) + 1'000'000;
+        enter_waiting = false;
       }
-      enter_waiting = false;
     }
     const bool recovery_only =
         recovery_only_mode.load(std::memory_order_acquire);
@@ -4093,7 +4068,6 @@ void sdLogTask(void *) {
         }
         if (reason == protocol::CommandReason::none)
           flash_log_ready.store(true, std::memory_order_release);
-        // export/eraseは一度だけ実行し、result通知だけを必要ならretryする。
         export_completion =
             {true, export_request.transaction_id, reason,
              static_cast<uint32_t>(export_result)};
@@ -4120,7 +4094,6 @@ void sdLogTask(void *) {
         enqueueEvent(protocol::eventFlag(
                          protocol::MissionEventFlag::mission_sd_error),
                      protocol::MissionState::unknown, 0, 2);
-      // SD failureでRecovery entry自体を永久停止させない。flush試行完了を表す。
       recovery_sd_flushed.store(true, std::memory_order_release);
     }
 
@@ -4292,11 +4265,10 @@ esp_err_t ProductionRuntime::start() {
       parachute_start_response_queue == nullptr ||
       parachute_persistence_request_queue == nullptr ||
       parachute_persistence_response_queue == nullptr ||
-      air_data_queue == nullptr ||
-      recovery_queue == nullptr || recovery_status_queue == nullptr ||
-      recovery_log_data_queue == nullptr || sd_recovery_queue == nullptr ||
-      storage_export_queue == nullptr || flash_log_queue == nullptr ||
-      sd_log_queue == nullptr ||
+      air_data_queue == nullptr || recovery_queue == nullptr ||
+      recovery_status_queue == nullptr || recovery_log_data_queue == nullptr ||
+      sd_recovery_queue == nullptr || storage_export_queue == nullptr ||
+      flash_log_queue == nullptr || sd_log_queue == nullptr ||
       event_queue == nullptr || persistence_queue == nullptr ||
       state_mutex == nullptr || executor_mutex == nullptr ||
       time_mutex == nullptr) {
