@@ -150,22 +150,9 @@ bool DisplayAttitudeEstimator::initialize(
     return false;
   }
 
-  // 既存roll実装はICM Z軸を機体longitudinal軸としている。
-  // 実装向きの+/-符号はlauncher上の既知tiltに近い側を選び、
-  // 基板silkscreen等の未確認情報をコードへ埋め込まない。
-  const Vector3 positive_longitudinal{0.0, 0.0, 1.0};
-  const Vector3 negative_longitudinal{0.0, 0.0, -1.0};
-  const auto candidate_tilt_deg = [&](const Vector3 &candidate) {
-    return std::acos(std::clamp(dot(candidate, sensor_up), -1.0, 1.0)) *
-           kRadToDeg;
-  };
-  longitudinal_sensor_ =
-      std::abs(candidate_tilt_deg(positive_longitudinal) -
-               launcher_tilt_deg) <=
-              std::abs(candidate_tilt_deg(negative_longitudinal) -
-                       launcher_tilt_deg)
-          ? positive_longitudinal
-          : negative_longitudinal;
+  // 実機取付方向は確定済みで、ICM42688 +Zが機体後方（鉛直下向き）。
+  // 20 degに近い側を毎回選ぶ旧方式は90 deg超の姿勢を反転解釈するため使わない。
+  longitudinal_sensor_ = {0.0, 0.0, -1.0};
   Vector3 sensor_horizontal = subtract(
       longitudinal_sensor_, scale(sensor_up, dot(longitudinal_sensor_, sensor_up)));
   if (!normalize(sensor_horizontal)) {
@@ -201,6 +188,9 @@ bool DisplayAttitudeEstimator::initialize(
       world_lateral, world_up));
   world_from_sensor_ = {initial.w, initial.x, initial.y, initial.z};
   gyro_bias_rad_s_ = gyro_bias_rad_s;
+  // COMMANDRECEIVE表示rollは最新の正常PreflightCalibration姿勢を0 degとする。
+  // 絶対roll方位はgravityだけでは観測できないため、飛行制御用rollとは分離する。
+  roll_rad_ = 0.0;
   previous_timestamp_us_ = timestamp_us;
   initialized_ = true;
   if (!publish(timestamp_us)) {
@@ -241,6 +231,14 @@ bool DisplayAttitudeEstimator::update(
   }
 
   const double dt = static_cast<double>(timestamp_us - previous_timestamp_us_) / 1.0e6;
+  const double longitudinal_rate = dot(corrected, longitudinal_sensor_);
+  roll_rad_ = std::remainder(roll_rad_ + longitudinal_rate * dt, 2.0 * kPi);
+  if (!std::isfinite(roll_rad_)) {
+    initialized_ = false;
+    invalidate(DisplayAttitudeInvalidReason::numeric_error);
+    return false;
+  }
+
   const double rate = norm(corrected);
   Quaternion delta{};
   if (rate > kVectorEpsilon) {
@@ -293,9 +291,11 @@ bool DisplayAttitudeEstimator::publish(uint64_t timestamp_us) {
     if (direction_deg < 0.0)
       direction_deg += 360.0;
   }
-  if (!std::isfinite(tilt_deg) || !std::isfinite(direction_deg))
+  const double roll_deg = roll_rad_ * kRadToDeg;
+  if (!std::isfinite(tilt_deg) || !std::isfinite(direction_deg) ||
+      !std::isfinite(roll_deg))
     return false;
-  state_ = {tilt_deg, direction_deg, timestamp_us,
+  state_ = {tilt_deg, direction_deg, roll_deg, timestamp_us,
             DisplayAttitudeInvalidReason::none, direction_valid, true};
   return true;
 }
