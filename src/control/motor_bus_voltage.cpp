@@ -8,8 +8,14 @@
 namespace control::motor_bus_voltage {
 namespace {
 
-std::atomic<uint8_t> status_raw{
-    static_cast<uint8_t>(Status::uninitialized)};
+#if defined(ESP_PLATFORM)
+constexpr Status kResetStatus = Status::invalid;
+#else
+// native/host testでは既存TorqueMapper APIのcaller supplied Vbusを使用できる。
+constexpr Status kResetStatus = Status::uninitialized;
+#endif
+
+std::atomic<uint8_t> status_raw{static_cast<uint8_t>(kResetStatus)};
 std::atomic<uint64_t> voltage_bits{};
 
 uint64_t encode(double value) {
@@ -44,13 +50,13 @@ void invalidate() {
 
 void reset() {
   voltage_bits.store(0, std::memory_order_relaxed);
-  status_raw.store(static_cast<uint8_t>(Status::uninitialized),
+  status_raw.store(static_cast<uint8_t>(kResetStatus),
                    std::memory_order_release);
 }
 
 Snapshot snapshot() {
-  const auto status = static_cast<Status>(
-      status_raw.load(std::memory_order_acquire));
+  const auto status =
+      static_cast<Status>(status_raw.load(std::memory_order_acquire));
   if (status != Status::live)
     return {status, 0.0};
   const double voltage_v =
