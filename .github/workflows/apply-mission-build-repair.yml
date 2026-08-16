@@ -1,0 +1,47 @@
+name: Apply mission build repair
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - tools/apply_mission_build_repair.py
+      - .github/workflows/apply-mission-build-repair.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Sync latest main
+        run: git pull --rebase origin main
+      - name: Apply targeted build repairs
+        run: python3 tools/apply_mission_build_repair.py
+      - name: Check patch
+        run: git diff --check
+      - name: Install PlatformIO
+        run: pip install platformio
+      - name: Build production firmware
+        run: pio run -e avi_99l_missionboard
+      - name: Commit verified repair
+        run: |
+          rm -f tools/apply_mission_build_repair.py
+          rm -f .github/workflows/apply-mission-build-repair.yml
+          git diff --check
+          git config user.name "hotaru"
+          git config user.email "69021496+Natsu-B@users.noreply.github.com"
+          git add src/runtime/flight_storage.hpp src/runtime/production_runtime.cpp \
+                  tools/apply_mission_build_repair.py \
+                  .github/workflows/apply-mission-build-repair.yml
+          git commit -m "fix(mission): repair psram log build"
+          git pull --rebase origin main
+          pio run -e avi_99l_missionboard
+          git push origin HEAD:main
