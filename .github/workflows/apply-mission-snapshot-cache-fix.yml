@@ -1,0 +1,49 @@
+name: Apply mission snapshot cache fix
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - tools/apply_mission_snapshot_cache_fix.py
+      - .github/workflows/apply-mission-snapshot-cache-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: Sync main
+        run: git pull --rebase origin main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Apply targeted patch
+        run: python tools/apply_mission_snapshot_cache_fix.py
+      - name: Check diff
+        run: git diff --check
+      - name: Run snapshot safety host tests
+        run: |
+          cmake -S host_test -B host_test/build
+          cmake --build host_test/build --target mission_snapshot_cache_tests mission_state_safety_regression_tests --parallel
+          host_test/build/mission_snapshot_cache_tests
+          host_test/build/mission_state_safety_regression_tests
+      - name: Install PlatformIO
+        run: python -m pip install platformio==6.1.19
+      - name: Build production firmware
+        env:
+          AVI_99L_MOTOR_PROFILE_ID: "1"
+        run: pio run -e avi_99l_missionboard
+      - name: Commit verified change
+        run: |
+          git config user.name "hotaru"
+          git config user.email "69021496+Natsu-B@users.noreply.github.com"
+          git add src/runtime/production_runtime.cpp src/runtime/mission_snapshot_cache.hpp host_test/mission_snapshot_cache_tests.cpp host_test/CMakeLists.txt
+          git rm tools/apply_mission_snapshot_cache_fix.py .github/workflows/apply-mission-snapshot-cache-fix.yml
+          git commit -m "fix(mission): preserve snapshot on mutex contention"
+          git push origin HEAD:main
