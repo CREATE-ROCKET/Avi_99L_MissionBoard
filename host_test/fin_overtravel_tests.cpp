@@ -20,7 +20,7 @@ void resetGuard() {
 }
 
 mission::PreflightReadinessSnapshot readyReadiness() {
-  return {1, 1234, true, true, true, true, true, true, true, true};
+  return {1, 1234, true, true, true, true, true, true};
 }
 
 mission::ControlAvailability readyControl(uint64_t timestamp_us) {
@@ -48,8 +48,6 @@ mission::CommandContext readyCommandContext() {
   mission::CommandContext context{};
   context.state = protocol::MissionState::command_receive;
   context.resources_preallocated = true;
-  context.persistence_load_complete = true;
-  context.persistence_runtime_available = true;
   context.fin_available = true;
   context.parachute_available = true;
   context.calibration_supported = true;
