@@ -19,7 +19,9 @@ namespace avi::characterization {
 
 class LogWriterV5 {
 public:
-  static constexpr std::size_t kQueueDepth = 512U;
+  // realtime ingressはSD stall吸収用ではなくCore0->Core1 handoff専用。
+  // 長時間stallは後段の4 MiB PSRAM stagingで吸収する。
+  static constexpr std::size_t kQueueDepth = 128U;
   static constexpr std::size_t kBatchRecords = 64U;
 
   [[nodiscard]] esp_err_t initialize();
@@ -80,7 +82,7 @@ private:
   void sdTaskLoop();
   [[nodiscard]] esp_err_t initializeStorage() noexcept;
   void rememberFirst(esp_err_t error) noexcept;
-  void processRecordBatch(ImmutableLogRecord first_record);
+  void processRecordBatch();
   [[nodiscard]] bool stageEncodedRecord(
       std::uint64_t sequence, const wire_v5::RecordBytes &bytes) noexcept;
   [[nodiscard]] bool drainStagedBatch() noexcept;
@@ -90,11 +92,11 @@ private:
   void resetRunMetrics() noexcept;
   void cleanupPreparedFile(bool remove_file) noexcept;
 
-  StaticQueue_t queue_control_{};
-  std::array<std::uint8_t,
-             kQueueDepth * sizeof(ImmutableLogRecord)>
-      queue_storage_{};
-  QueueHandle_t queue_{nullptr};
+  // Single producer=char_runtime(Core0), single consumer=char_log_stage(Core1)。
+  // FreeRTOS queueのcritical sectionと内部memcpyをrealtime pathから外す。
+  std::array<ImmutableLogRecord, kQueueDepth> ingress_ring_{};
+  std::atomic<std::uint64_t> ingress_write_index_{0U};
+  std::atomic<std::uint64_t> ingress_read_index_{0U};
 
   StaticQueue_t control_queue_control_{};
   std::array<std::uint8_t, sizeof(ControlRequest)>
@@ -120,7 +122,6 @@ private:
   StackType_t sd_task_stack_[4096]{};
   TaskHandle_t sd_task_{nullptr};
 
-  // realtime側はDRAM queueへImmutableLogRecordを短時間copyするだけに留める。
   // char_log_stageがvalidation/encode後のwire recordを4 MiB PSRAM ringへ移し、
   // char_writerだけがPSRAMからDRAM batchへcopyしてSDへ書く。
   StagedRecord *psram_stage_{nullptr};
