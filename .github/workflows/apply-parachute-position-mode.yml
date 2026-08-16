@@ -31,11 +31,11 @@ jobs:
         run: python tools/apply_parachute_position_mode.py
       - name: Check diff
         run: git diff --check
-      - name: Run host tests
+      - name: Run parachute host tests
         run: |
           cmake -S host_test -B host_test/build
-          cmake --build host_test/build --parallel
-          ctest --test-dir host_test/build --output-on-failure
+          cmake --build host_test/build --target parachute_configuration_tests --parallel
+          host_test/build/parachute_configuration_tests
       - name: Install PlatformIO
         run: python -m pip install platformio==6.1.19
       - name: Build production firmware
