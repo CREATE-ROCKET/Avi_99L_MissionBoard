@@ -6,8 +6,6 @@ on:
       - fix/simplify-parachute-servo
     paths:
       - .github/workflows/apply-parachute-simplification.yml
-      - tools/apply_runtime_v2.py
-      - tools/fix_runtime_patch_script.py
 
 permissions:
   contents: write
@@ -20,12 +18,14 @@ jobs:
         with:
           fetch-depth: 0
           submodules: false
-      - name: Apply runtime patch
+      - name: Apply runtime and host-test patches
         shell: bash
         run: |
           set -euo pipefail
           python tools/fix_runtime_patch_script.py
+          python tools/fix_runtime_patch_script_v2.py
           python tools/apply_runtime_v2.py
+          python tools/fix_parachute_host_tests.py
       - name: Run host tests
         shell: bash
         run: |
@@ -40,13 +40,14 @@ jobs:
           ! grep -nE 'ParachutePersistence|parachute_persistence_|parachute_config_load_complete|parachute_open_configured|parachute_close_configured|configureMultiTurnPositionMode|servo\.disableTorque\(\)|ParaRequest::Kind::free|nvs_(open|set_blob|get_blob|flash_init)' src/runtime/production_runtime.cpp
           grep -n 'moveRelativeDegrees' src/runtime/production_runtime.cpp
           grep -n 'kParachuteOpenRelativeDegrees' src/runtime/production_runtime.cpp
+          ! grep -nE 'ParachuteEndpoint|ParachuteBlob|FlightParachuteConfiguration' src/actuators/parachute_configuration.hpp src/runtime/recovery_boot.*
       - name: Commit implementation
         shell: bash
         run: |
           set -euo pipefail
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          rm -f .github/workflows/apply-parachute-simplification.yml tools/apply_parachute.py.gz.b64 tools/apply_runtime_v2.py tools/fix_runtime_patch_script.py
+          rm -f .github/workflows/apply-parachute-simplification.yml .github/workflows/apply-parachute-simplification-v3.yml tools/apply_parachute.py.gz.b64 tools/apply_runtime_v2.py tools/fix_runtime_patch_script.py tools/fix_runtime_patch_script_v2.py tools/fix_parachute_host_tests.py
           git add -A
           git update-index --add --cacheinfo 160000,43a185ab2a570d4e1b889a4a534984fd19b2194f,lib/Avi_ESP_Libs
           git diff --cached --check
