@@ -26,8 +26,7 @@ bool allZero(const GenericCommandRequest &request, std::size_t first) {
 
 bool commandKnown(CommandCode code) {
   const uint8_t raw = static_cast<uint8_t>(code);
-  return (raw >= 0x01 && raw <= 0x04) ||
-         (raw >= 0x10 && raw <= 0x13) ||
+  return (raw >= 0x01 && raw <= 0x04) || raw == 0x10 || raw == 0x13 ||
          (raw >= 0x20 && raw <= 0x26) ||
          (raw >= 0x30 && raw <= 0x31) || raw == 0x33;
 }
@@ -66,7 +65,9 @@ CommandDomain domainFor(CommandCode code) {
 bool argumentsValid(const GenericCommandRequest &request, CommandCode code) {
   switch (code) {
   case CommandCode::fin_move_relative:
-    return allZero(request, 2);
+    // 0x13は旧relative-move実装を0deg移動として利用し、受信時の現在角を
+    // targetへcaptureしてその位置を保持する。任意相対移動は公開しない。
+    return allZero(request, 0);
   case CommandCode::para_move_relative: {
     if (!allZero(request, 2))
       return false;
