@@ -6,7 +6,6 @@ on:
       - fix/simplify-parachute-servo
     paths:
       - .github/workflows/apply-parachute-simplification.yml
-      - tools/fix_parachute_host_tests_v2.py
 
 permissions:
   contents: write
@@ -69,6 +68,7 @@ jobs:
           set -euo pipefail
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          rm -rf host_test/build .pio
           rm -f \
             .github/workflows/apply-parachute-simplification.yml \
             .github/workflows/apply-parachute-simplification-v3.yml \
