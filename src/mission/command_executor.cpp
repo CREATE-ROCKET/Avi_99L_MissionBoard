@@ -26,8 +26,8 @@ bool allZero(const GenericCommandRequest &request, std::size_t first) {
 
 bool commandKnown(CommandCode code) {
   const uint8_t raw = static_cast<uint8_t>(code);
-  return (raw >= 0x01 && raw <= 0x04) || raw == 0x10 || raw == 0x13 ||
-         (raw >= 0x20 && raw <= 0x26) ||
+  return (raw >= 0x01 && raw <= 0x04) || raw == 0x10 || raw == 0x11 ||
+         raw == 0x13 || (raw >= 0x20 && raw <= 0x26) ||
          (raw >= 0x30 && raw <= 0x31) || raw == 0x33;
 }
 
