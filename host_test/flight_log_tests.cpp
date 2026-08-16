@@ -34,6 +34,7 @@ int main() {
   sample.deployment_power_cutoff = false;
   sample.control_reference_valid = true;
   sample.fin_zero_configured = true;
+  sample.encoder_zero_count = 0x3456;
   sample.reference_capture_tick = 42;
   sample.reference_estimator_timestamp_us = 987'654;
   sample.roll_estimate_rad = 1.25F;
@@ -45,18 +46,41 @@ int main() {
   sample.pitot_coefficient_assumed = 0.92F;
   sample.pitot_coefficient_diagnostic_min = 0.60F;
   sample.pitot_coefficient_diagnostic_max = 1.20F;
+  sample.fin_zero_configured_timestamp_us = 12'345;
+  sample.fin_zero_flight_epoch = 7;
+  sample.fin_zero_approach_direction =
+      runtime::flight_log::FinZeroApproachDirection::positive;
+  sample.fin_zero_calibration_method =
+      runtime::flight_log::FinZeroCalibrationMethod::current_position;
+  sample.fin_zero_ground_verification_status =
+      runtime::flight_log::FinZeroGroundVerificationStatus::unverified;
+  sample.encoder_diagnostic_flags =
+      runtime::flight_log::encoder_sample_valid |
+      runtime::flight_log::encoder_rate_valid;
+  sample.encoder_sample_timestamp_us = 11'111;
+  sample.encoder_read_latency_us = 43;
+  sample.encoder_sample_age_us = 71;
+  sample.encoder_reconnect_count = 2;
+  sample.encoder_error_count = 3;
 
   auto record = runtime::flight_log::serialize(sample);
   assert(record.size() == runtime::flight_log::kSerializedRecordBytes);
+  assert(record.size() == 256);
   assert(record[0] == '9' && record[1] == '9' && record[2] == 'L' &&
          record[3] == 'G');
   assert(record[4] == runtime::flight_log::kSchemaVersion);
-  assert(record[5] == runtime::flight_log::kSerializedRecordBytes);
+  // schema v2では1-byte length code 0が256 byteを表す。
+  assert(record[5] == 0);
+  assert(record[62] == 0x56 && record[63] == 0x34);
+  assert(record[132] == static_cast<uint8_t>(
+                            runtime::flight_log::FinZeroApproachDirection::positive));
+  assert(record[133] == static_cast<uint8_t>(
+                            runtime::flight_log::FinZeroCalibrationMethod::current_position));
   assert(runtime::flight_log::validate(record));
   assert(!runtime::flight_log::erased(record));
 
   auto corrupted = record;
-  corrupted[80] ^= 0x01;
+  corrupted[144] ^= 0x01;
   assert(!runtime::flight_log::validate(corrupted));
 
   runtime::flight_log::SerializedRecord erased{};
