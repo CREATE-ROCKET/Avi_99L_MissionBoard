@@ -1,227 +1,57 @@
-# 99L ForceStartSequence・パラシュート Stage 2 詳細仕様
+# 99L ForceStartSequence・パラシュート簡素化 詳細仕様
 
-## 1. 優先順位
+本書は[[08e_20260816_パラシュート簡素化|08e パラシュート簡素化仕様]]を前提とする。Open/Close絶対角endpoint、NVS endpoint、flight parachute snapshot、`ParaFree`、自動Open retryを前提とする旧記述は廃止する。
 
-本書は、パラシュート絶対角・optional・flight snapshotを導入したStage 1以後の確定仕様である。`00`、`01`、`02`、`04`、`07`を含む旧記述と矛盾する場合は本書を優先する。
+## 1. Start / ForceStart
 
-## 2. Open/Close endpoint
-
-Open/Closeは1回転内の絶対角であり、それぞれ独立したoptionalとして保持する。
-
-- NVS keyなしは未設定とする。
-- CRC、schema、size、endpoint、reserved、count範囲等が不正なendpointも、運用上は未設定と同じ`nullopt`として扱う。
-- corrupt理由はHealth、MissionEvent、内部logへ残す。
-- corrupt値を剰余演算、clamp、既定角で補正しない。
-- ForceStart時にmissing/corruptをvalidへ偽装しない。
-
-通常StartはOpen/Closeの両方を要求する。ForceStartではOpen/Closeを独立optionalのままflight snapshotへfreezeできる。
-
-### 2.1 STS3215 current/target座標系
-
-productionのパラシュートサーボは`OperatingMode::position`と`FeedbackMode::multi_turn`を使用する。`OperatingMode::step`は相対移動command向けであり、停止後のcurrent position feedbackを物理絶対角として扱えないfirmwareがあるため、productionのcurrent angle sourceには使用しない。
-
-STS3215のmulti-turn absolute position controlではminimum/maximum angle limitをともに`0`へ設定する。`0..4095`は単回転position mode用であり、multi-turn production設定には使用しない。
-
-- STS3215のfresh current positionはsigned multi-turn countとして取得する。
-- GUI/CAN/LoRaへ送る`parachute angle`とOpen/Close endpoint比較では、fresh multi-turn countを1回転内`0..4095`へwrapした物理絶対角を使う。
-- `ParaMoveRelative`はfresh multi-turn currentに要求変位を加えたabsolute multi-turn targetを`position` modeへ送る。要求変位は従来どおり`abs(delta) < 180 deg`とする。
-- `ParaOpen`/`ParaClose`はwrapped currentとendpointから`shortestParachuteDisplacement`を求め、その`(-180, +180) deg`の変位をfresh multi-turn currentへ加えたabsolute multi-turn targetを送る。exact 180 degは従来どおり拒否する。
-- Holdはfresh current position自体をabsolute targetとして保持する。
-- driver/deviceのmulti-turn有効範囲を越えるtargetはalternate long pathへ置換せずfailureとする。
-- 電源再投入後に過去のturn countをNVSから推測しない。毎回STSのfresh position feedbackをsource of truthとし、永続化するOpen/Closeは1回転内絶対角だけとする。
-
-## 3. half-turn判定
-
-half-turnは保存済みOpenとCloseの相互関係ではなく、実際に移動するときのfreshな現在角とtargetとの関係で判定する。
-
-- OpenとCloseが2048 count離れていても、それ自体をStart拒否理由にしない。
-- Open動作直前に`current -> open`を検証する。
-- Close動作直前に`current -> close`を検証する。
-- retry時もfresh currentから同じsnapshot targetへの変位を再計算する。
-- 2048 countちょうどなら任意方向へ動かさずfailureとする。
-- 通常Startではfresh currentを取得できた場合に`current -> open`を事前検証する。ただしdeployment時にも再検証する。
-- ForceStartはSTS/currentが取得不能でも遷移できる。ForceStart時点のhalf-turn判定は必須とせず、実際のdeployment時に判定する。
-
-## 4. StartSequenceのcommand phase
-
-通常StartおよびForceStartは、protocol/state/Busy/resource条件を通過した後に`Accepted`を返し、ParachuteTaskで非同期preparationを実行する。
-
-通常StartでOpen/Closeを含む7項目不足が判明した場合は次のterminal resultを返す。
-
-- phase: `Failed`
-- reason: `NotConfigured`
-- detail: 7項目のpreflight missing bitmask
-
-Groundはterminal phaseが`Rejected`または`Failed`のどちらであっても、reasonが`NotConfigured`かつdetail bit0..6が非0の場合に限りForce操作を提示できる。
-
-path half-turnは7項目missing maskへ混ぜず、`SafetyInterlock`と専用detailで表す。
-
-## 5. ForceStartSequence
-
-`ForceStartSequence`はcommand code `0x04`、args0..5全て0、CommandReceiveのみ受理する。
-
-Forceがbypassするのは通常Startの次の7項目のpreflight `NotConfigured` gateだけである。
+通常`StartSequence`のpreflight readinessは次の5 bitとする。
 
 | bit | 項目 |
 |---:|---|
 | 0 | `FinZeroConfigured` |
-| 1 | `ParachuteOpenConfigured` |
-| 2 | `ParachuteCloseConfigured` |
-| 3 | `MotorProfileValid` |
-| 4 | `GyroBiasValid` |
-| 5 | `GravityReferenceValid` |
-| 6 | `SscZeroValid` |
+| 1 | `MotorProfileValid` |
+| 2 | `GyroBiasValid` |
+| 3 | `GravityReferenceValid` |
+| 4 | `SscZeroValid` |
 
-Forceでもprotocol validity、MissionState、Busy、queue/mutex/task等のruntime invariant、resources preallocationはbypassしない。
+`ForceStartSequence (0x04)`はこの5項目の`NotConfigured` gateだけをbypassする。protocol validity、MissionState、Busy、resource preallocation、fin overtravel等の安全interlockはbypassしない。terminal `Completed.detail`には実際にbypassした5 bit missing maskを格納する。
 
-### 5.1. STS unavailable
+STS3215がStart時にUnavailableでもendpoint不足としてStartを拒否しない。ParachuteTaskはbounded reconnectを継続し、利用可能になった時点で現在位置Holdをbest effortで確立する。
 
-ForceStartではSTS初期化、fresh angle取得、現在位置Holdをbest effortで試す。STS未接続、初期化失敗、fresh angle read timeout/failure、current Hold failureがあっても、他の非bypass条件が成立していればLiftoffDetectionへ遷移する。
+## 2. パラシュートcommand
 
-失敗状態を正常へ偽装しない。STS HealthはUnavailable/Faultのまま、`HoldEstablished=false`のまま、current angleやOpen/Close endpointを0等で生成しない。
+CommandReceiveで有効なパラシュートgeneric commandは次の2つだけとする。
 
-ParachuteTaskはpower-on要求とbounded再接続を継続し、STSが利用可能になった時点でfresh currentを取得して現在位置Holdを試す。
+- `ParaOpen (0x25)`: 反時計回り130度の固定相対move
+- `ParaClose (0x26)`: 時計回り130度の固定相対move
 
-### 5.2. snapshot
+args0..5はすべて0とする。`0x20..0x24`はdeprecated reserved codeであり、Mission Boardは常に副作用なしの`Rejected / NotSupported`とする。
 
-ForceStartのflight snapshotはOpen/Closeを独立optionalとして保持する。
+## 3. STS3215 Hold / relative move
 
-- Open valid / Close valid: 両方をfreeze
-- Open valid / Close missing/corrupt: Openだけをfreeze
-- Open missing/corrupt / Close valid: Closeだけをfreeze
-- 両方missing/corrupt: 両方`nullopt`
+1. relative move前に現在位置Holdを成立させ、Torque ONを保証する。
+2. 固定130度relative moveを1回だけ発行する。
+3. move停止確認後は現在位置Holdへ戻る。
+4. UART response timeout等でcommand実行有無が曖昧な場合、同じ130度moveを自動再送しない。
+5. Open/Close target計算にNVS値や絶対角を使用しない。現在角はtelemetry観測用にのみ使用してよい。
 
-Openだけ存在する場合でも、deployment時にfresh current angleを取得でき、`current -> open`がexact half-turnでなければOpen動作を行ってよい。Closeはdeploymentの必須条件ではない。
+STS runtime Direction設定は既知状態へ固定し、実機でOpenが反時計回り、Closeが時計回りとなる符号を飛行前に確認する。
 
-### 5.3. completed detail
+## 4. 自動deployment / cutoff
 
-`ForceStartSequence`のterminal `Completed.detail`には、Force受理時に実際にbypassした7項目missing maskを格納する。Accepted時detailは0でよい。
+- pressure apex条件は離床+10秒以降に使用してよい。
+- pressure条件が成立しなくても離床+17秒でtimer fallbackを成立させる。
+- CAN、LoRa、LPS、SSC、loggingの故障を+17秒timer fallbackの成立条件にしない。
+- deployment requestはflight epochごとに1回だけrelative Openへ変換する。
+- move command失敗/確認timeoutでも130度relative moveを自動再送しない。
+- Open完了後も離床+25秒までHold/Torque ONを維持する。
+- +25秒では事前`disableTorque()`なしでパラシュート電源を物理的にOFFする。
+- `ActuatorEmergencyStop`では動翼は既定Emergency処理へ移し、パラシュートはFree/power-offせずHoldを要求する。
 
-Force preparation中にruntime failureをterminal failureとして返す場合はmissing maskではなく該当failure detailを優先する。ただしSTS unavailableだけではForceを失敗させない。
+飛行中resetで`deployment_started=true`を復元した場合はOpen relative moveを再発行せず、現在位置Holdだけを再確立して+25秒cutoffを継続する。
 
-## 6. forced_start latch
+## 5. persistence / telemetry
 
-flight attemptごとに`forced_start`を保持する。
+パラシュートOpen/Close endpoint用NVS key/blob/CRC、configured flag、flight snapshot、RTC endpoint checkpointを使用しない。旧値がFlashに残っていても読み込まない。
 
-- normal Start成功: `forced_start=false`
-- ForceStart成功: `forced_start=true`
-- `CancelSequence`: clear
-- 次のnormal/Force Start: 新しい値で上書き
-- `LiftoffDetectionEmergencyStop`: 同じflight attempt由来として維持
-- software/watchdog reset recovery: RTC checkpointから復元
-- checkpointが検証不能な場合: trueを推測しない
-
-Force受理時の7項目snapshot/missing maskもRTC/full-rate logへ保持する。
-
-## 7. 電源・Hold方針
-
-起動直後は従来どおりGPIOを安全化してパラシュート電源をOFFにする。Task/driver/queue初期化後の通常CommandReceiveでは、明示的なEmergencyまたはpower-off状態でない限りSTS電源を可能な限りONに維持する。
-
-- STSが利用可能なら現在位置Holdを維持する。
-- 未接続/故障中もpower-on要求とboundedな再初期化を継続する。
-- `ParaFree`は原則としてtorqueをOFFにするが、通常操作では電源まで落とす必要はない。
-- `ActuatorEmergencyStop`および絶対cutoff等、既存の安全処理は電源OFFを許可する。
-
-LiftoffDetection以降、離床+25秒より前はSTS電源を基本的にONとする。
-
-- Hold要求中は現在位置Hold
-- Open成功後はOpen位置Hold
-- Open failure後は取得できた現在位置Hold
-- STS unavailable中はrequested modeをHoldのまま維持し、Healthをfaultとして再接続を続ける
-- 離床+25秒で状態にかかわらず絶対遮断
-
-## 8. deployment
-
-### 8.1. Openあり
-
-flight snapshotにOpenが存在する場合:
-
-1. fresh current angleを読む。
-2. `shortestParachuteDisplacement(current, open)`を計算する。
-3. exact half-turnなら動かさない。
-4. path validならshortest pathでOpen指令を出す。
-5. retryでも同じsnapshot Openを使う。
-6. retryのたびにfresh currentから変位を再計算する。
-7. NVS/CommandReceive active configは参照しない。
-
-### 8.2. Openなし
-
-Openがmissing/corruptの場合、MissionStateはDescentへ遷移するがOpen moveは発行しない。`ParachuteOpenNotConfigured`相当のfailureを一度記録し、現在位置Holdを継続する。電源を早期遮断せず離床+25秒で絶対遮断する。
-
-### 8.3. current angleなし
-
-Openは存在するがfresh current angleを取得できない場合、targetから移動方向を推測せずOpen moveを発行しない。STS再接続とfresh angle取得を継続し、Open再試行期限内に取得できればOpenを試す。取得不能のまま期限を迎えたらfailureを記録してrequested Holdへ戻り、電源は離床+25秒まで維持する。
-
-### 8.4. 5秒deadline
-
-約5秒のglobal Open retry deadlineは「Open move/retryを終了する期限」であり、「パラシュート電源を切る期限」ではない。
-
-5秒経過時は新しいOpen retryを停止し、deadlineを延長せず、failureを記録する。fresh currentを取得できる場合はその位置をHoldし、STS電源はONのまま維持する。Open成功時もOpen位置をHoldし、離床+25秒でのみ絶対遮断する。
-
-## 9. persistence load状態
-
-次を区別する。
-
-- key missing: endpoint `nullopt`、通常の未設定
-- blob corrupt: endpoint `nullopt`、persistence faultを記録
-- load in progress: Start/ForceStartは`Busy`
-- NVS owner/queue/init/open/read自体が利用不能: `PersistenceError`または`InternalError`
-- load完了状態が不明: 未設定へ丸めず`Busy`/`InternalError`
-
-Forceはmissing/corrupt endpointをbypassできるが、load未完了やNVS ownerのruntime failureを単なる未設定としてbypassしない。
-
-## 10. readiness snapshot
-
-7項目と`resources_preallocated`は、一貫した`PreflightReadinessSnapshot`として取得する。少なくとも次を保持する。
-
-- generation
-- captured_at_us
-- 7項目bool
-- missing mask
-- resources_preallocated
-
-Force/normal Startの判定とlogには同じsnapshotを使用する。
-
-## 11. failure/event
-
-内部には最低限次を区別する。
-
-- `open_not_configured`
-- `current_angle_unavailable`
-- `ambiguous_half_turn`
-- `move_command_failed`
-- `retry_exhausted`
-- `hold_failed`
-- `persistence_corrupt`
-
-自律deployment failureはCommandResultだけでは表せないため、full-rate logとMissionEvent/Descent statusの既存予約領域を使用して一度だけ記録する。既存wire layoutは変更せず、予約bit/detailの意味を通信仕様へ明記する。
-
-## 12. 必須試験
-
-- corrupt endpointがoperationally `nullopt`になる
-- corrupt理由はpersistence faultとして残る
-- OpenのみのForce snapshot
-- CloseのみのForce snapshot
-- 両方なしのForce snapshot
-- Openのみでもfresh currentがあればdeployment可能
-- Open/Close相互が2048 countでもStartを拒否しない
-- actual current/targetが2048 countならmoveしない
-- normal Startはcurrent/Open half-turnを拒否
-- ForceStartはSTS unavailableでもLiftoffDetectionへ遷移
-- STS unavailableをvalidへ偽装しない
-- STS復旧後に現在位置Holdへ入る
-- OpenなしのdeploymentでHold継続
-- Open成功後も+25秒までHold/power-on
-- retry exhausted後も+25秒までHold/power-on
-- +25秒で必ず絶対遮断
-- 5秒deadlineがretryで延長されない
-- Force `Completed.detail`が実際のmissing mask
-- Cancelで`forced_start` clear
-- Emergency rollbackで`forced_start`維持
-- software/watchdog resetで`forced_start`とoptional snapshotを復元
-- NVS load中のForceは`Busy`
-- NVS runtime failureをmissingとしてbypassしない
-
-## 13. 飛行認定との関係
-
-ForceStartSequenceは通常flight readinessを満たしたことを意味しない。Forceでsequenceが完走してもqualificationの代替にはせず、`TODO(HW_TEST)` / `TODO(SIMULATION)`、審査書要求、通常Startのreadinessを独立して満たす。
+既存wire frame layoutは維持し、旧endpoint persistence用bitはreserved 0へ戻してよい。`ParaMode::opening_or_retrying`というwire名を残しても、自動retryを意味しない。
