@@ -9,6 +9,7 @@
 #include "bringup/spi_bringup.hpp"
 #include "bringup/stream_protocol.hpp"
 #include "esp_err.h"
+#include "sensors/display_attitude_runtime.hpp"
 
 namespace bringup {
 
@@ -28,6 +29,30 @@ struct ImuSample {
   bool temperature_valid{false};
   bool accel_odr_changed{false};
   bool gyro_odr_changed{false};
+
+  ImuSample() = default;
+  ImuSample(const ImuSample &) = default;
+  ImuSample &operator=(const ImuSample &other) {
+    if (this == &other)
+      return *this;
+    host_timestamp_us = other.host_timestamp_us;
+    sensor_timestamp_us = other.sensor_timestamp_us;
+    timestamp_ticks = other.timestamp_ticks;
+    acceleration_raw = other.acceleration_raw;
+    angular_velocity_raw = other.angular_velocity_raw;
+    temperature_raw = other.temperature_raw;
+    acceleration_g = other.acceleration_g;
+    angular_velocity_dps = other.angular_velocity_dps;
+    temperature_celsius = other.temperature_celsius;
+    read_latency_us = other.read_latency_us;
+    acceleration_valid = other.acceleration_valid;
+    angular_velocity_valid = other.angular_velocity_valid;
+    temperature_valid = other.temperature_valid;
+    accel_odr_changed = other.accel_odr_changed;
+    gyro_odr_changed = other.gyro_odr_changed;
+    sensors::display_attitude_runtime::observe(*this);
+    return *this;
+  }
 };
 
 struct ImuSelfTestResult {
@@ -127,4 +152,4 @@ private:
   std::atomic<bool> busy_{false};
 };
 
-} // 名前空間 bringup
+} // namespace bringup

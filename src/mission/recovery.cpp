@@ -1,12 +1,14 @@
 #include "mission/recovery.hpp"
 
+#include "runtime/recovery_persistence.hpp"
+
 namespace mission {
 namespace {
 
 constexpr uint32_t kRecoveryMagic = 0x39394C52;
 constexpr uint16_t kRecoveryVersion = 2;
 
-} // 無名名前空間
+} // namespace
 
 uint16_t recoveryMarkerChecksum(const RecoveryMarker &marker) {
   uint64_t value = marker.magic ^
@@ -21,6 +23,9 @@ uint16_t recoveryMarkerChecksum(const RecoveryMarker &marker) {
 
 RecoveryMarker makeRecoveryMarker(uint32_t wake_sequence,
                                   uint64_t entry_rtc_time_us) {
+  // NVS latchはRTC markerより先にbest-effortで有効化する。
+  // 失敗してもRecovery安全化/Deep Sleep自体は停止させない。
+  (void)runtime::recovery_persistence::ensureActive();
   RecoveryMarker marker{kRecoveryMagic, kRecoveryVersion, 0, wake_sequence,
                         entry_rtc_time_us, true};
   marker.checksum = recoveryMarkerChecksum(marker);
@@ -88,4 +93,4 @@ bool RecoveryRuntime::mayEnterDeepSleep() const {
          state_ == RecoveryRuntimeState::wake_command_window;
 }
 
-} // 名前空間 mission
+} // namespace mission

@@ -17,6 +17,7 @@
 #include "freertos/task.h"
 #include "runtime/production_runtime.hpp"
 #include "runtime/recovery_boot.hpp"
+#include "runtime/recovery_persistence.hpp"
 
 #ifndef MISSION_BRINGUP_SHELL
 #define MISSION_BRINGUP_SHELL 0
@@ -118,9 +119,17 @@ extern "C" void app_main() {
 #else
   const bool marker_valid = runtime::recovery_boot::markerValid();
   const bool wake_cause_valid = runtime::recovery_boot::wakeCauseValid();
-  const bool recovery_only = marker_valid || wake_cause_valid;
-  static runtime::ProductionRuntime runtime{
-      recovery_only, marker_valid && wake_cause_valid};
+  const auto persistent_state = runtime::recovery_persistence::latchState();
+  const bool persistent_evidence =
+      persistent_state != runtime::recovery_persistence::LatchState::inactive;
+  runtime::recovery_persistence::setBootEvidence(persistent_evidence,
+                                                 marker_valid);
+  const bool recovery_only =
+      marker_valid || wake_cause_valid || persistent_evidence;
+  const bool recovery_wake_authorized =
+      (marker_valid && wake_cause_valid) || persistent_evidence;
+  static runtime::ProductionRuntime runtime{recovery_only,
+                                            recovery_wake_authorized};
   production_runtime = &runtime;
   const esp_err_t runtime_result = production_runtime->start();
   std::printf("runtime=%s flight_enabled=%s\n",
