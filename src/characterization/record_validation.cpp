@@ -115,6 +115,13 @@ validateRecordStrict(const ImmutableLogRecord &record) noexcept {
       (block.flags & EpochAggregateValid) != 0U;
   const bool incomplete = (block.flags & EpochIncomplete) != 0U;
   const bool startup_incomplete = (block.flags & EpochStartup) != 0U;
+  const bool deadline_flag = (block.flags & EpochDeadline) != 0U;
+  const bool release_late =
+      block.consumer_lateness_us >
+      static_cast<std::int32_t>(kConsumerDeadlineBudgetUs);
+  // 旧V5 captureではrelease遅延もEpochDeadlineを立てているため、その形式は
+  // 引き続き受理する。新しい1 kHz motor-ID captureではrelease遅延は数値診断だけを
+  // 残し、100 us command apply deadlineだけをfatalなEpochDeadlineとする。
   if (complete != aggregate_valid || complete == incomplete ||
       startup_incomplete != (block.epoch_index == 0U && incomplete) ||
       ((block.flags & EpochRepeated) != 0U) !=
@@ -123,10 +130,8 @@ validateRecordStrict(const ImmutableLogRecord &record) noexcept {
           (block.skipped_sample_count != 0U) ||
       ((block.flags & EpochInvalid) != 0U) !=
           (block.invalid_sample_count != 0U) ||
-      ((block.flags & EpochDeadline) != 0U) !=
-          (command_apply_late ||
-           block.consumer_lateness_us >
-               static_cast<std::int32_t>(kConsumerDeadlineBudgetUs)) ||
+      (command_apply_late && !deadline_flag) ||
+      (deadline_flag && !command_apply_late && !release_late) ||
       (block.flags & ~0x00FFU) != 0U)
     error = error | RecordValidationError::InconsistentFlags;
 
