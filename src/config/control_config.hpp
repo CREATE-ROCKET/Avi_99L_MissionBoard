@@ -62,19 +62,6 @@ struct PitotCoefficientDiagnosticsConfig {
   }
 };
 
-struct EncoderPipelineConfig {
-  uint32_t acquisition_hz{1'000};
-  uint32_t consumer_hz{1'000};
-
-  [[nodiscard]] constexpr bool valid() const {
-    return consumer_hz != 0 && acquisition_hz >= consumer_hz &&
-           acquisition_hz % consumer_hz == 0;
-  }
-  [[nodiscard]] constexpr uint32_t samplesPerBlock() const {
-    return valid() ? acquisition_hz / consumer_hz : 0;
-  }
-};
-
 inline constexpr ControlAuthorityLimits kControlAuthorityLimits{};
 inline constexpr PitotCoefficientDiagnosticsConfig
     kPitotCoefficientDiagnostics{};
@@ -82,8 +69,15 @@ inline constexpr PitotCoefficientDiagnosticsConfig
 // 20 degのovertravel fault閾値を最終確定する。通常の指令可能範囲とは別値。
 inline constexpr double kFinOvertravelFaultLimitRad =
     0.34906585039886590;
-// TODO(HW_TEST): 1/2 kHzの最終選択後も本configだけを差し替える。
-// 現在のproduction producer/consumerは1 kHz暫定である。
-inline constexpr EncoderPipelineConfig kEncoderPipeline{1'000, 1'000};
 
-} // 名前空間 board
+// productionはAS5047D acquisition/consumerとも1 kHzへ固定する。
+// 2/5/10 kHzはcharacterization/offline comparator専用であり、productionの
+// EncoderCaptureTask/ring/block assemblerを必要としない。
+// 将来production captureを1 kHz超へ戻す場合だけproducer/consumer分離を再導入する。
+inline constexpr uint32_t kProductionEncoderAcquisitionHz = 1'000;
+inline constexpr uint32_t kProductionEncoderConsumerHz = 1'000;
+static_assert(kProductionEncoderAcquisitionHz ==
+                  kProductionEncoderConsumerHz,
+              "1 kHz production encoder must use direct consumption");
+
+} // namespace board
