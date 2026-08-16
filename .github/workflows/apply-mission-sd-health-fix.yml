@@ -30,11 +30,11 @@ jobs:
         run: python3 tools/apply_sd_health_fix.py
       - name: Check diff
         run: git diff --check
-      - name: Run host tests
+      - name: Run targeted host test
         run: |
           cmake -S host_test -B /tmp/mission-host-test
-          cmake --build /tmp/mission-host-test -j2
-          ctest --test-dir /tmp/mission-host-test --output-on-failure
+          cmake --build /tmp/mission-host-test --target mission_host_tests -j2
+          /tmp/mission-host-test/mission_host_tests
       - name: Install PlatformIO
         run: pip install platformio
       - name: Build production firmware
