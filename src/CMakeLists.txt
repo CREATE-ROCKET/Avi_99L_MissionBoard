@@ -1,18 +1,37 @@
-# defaultのCMakeLists.txtを持たないproject用に自動生成されたfile。
-
-FILE(GLOB_RECURSE app_sources ${CMAKE_SOURCE_DIR}/src/*.*)
-
-idf_component_register(SRCS ${app_sources} REQUIRES esp_driver_gptimer)
-
-target_compile_options(
-    ${COMPONENT_LIB}
-    PRIVATE
-    "$<$<COMPILE_LANGUAGE:CXX>:-std=gnu++17>"
+idf_component_register(
+  SRCS
+    "main.cpp"
+    "actuators/production_motor.cpp"
+    "actuators/parachute_configuration.cpp"
+    "actuators/safety_core.cpp"
+    "bringup/safe_outputs.cpp"
+    "bringup/spi_bringup.cpp"
+    "bringup/encoder_bringup.cpp"
+    "bringup/imu_bringup.cpp"
+    "bringup/power_bringup.cpp"
+    "bringup/stream_protocol.cpp"
+    "control/control_pipeline.cpp"
+    "control/fin_overtravel_guard.cpp"
+    "control/motor_bus_voltage.cpp"
+    "mission/command_executor.cpp"
+    "mission/mission_state.cpp"
+    "mission/recovery.cpp"
+    "protocol/can_protocol.cpp"
+    "protocol/quantization.cpp"
+    "runtime/flight_log.cpp"
+    "runtime/flight_storage.cpp"
+    "runtime/imu_heartbeat_clock.cpp"
+    "runtime/production_runtime.cpp"
+    "runtime/recovery_boot.cpp"
+    "sensors/air_data_flight_logic.cpp"
+    "sensors/airspeed_estimator.cpp"
+    "sensors/attitude_estimator.cpp"
+    "sensors/flight_detectors.cpp"
+    "sensors/power_presence.cpp"
+    "sensors/power_presence_runtime.cpp"
+  INCLUDE_DIRS "." "../include"
 )
 
 if(AVI_99L_CHARACTERIZATION_BUILD)
-    # ESP-IDF framework全体へ-O3を適用すると、framework内部の-Werrorと
-    # GCCの強いarray-bounds解析が衝突し得る。timing qualificationで速度が必要な
-    # MissionBoard自前componentだけを-O3にし、frameworkは公式performance(-O2)に保つ。
-    target_compile_options(${COMPONENT_LIB} PRIVATE -O3)
+  target_compile_options(${COMPONENT_LIB} PRIVATE -O3)
 endif()
