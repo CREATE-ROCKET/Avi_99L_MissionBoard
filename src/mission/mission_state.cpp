@@ -33,10 +33,6 @@ uint8_t PreflightReadinessSnapshot::readyMask() const {
   uint8_t result = 0;
   if (fin_zero_configured)
     result |= bit(PreflightReadinessBit::fin_zero_configured);
-  if (parachute_open_configured)
-    result |= bit(PreflightReadinessBit::parachute_open_configured);
-  if (parachute_close_configured)
-    result |= bit(PreflightReadinessBit::parachute_close_configured);
   if (motor_profile_valid)
     result |= bit(PreflightReadinessBit::motor_profile_valid);
   if (gyro_bias_valid)
@@ -228,7 +224,8 @@ void MissionStateMachine::tick(const MissionTickInput &input,
   uint64_t elapsed_us{};
   if (snapshot_.liftoff_time_valid &&
       input.monotonic_us >= snapshot_.liftoff_time_us)
-    elapsed_us = elapsed_offset_us_ + input.monotonic_us - snapshot_.liftoff_time_us;
+    elapsed_us = elapsed_offset_us_ + input.monotonic_us -
+                 snapshot_.liftoff_time_us;
   snapshot_.elapsed_us = elapsed_us;
   fin_control_available_ = input.control.fin_control_available;
 
@@ -244,8 +241,9 @@ void MissionStateMachine::tick(const MissionTickInput &input,
       snapshot_.state = protocol::MissionState::engine_burn;
   }
 
-  const bool flight_state = snapshot_.state == protocol::MissionState::engine_burn ||
-                            snapshot_.state == protocol::MissionState::control;
+  const bool flight_state =
+      snapshot_.state == protocol::MissionState::engine_burn ||
+      snapshot_.state == protocol::MissionState::control;
   if (flight_state &&
       ((current_safety && safety.deploy) ||
        (input.deployment_pressure_condition && snapshot_.liftoff_time_valid &&
@@ -257,7 +255,8 @@ void MissionStateMachine::tick(const MissionTickInput &input,
       snapshot_.liftoff_time_valid && elapsed_us >= kControlGateUs &&
       !control_gate_evaluated_) {
     control_gate_evaluated_ = true;
-    if (!snapshot_.fin_control_disabled && !snapshot_.control_reentry_inhibited &&
+    if (!snapshot_.fin_control_disabled &&
+        !snapshot_.control_reentry_inhibited &&
         finFlightReadinessValid(snapshot_) && input.control.ready() &&
         captureControlRollReference(input))
       snapshot_.state = protocol::MissionState::control;
